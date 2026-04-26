@@ -1,164 +1,446 @@
+import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { runAI, loadPrompt } from '../lib/ai.js';
-import { bold, dim, green, ask, singleSelect } from '../lib/ui.js';
-import { loadSettings, saveSettings, upsertApi } from '../lib/settings.js';
+import { bold, dim, green, red, yellow, cyan, ask, singleSelect, waitForKey } from '../lib/ui.js';
+import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/settings.js';
+import { startStep } from '../lib/step-template.js';
+import { fatalError } from '../lib/errors.js';
+import { findEndpoints } from '../lib/find-endpoints.js';
+import { findOasCandidates } from '../lib/find-oas.js';
 
-function slugify(name) {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+/**
+ * Build a compact findings section to prepend to the LLM prompt.
+ *
+ * We run the endpoint + OAS scans locally (cheap, deterministic) before
+ * asking the LLM anything. That way the LLM's job is just to synthesize:
+ * group the endpoints into one or more named APIs, pick the framework
+ * from package.json, and choose an existing OAS file if we found one.
+ *
+ * If the scans find nothing (unusual framework, non-Node codebase), we
+ * still fall back to letting the LLM explore — see the prompt.
+ */
+function buildFindingsSection(packageDir) {
+  const endpointResult = findEndpoints(packageDir);
+  const oasResult = findOasCandidates(packageDir);
+
+  const lines = ['## Findings (from a deterministic pre-scan)'];
+  lines.push('');
+
+  if (endpointResult.endpoints.length > 0) {
+    // Cap the inline list so the prompt doesn't balloon on huge repos.
+    const capped = endpointResult.endpoints.slice(0, 200);
+    const byFile = new Map();
+    for (const e of capped) {
+      if (!byFile.has(e.file)) byFile.set(e.file, []);
+      byFile.get(e.file).push(`${e.method} ${e.path}`);
+    }
+    lines.push(`Endpoints (${endpointResult.endpoints.length} total across ${endpointResult.filesWithEndpoints.length} file(s)):`);
+    for (const [file, routes] of byFile) {
+      lines.push(`- ${file}:`);
+      for (const r of routes) lines.push(`    - ${r}`);
+    }
+    if (endpointResult.endpoints.length > capped.length) {
+      lines.push(`  … ${endpointResult.endpoints.length - capped.length} more truncated`);
+    }
+  } else {
+    lines.push('Endpoints: none found by the pre-scan. The codebase may use a framework/language our regex does not cover — please explore.');
+  }
+  lines.push('');
+
+  if (oasResult.length > 0) {
+    lines.push('OAS/Swagger spec candidates (found by parsing every YAML/JSON for a top-level `openapi` or `swagger` field):');
+    for (const c of oasResult) {
+      lines.push(`- ${c.path} (${c.type} ${c.version})`);
+    }
+  } else {
+    lines.push('OAS spec candidates: none found by the pre-scan.');
+  }
+  lines.push('');
+
+  return lines.join('\n');
 }
 
-export default async function generateOas({ packageDir, rootDir, update, setSpinner }) {
-  // Sub 0: Detect endpoints
-  update({ status: 'active', activeSub: 0, message: [
-    '  Let\'s take a look at your project and see what APIs you have.',
-  ]});
-
-  const detectResult = await runAI(loadPrompt('detect-endpoints'), packageDir, { setSpinner });
-
-  let apis = [];
+/**
+ * Run the detect-endpoints AI pass. If `hint` is provided (from the user
+ * picking "Other" in the picker), inject it as a "user hint" section so the
+ * AI narrows its search.
+ */
+async function locateApis({ packageDir, setSpinner, hint = '' }) {
+  const findingsSection = buildFindingsSection(packageDir);
+  const hintSection = hint
+    ? [
+        '## User hint',
+        '',
+        "The user ran the setup but we couldn't auto-detect their API. They said:",
+        '',
+        `> ${hint}`,
+        '',
+        'Search based on this hint. The hint is authoritative — prioritize it over anything else.',
+        '',
+      ].join('\n')
+    : '';
+  const prompt = loadPrompt('detect-endpoints', { findingsSection, hintSection });
+  const result = await runAI(prompt, packageDir, { setSpinner });
   try {
-    const jsonMatch = detectResult.match(/```json\s*([\s\S]*?)```/);
+    const jsonMatch = result.match(/```json\s*([\s\S]*?)```/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[1]);
-      apis = parsed.apis || [];
+      return parsed.apis || [];
     }
   } catch {}
+  return [];
+}
 
-  if (apis.length === 0) {
-    update({ sub: { 0: 'done' }, activeSub: -1, message: [
-      dim('  No APIs detected. Try running from your project root.'),
-    ]});
-    return { apis: [], detectedLanguage: null, detectedFramework: null, domain: null };
+/**
+ * "User already has an OAS file" branch. Asks whether it's in the codebase
+ * or at a URL, registers it in .api/settings.json, copies the file into
+ * .api/ if it's outside the repo.
+ *
+ * If `selectedApi` is provided, reuses its name/framework/language instead
+ * of prompting. If not, asks for a name.
+ */
+async function adoptExistingOas({ rootDir, update, selectedApi = null, isInternal = null }) {
+  console.log('');
+  const location = await singleSelect(
+    ["It's in my codebase", "It's at a URL"],
+    { message: 'Where is it?', defaultIndex: 0 },
+  );
+
+  const settings = loadSettings(rootDir);
+  let oasFile;
+  let oasUrl;
+
+  if (location === 0) {
+    console.log('');
+    const input = (await ask('  Path to the OAS file: ')).trim();
+    const absPath = path.isAbsolute(input) ? input : path.resolve(rootDir, input);
+    if (!fs.existsSync(absPath)) {
+      fatalError(`No file at ${absPath}`);
+    }
+
+    const rel = path.relative(rootDir, absPath);
+    if (rel.startsWith('..')) {
+      // Outside the repo — copy into .api/ so it lives alongside the codebase.
+      const apiDir = path.join(rootDir, '.api');
+      if (!fs.existsSync(apiDir)) fs.mkdirSync(apiDir, { recursive: true });
+      const ext = path.extname(absPath) || '.yaml';
+      const dest = path.join(apiDir, `openapi${ext}`);
+      fs.copyFileSync(absPath, dest);
+      oasFile = path.relative(rootDir, dest);
+      console.log('');
+      console.log(`  ${green('✓')} Copied to ${bold(oasFile)} so it lives with your code.`);
+    } else {
+      oasFile = rel;
+      console.log('');
+      console.log(`  ${green('✓')} Using the file at ${bold(oasFile)}.`);
+    }
+  } else {
+    console.log('');
+    const url = (await ask('  OAS URL: ')).trim();
+    if (!/^https?:\/\//.test(url)) {
+      fatalError("That doesn't look like a valid URL.", [`Got: ${url || '(empty)'}`]);
+    }
+    oasUrl = url;
+    console.log('');
+    console.log(`  ${green('✓')} Registered ${bold(url)}.`);
   }
 
-  // Pick one API
+  // Use selectedApi's name/framework/language if available, else prompt.
+  let name;
+  if (selectedApi) {
+    name = selectedApi.name;
+  } else {
+    console.log('');
+    const rawName = (await ask('  What should we call this API? ')).trim();
+    name = rawName || 'My API';
+  }
+
+  upsertApi(settings, {
+    name,
+    rootDir: selectedApi?.rootDir || '.',
+    ...(oasFile && { oasFile }),
+    ...(oasUrl && { oasUrl }),
+    ...(selectedApi?.framework && { framework: selectedApi.framework }),
+    ...(selectedApi?.language && { language: selectedApi.language.toLowerCase() }),
+    ...(isInternal !== null && { internal: isInternal }),
+    lastSyncedAt: new Date().toISOString(),
+    requestIdPrefix: generatePrefix(name),
+  });
+  saveSettings(rootDir, settings);
+
+  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
+    `  ${green('✓')} ${bold(name)} registered. Ready for the next step.`,
+  ]});
+
+  return {
+    detectedLanguage: selectedApi?.language || null,
+    detectedFramework: selectedApi?.framework || null,
+    domain: null,
+  };
+}
+
+export default async function generateOas({ packageDir, rootDir, update, setSpinner, aiTool = 'Claude Code', existingOas = false }) {
+  await startStep({
+    update,
+    stepNum: 1,
+    title: 'Map your API',
+    intro: "Alright, let's map out your API.",
+    sections: [
+      {
+        label: 'Why',
+        body:
+          `An OAS file is the shape of your API, every endpoint, parameter,\n` +
+          `and response. Later steps use it to install the right adapter and wire up\n` +
+          `the middleware exactly.`,
+      },
+      {
+        label: "What we'll do",
+        body:
+          `Point ${cyan(aiTool)} (running locally on your machine) at\n` +
+          `your codebase, find your routes, and write an OAS file. It lands in a new\n` +
+          `${bold('.api/')} folder, commit that along with your code, it's meant to live there.`,
+      },
+      {
+        label: 'Privacy',
+        body:
+          `Scanning runs entirely on your machine via your own ${cyan(aiTool)}\n` +
+          `install. We don't see a single line of your code, and nothing gets sent to\n` +
+          `our servers at this step.`,
+      },
+    ],
+    action: 'locate APIs',
+  });
+
+  // Detect APIs in the repo and let the user pick one.
+  //
+  // Loop: detect → (optionally cross-reference with .api/settings.json for
+  // already-set-up markers) → pick. If user picks "Other", collect a free-form
+  // hint and re-detect with it.
+  let hint = '';
   let selectedApi;
-  if (apis.length === 1) {
-    selectedApi = apis[0];
-    const ep = selectedApi.endpoints?.length || 0;
-    const internal = selectedApi.internalEndpoints?.length || 0;
-    const lang = selectedApi.language ? ` (${selectedApi.language})` : '';
+  let selectedExisting;  // matching settings.apis[] entry if already set up
+  while (!selectedApi) {
+    update({ status: 'active', activeSub: 0, message: [
+      hint
+        ? `  Searching again with your hint…`
+        : `  Let's take a look at your project and see what APIs you have.`,
+      '',
+      `  ${dim('Note: we currently only support Node and TypeScript.')}`,
+    ]});
+
+    const apis = await locateApis({ packageDir, setSpinner, hint });
+
+    // Cross-reference each detected API with .api/settings.json. Match by
+    // rootDir first, then by name.
+    const settings = loadSettings(rootDir);
+    const annotated = apis.map((a) => {
+      const match = settings.apis?.find((s) =>
+        (s.rootDir && s.rootDir === a.rootDir) || s.name === a.name,
+      );
+      const isSetup = !!(
+        match &&
+        match.oasFile &&
+        fs.existsSync(path.join(rootDir, match.oasFile))
+      );
+      return { ...a, existing: match, isSetup };
+    });
+
+    const termW = process.stdout.columns || 80;
+    const indentW = 9; // "  ❯ N.   " leading prefix rendered by singleSelect
+    // Cap the row width so the right-aligned status doesn't drift halfway
+    // across a wide terminal. 60 keeps both pieces visually adjacent.
+    const rowWidth = Math.min(60, Math.max(40, termW - indentW - 2));
+    const labels = annotated.map((a) => {
+      const count = (a.endpoints?.length || 0) + (a.internalEndpoints?.length || 0);
+      const lang = a.framework ? `${a.language}/${a.framework}` : a.language || 'unknown';
+      const locPath = a.rootDir && a.rootDir !== '.' ? `./${a.rootDir}` : './';
+      const statusText = a.isSetup ? 'Already set up' : 'Needs setup';
+      const statusColored = a.isSetup ? green(statusText) : dim(statusText);
+      const padLen = Math.max(2, rowWidth - a.name.length - statusText.length);
+      const line1 = `${bold(a.name)}${' '.repeat(padLen)}${statusColored}`;
+      const line2 = dim(`${count} endpoints  ·  ${lang}  ·  ${locPath}`);
+      return `${line1}\n${line2}`;
+    });
+    // Always include "Other" as the last option so the user can redirect us.
+    labels.push(`${bold('Other')} ${dim('— tell us where to look')}`);
+
+    console.log('');
+    const chosenIdx = await singleSelect(labels, {
+      message: apis.length === 0
+        ? "We couldn't find any APIs. Can you point us at one?"
+        : 'Which API do you want to map out?',
+      defaultIndex: 0,
+    });
+
+    // "Other" — prompt for a plain-English hint, then loop and re-detect.
+    if (chosenIdx === labels.length - 1) {
+      console.log('');
+      console.log(`  ${dim('Tell us where to look. For example:')}`);
+      console.log(`  ${dim('• "it\'s a Python FastAPI in backend/api"')}`);
+      console.log(`  ${dim('• "look in services/gateway — it\'s a Go server"')}`);
+      console.log(`  ${dim('• "there are three workers in packages/, I want the one named billing"')}`);
+      console.log('');
+      const newHint = (await ask('  Where should we look? ')).trim();
+      if (!newHint) {
+        console.log('');
+        console.log(`  ${dim('No hint given. Exiting.')}`);
+        process.exit(0);
+      }
+      hint = newHint;
+      continue;
+    }
+
+    selectedApi = annotated[chosenIdx];
+    selectedExisting = selectedApi.existing;
+  }
+
+  // If the chosen API is already fully set up, short-circuit.
+  if (selectedApi.isSetup && selectedExisting) {
+    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
+      `  ${green('✓')} ${bold(selectedApi.name)} is already set up (${selectedExisting.oasFile}).`,
+      `  ${dim('Delete the entry from .api/settings.json if you want to regenerate.')}`,
+    ]});
+    return {
+      detectedLanguage: selectedExisting.language || selectedApi.language || null,
+      detectedFramework: selectedExisting.framework || selectedApi.framework || null,
+      domain: selectedExisting.baseUrl || null,
+    };
+  }
+
+  // === Summary of the chosen API ===
+  const ep = selectedApi.endpoints?.length || 0;
+  const internal = selectedApi.internalEndpoints?.length || 0;
+  const totalEp = ep + internal;
+  const framework = selectedApi.framework || selectedApi.language || 'unknown';
+  {
     const lines = [
-      `  We found ${bold('1 API')} in your project — it's ${bold(selectedApi.framework || selectedApi.language)}${selectedApi.framework && selectedApi.language ? lang : ''} with ${bold(String(ep))} endpoints.`,
+      `  Setting up ${bold(selectedApi.name)} — ${bold(framework)} with ${bold(String(totalEp))} endpoint${totalEp === 1 ? '' : 's'}${internal > 0 ? ` ${dim(`(${internal} internal)`)}` : ''}.`,
     ];
     if (selectedApi.rootDir && selectedApi.rootDir !== '.') {
       lines.push(`  ${dim(`Located in ${selectedApi.rootDir}`)}`);
     }
-    if (internal > 0) {
-      lines.push(`  ${dim(`${internal} endpoint${internal > 1 ? 's' : ''} look${internal === 1 ? 's' : ''} internal — we'll tag ${internal === 1 ? 'it' : 'them'} as such in the spec.`)}`);
-    }
     update({ sub: { 0: 'done' }, activeSub: -1, message: lines });
-  } else {
-    update({ sub: { 0: 'done' }, activeSub: -1, message: [
-      `  We found ${bold(String(apis.length))} APIs in your project. Let's set up one at a time.`,
-    ]});
-
-    const labels = apis.map(a => {
-      const ep = a.endpoints?.length || 0;
-      return `${a.name} — ${a.framework || a.language}, ${ep} endpoints`;
-    });
-
-    console.log('');
-    const selectedIndex = await singleSelect(labels, {
-      message: 'Which API do you want to set up?',
-      defaultIndex: 0,
-    });
-    selectedApi = apis[selectedIndex];
-
-    update({ sub: { 0: 'done' }, activeSub: -1, message: [
-      `  Setting up ${bold(selectedApi.name)}.`,
-    ]});
   }
 
-  // Ask internal vs external
-  // Guess internal vs external based on signals
+  // === Internal vs external (ask early, best-guess default) ===
   const nameLower = (selectedApi.name || '').toLowerCase();
   const frameworkLower = (selectedApi.framework || '').toLowerCase();
-  const endpoints = (selectedApi.endpoints || []).map(e => e.toLowerCase());
-  const allPaths = endpoints.join(' ');
+  const endpointsLower = (selectedApi.endpoints || []).map((e) => e.toLowerCase());
+  const allPaths = endpointsLower.join(' ');
 
   const internalSignals = [
-    // Name signals
     nameLower.includes('internal'),
     nameLower.includes('admin'),
     nameLower.includes('private'),
     nameLower.includes('backoffice'),
     nameLower.includes('back-office'),
-    // Microservice signals
     nameLower.includes('service'),
     nameLower.includes('worker'),
     nameLower.includes('queue'),
     nameLower.includes('consumer'),
     nameLower.includes('processor'),
     nameLower.includes('gateway') && !nameLower.includes('api gateway'),
-    // Path signals — mostly RPC-style or infra endpoints
     allPaths.includes('/internal/'),
     allPaths.includes('/admin/'),
     allPaths.includes('/_/'),
     allPaths.includes('/rpc/'),
     allPaths.includes('/grpc'),
-    // No versioned paths (external APIs usually have /v1/, /v2/)
-    !allPaths.includes('/v1') && !allPaths.includes('/v2') && endpoints.length > 3,
-    // Framework signals — things like gRPC, message queues
+    !allPaths.includes('/v1') && !allPaths.includes('/v2') && endpointsLower.length > 3,
     frameworkLower.includes('grpc'),
     frameworkLower.includes('trpc'),
   ].filter(Boolean).length;
 
   const looksInternal = internalSignals >= 2;
-  const recommendedIndex = looksInternal ? 1 : 0;
   const recommended = looksInternal ? 'internal' : 'external';
-
-  update({ sub: { 0: 'done' }, activeSub: -1, message: [
-    `  Is ${bold(selectedApi.name)} a public-facing API or an internal one?`,
-    dim(`  We think it's ${bold(recommended)} based on the name.`),
-  ]});
 
   console.log('');
   const visibilityIndex = await singleSelect(
     [
-      `External — public-facing, for your API consumers`,
-      `Internal — private, for internal use only`,
+      'External (public-facing, for your API consumers)',
+      'Internal (private, internal use only)',
     ],
     {
-      message: 'API visibility:',
-      defaultIndex: recommendedIndex,
-    }
+      message: `Is ${selectedApi.name} external or internal? (our guess: ${recommended})`,
+      defaultIndex: looksInternal ? 1 : 0,
+    },
   );
   const isInternal = visibilityIndex === 1;
 
+  // === Detection: can we skip OAS generation? ===
+  const existingOasPath = selectedApi.existingOasFile
+    ? path.join(rootDir, selectedApi.existingOasFile)
+    : null;
+  const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
+  const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
+
+  const oasFile = '.api/openapi.yaml';
+  const placeholderDomain = 'https://example.com';
+  let skipReason = null;
+  let finalOasFile = oasFile;
+
+  if (hasExistingOas) {
+    // Point settings at their file — don't overwrite their work.
+    finalOasFile = selectedApi.existingOasFile;
+    skipReason = `found OAS at ${bold(selectedApi.existingOasFile)}`;
+  } else if (frameworkGenerates) {
+    // Framework serves OAS natively at runtime — mark and move on.
+    skipReason = `${bold(framework)} generates OAS natively`;
+    finalOasFile = null;
+  }
+
+  if (skipReason) {
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: -1, message: [
+      `  ${green('✓')} Skipped OAS generation ${dim(skipReason)}.`,
+    ]});
+  } else {
+    // Run the AI generator.
+    update({ sub: { 0: 'done' }, activeSub: 1, message: [
+      `  Turning your ${bold(String(totalEp))} endpoints into an OpenAPI spec — the standard`,
+      `  format tools and SDKs use to talk to your API.`,
+    ]});
+
+    const existingOasNote = selectedApi.existingOasFile
+      ? `An existing OAS file was found at ${selectedApi.existingOasFile}. Use it as a starting point — update it if the code has diverged, but preserve any hand-written descriptions or examples.`
+      : '';
+    const frameworkNote = selectedApi.frameworkCanGenerateOas
+      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively. Try using the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps manually.`
+      : '';
+    const internalNote = selectedApi.internalEndpoints?.length
+      ? `The following endpoints were detected as internal/admin and should be marked as such:\n${selectedApi.internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`
+      : '';
+
+    const vars = {
+      name: selectedApi.name,
+      domain: placeholderDomain,
+      oasFile,
+      existingOasNote,
+      frameworkNote,
+      internalNote,
+    };
+
+    await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
+  }
+
   // Ask for the base URL
   const firstEndpoint = selectedApi.endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
-  update({ sub: { 0: 'done' }, activeSub: -1, message: [
+  update({ sub: { 0: 'done', 1: 'done' }, activeSub: -1, message: [
     '  For the OpenAPI spec, we need to know the base URL of your API in production.',
     `  ${dim(`This is so we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
   ]});
   const domain = await ask(`\n  ${bold('Base URL:')} `);
 
-  // Sub 1: Generate OAS file
-  const ep = selectedApi.endpoints?.length || 0;
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    `  Now we'll generate an OpenAPI spec — this is a standard format that`,
-    `  documents your API so tools and SDKs know how to talk to it.`,
-    '',
-    `  We're turning those ${bold(String(ep))} endpoints into a complete spec for ${bold(domain || 'http://localhost:3000')}.`,
-  ]});
-
-  const oasFile = '.api/openapi.yaml';
-  const internalList = selectedApi.internalEndpoints?.length
-    ? selectedApi.internalEndpoints.join(', ')
-    : '';
-
-  const vars = {
-    name: selectedApi.name,
-    domain: domain || 'http://localhost:3000',
-    oasFile,
-    framework: selectedApi.framework || '',
-    existingOasFile: selectedApi.existingOasFile || '',
-    frameworkCanGenerateOas: selectedApi.frameworkCanGenerateOas ? 'true' : '',
-    internalEndpoints: internalList,
-  };
-
-  await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
+  // Replace placeholder domain in the AI-generated OAS file only when we
+  // actually generated one (not when we're reusing a user's file or when
+  // the framework serves it at runtime).
+  if (finalOasFile === oasFile && !skipReason) {
+    const oasFullPath = path.join(rootDir, oasFile);
+    try {
+      const oasContent = fs.readFileSync(oasFullPath, 'utf8');
+      const updated = oasContent.replaceAll(placeholderDomain, domain || 'http://localhost:3000');
+      fs.writeFileSync(oasFullPath, updated);
+    } catch {}
+  }
 
   // Sub 2: Write to .api/
   update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
@@ -169,23 +451,49 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   upsertApi(settings, {
     name: selectedApi.name,
     rootDir: selectedApi.rootDir || '.',
-    oasFile,
+    ...(finalOasFile && { oasFile: finalOasFile }),
+    ...(frameworkGenerates && !hasExistingOas && { frameworkGeneratesOas: true }),
     framework: selectedApi.framework,
     language: selectedApi.language?.toLowerCase(),
     baseUrl: domain || null,
     internal: isInternal,
     lastSyncedAt: new Date().toISOString(),
   });
+
+  // Generate a request ID prefix on the API entry (not top-level)
+  const apiEntry = settings.apis.find(a => a.rootDir === (selectedApi.rootDir || '.'));
+  if (apiEntry && !apiEntry.requestIdPrefix) {
+    // Migrate from top-level if it exists
+    if (settings.requestIdPrefix) {
+      apiEntry.requestIdPrefix = settings.requestIdPrefix;
+      delete settings.requestIdPrefix;
+    } else {
+      let projectName;
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+        projectName = pkg.name;
+      } catch {}
+      if (!projectName) {
+        projectName = path.basename(rootDir);
+      }
+      apiEntry.requestIdPrefix = generatePrefix(projectName);
+    }
+  }
+
   saveSettings(rootDir, settings);
 
-  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
-    `  ${green('✓')} OpenAPI spec written to ${bold(oasFile)}${isInternal ? dim(' (internal)') : ''}.`,
-  ]});
+  {
+    const doneMsg = finalOasFile
+      ? `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`
+      : `  ${green('✓')} ${bold(selectedApi.name)} registered — ${framework} will serve OAS at runtime${isInternal ? dim(' (internal)') : ''}.`;
+    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [doneMsg] });
+  }
 
   return {
     apis: [selectedApi],
     detectedLanguage: selectedApi.language?.toLowerCase() || null,
     detectedFramework: selectedApi.framework || null,
+    apiRootDir: selectedApi.rootDir || '.',
     domain,
   };
 }

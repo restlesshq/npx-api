@@ -17,12 +17,14 @@ Before installing, figure out the right location:
 After installing, you MUST also set up the SDK in the actual server code:
 
 1. **Find where the server is created and routes are registered.** Don't assume it's in any particular file — search the codebase for where the framework is initialized (e.g. `fastify()`, `express()`, `createServer()`, `new Hono()`, etc.) and where routes are added. That's where the middleware goes.
-2. Add the import for the SDK
-3. Add the middleware/plugin registration using the setup code from the guide above
-4. The API key should be read from `process.env.README_API_KEY` (or equivalent for the language)
-5. For the `apiId`, read it from `.api/settings.json` — look at the `apis[0].id` field
+2. Add the import for the SDK (use the right adapter for the framework — Express, Fastify, Koa, Hono, Next, http).
+3. Add the middleware/plugin registration using the setup code from the guide above.
+4. The API key is read automatically by the SDK from `process.env.RESTLESS_KEY`. You do NOT need to pass it explicitly — the factory takes it as an argument and falls back to the env var.
+5. Look at how this API authenticates its users (Authorization header, JWT, X-API-Key header, query param, etc.) and extract that credential inside the setup callback. Run it through `restless.mask(...)` before logging.
 
 Make sure to:
-- Place the middleware BEFORE route definitions so it captures all requests
-- Don't break existing imports or code structure
-- Use the right adapter for the framework (Express, Fastify, etc.)
+- Place the middleware BEFORE route definitions so it captures all requests.
+- Don't break existing imports or code structure.
+- **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, or `hooks.beforeSend`** — those are from the OLD SDK API. The new SDK will ignore them.
+- **Do NOT read `.api/settings.json` manually.** The SDK reads it automatically at startup.
+- **Do NOT substitute `|| 'anonymous'` inside `restless.mask(...)`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it. Writing `restless.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.

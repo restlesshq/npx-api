@@ -16,7 +16,6 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.89",
-    "@restless/sdk": "file:../node-sdk",
     "js-yaml": "^4.1.1"
   },
   "devDependencies": {

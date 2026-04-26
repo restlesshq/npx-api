@@ -1,25 +1,67 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
+/**
+ * Map a tool_use block into {phase, detail}:
+ *  - phase: high-level human category (e.g. "Looking for files")
+ *  - detail: the specific tool call (e.g. 'Glob *.{js,ts}')
+ *
+ * Phase is stable across many calls of the same category; detail changes
+ * with every call.
+ */
 function describeToolUse(toolName, input) {
   switch (toolName) {
-    case 'Read': return `Reading ${input.file_path?.split('/').pop() || 'file'}`;
-    case 'Glob': return `Searching for ${input.pattern || 'files'}`;
-    case 'Grep': return `Searching for "${input.pattern?.slice(0, 30) || 'pattern'}"`;
-    case 'Write': return `Writing ${input.file_path?.split('/').pop() || 'file'}`;
-    case 'Edit':  return `Editing ${input.file_path?.split('/').pop() || 'file'}`;
-    case 'Bash': {
-      const cmd = input.command || '';
-      if (cmd.startsWith('npm ')) return `Running ${cmd.split('&&')[0].trim()}`;
-      if (cmd.startsWith('pip ')) return `Running ${cmd.split('&&')[0].trim()}`;
-      if (cmd.startsWith('gem ')) return `Running ${cmd.split('&&')[0].trim()}`;
-      if (cmd.startsWith('go ')) return `Running ${cmd.split('&&')[0].trim()}`;
-      if (cmd.startsWith('curl ')) return `Making request`;
-      if (cmd.startsWith('cat ') || cmd.startsWith('ls ')) return `Checking files`;
-      if (cmd.startsWith('mkdir ')) return `Creating directory`;
-      const first = cmd.split(/\s+/)[0]?.split('/').pop() || 'command';
-      return `Running ${first}`;
+    case 'Read':
+      return {
+        phase: 'Reading files',
+        detail: `Read ${input.file_path || 'file'}`,
+      };
+    case 'Glob':
+      return {
+        phase: 'Looking for files',
+        detail: `Glob ${input.pattern || '*'}${input.path ? ` in ${input.path}` : ''}`,
+      };
+    case 'Grep': {
+      const pat = (input.pattern || '').slice(0, 40);
+      const glob = input.glob ? ` --include="${input.glob}"` : '';
+      return {
+        phase: 'Searching the code',
+        detail: `Grep "${pat}"${glob}`,
+      };
     }
-    default: return `Working...`;
+    case 'Write':
+      return {
+        phase: 'Writing files',
+        detail: `Write ${input.file_path || 'file'}`,
+      };
+    case 'Edit':
+      return {
+        phase: 'Editing files',
+        detail: `Edit ${input.file_path || 'file'}`,
+      };
+    case 'Bash': {
+      // Claude often prefixes commands with a `# comment` line and joins pipes
+      // with real newlines. Flatten to one line so the spinner detail stays
+      // on a single visual row, and strip leading comments.
+      const raw = (input.command || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#'))
+        .join(' ');
+      let phase = 'Running commands';
+      if (/^(npm|pnpm|yarn|bun|pip|gem|go|cargo)\s/.test(raw)) phase = 'Installing packages';
+      else if (/^(ls|cat|find|head|tail)\s/.test(raw)) phase = 'Checking files';
+      else if (/^curl\s/.test(raw)) phase = 'Making requests';
+      else if (/^mkdir\s/.test(raw)) phase = 'Creating directories';
+      return {
+        phase,
+        detail: `Bash ${raw.slice(0, 80)}${raw.length > 80 ? '…' : ''}`,
+      };
+    }
+    default:
+      return {
+        phase: 'Working',
+        detail: toolName,
+      };
   }
 }
 
@@ -31,7 +73,7 @@ export default {
     for await (const message of query({
       prompt,
       options: {
-        maxTurns: 15,
+        maxTurns: 30,
         allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
         cwd,
       }
@@ -40,7 +82,7 @@ export default {
         for (const block of message.message.content) {
           if (block.type === 'text') {
             result += block.text;
-            onStatus?.('Thinking...');
+            onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
           } else if (block.type === 'tool_use') {
             onStatus?.(describeToolUse(block.name, block.input));
           }

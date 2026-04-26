@@ -4,25 +4,29 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 ## What to do
 
-1. **Find where the server is created and routes are registered.** Don't assume any particular file — search the codebase for where {{framework}} is initialized (look for things like `fastify()`, `express()`, `createServer()`, `new Hono()`, etc.) and where routes are defined. That's where the middleware needs to go.
+1. **Find the server entry point.** Open the file where the framework is initialized (`express()`, `fastify()`, `new Hono()`, `createServer()`, etc.) and where routes are registered. That's where the SDK goes.
 
-2. **Add the SDK setup code BEFORE any route definitions.** Here's the pattern to follow:
+2. **Follow the installation pattern in the guide exactly.** Here's the pattern:
 
 {{guide}}
 
-3. **Read the API UUID from `.api/settings.json`** — the `apis[0].id` field. Use `fs.readFileSync` (or equivalent) to read it at startup.
+3. **The API key comes from the environment.** The SDK auto-reads `process.env.RESTLESS_KEY` — you do NOT need to pass it explicitly.
 
-4. **The API key comes from the environment** — `process.env.README_API_KEY`. The SDK reads this automatically, so you don't need to pass it explicitly.
+4. **Wire up user identification via `setup(cb)`.** Look at how this API authenticates its users (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. Run it through `restless.mask()` before logging — that's what identifies the user on the dashboard without exposing the plaintext secret.
 
-5a. **Add `setupMode`** — pass `setupMode: process.env.README_SETUP_MODE === '1'` in the config. This makes the SDK flush logs immediately during setup instead of batching them.
-
-5. **Wire up user identification.** The SDK accepts a `hooks.getUser` function that resolves the API consumer from the incoming request. Look at how this API currently authenticates its consumers (API keys, JWTs, session tokens, etc.) and write a `getUser` hook that extracts the user identity from the request. The hook should return an object with fields like `apiKey`, `email`, `label`, or `company` — whatever is available. If the API already has auth middleware or a user lookup, reuse that. The guide above shows the general pattern.
+5. **Lazy enrichment (optional).** If resolving the user's full info (email, label, company) requires a DB lookup or external call, put that code inside an `enrich: async () => { ... }` function on the SetupResult. The SDK only runs `enrich` on the first request from each user; subsequent requests skip it entirely. This is way better than running a DB query on every request.
 
 ## Rules
-- **NEVER read, open, or access .env, .env.local, .env.*, or any file containing secrets/credentials. This is a hard requirement — not a suggestion. Do not read these files for any reason, including "to check what's there."**
-- **NEVER read files inside node_modules/. The guide above already tells you everything you need to know about the SDK. Do not explore the SDK source code.**
-- Place the middleware/plugin registration BEFORE route definitions so it captures all requests
-- Don't break existing imports, code structure, or formatting
-- Use `require()` style imports if the project uses CommonJS (no `"type": "module"` in package.json)
-- Use `import` style if the project uses ESM
-- Keep the changes minimal — just add the SDK setup, don't refactor anything else
+
+- **NEVER read, open, or access .env, .env.local, .env.*, or any file containing secrets.** This is a hard requirement.
+- **NEVER read files inside node_modules/.** The guide above tells you everything you need to know.
+- **DO NOT modify package.json.** This includes the `scripts` block (no adding `--env-file`, no changing `start` or `dev`), `dependencies`, `engines`, or anything else. The package is already installed. Do not touch this file.
+- **DO NOT modify any other config file** (`tsconfig.json`, `.gitignore`, `Dockerfile`, CI configs, etc.). Your only edits should be to the server source file where the SDK middleware gets registered.
+- **DO NOT install or suggest installing extra packages** (e.g. `dotenv`). The user's environment already provides `RESTLESS_KEY` by the time the server runs — assume `process.env.RESTLESS_KEY` is available.
+- Register the middleware/plugin **BEFORE route definitions** so it captures all requests.
+- Don't break existing imports, code structure, or formatting.
+- Use `require()` style imports if the project uses CommonJS (no `"type": "module"` in package.json). Use `import` style if the project uses ESM.
+- **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, or `hooks.beforeSend`** — these are from the OLD SDK API. The new SDK will ignore them.
+- **Do NOT read `.api/settings.json` manually.** The SDK reads it automatically at startup.
+- **Do NOT substitute `|| 'anonymous'` inside `restless.mask()`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it gracefully. Writing `restless.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.
+- Keep changes minimal — just add the SDK setup, don't refactor anything else.
