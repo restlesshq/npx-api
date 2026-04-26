@@ -4,6 +4,7 @@ import { execSync } from 'child_process';
 import { runAI, loadPrompt, pkgRoot } from '../lib/ai.js';
 import { bold, dim, green, red, cyan, yellow, ask, terminalPrompt, waitForKey } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
+import { CLI_NAME } from '../lib/config.js';
 
 const languageAliases = {
   node: 'javascript',
@@ -147,7 +148,7 @@ export default async function installSdk({
     if (!isSdkInstalled(installDir)) {
       update({ sub: { 0: 'done' }, activeSub: 1, message: [
         `  ${red('✗')} Install didn't complete — ${bold('@restlessai/sdk')} isn't in ${bold(installDirRel + '/node_modules')}.`,
-        dim('  Try running the command yourself, then re-run `npx api setup`.'),
+        dim(`  Try running the command yourself, then re-run \`npx ${CLI_NAME} setup\`.`),
       ]});
       return { detectedLanguage, detectedFramework, guideLanguage, installed: false, wired: false };
     }

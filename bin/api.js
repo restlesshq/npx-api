@@ -14,7 +14,7 @@ import installSdk from '../steps/install-sdk.js';
 import detectAuth from '../steps/detect-auth.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
-import { SITE_URL, CALENDLY_URL } from '../lib/config.js';
+import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { loadSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { fatalError } from '../lib/errors.js';
 
@@ -31,7 +31,7 @@ process.on('SIGINT', () => {
   // Show cursor in case it was hidden, move below current output
   process.stdout.write('\x1b[?25h\n');
   if (setupInProgress) {
-    console.log(dim('\n  Setup interrupted. Run `npx api setup` again to resume.\n'));
+    console.log(dim(`\n  Setup interrupted. Run \`npx ${CLI_NAME} setup\` again to resume.\n`));
   }
   process.exit(0);
 });
@@ -105,7 +105,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (welcomeKey === 'd' || welcomeKey === 'D') {
     console.log('');
     console.log(`  ${dim('Demo repo flow is coming soon. In the meantime, clone')}`);
-    console.log(`  ${dim('https://github.com/restlessai/demo and run `npx api setup` there.')}`);
+    console.log(`  ${dim(`https://github.com/restlessai/demo and run \`npx ${CLI_NAME} setup\` there.`)}`);
     console.log('');
     process.exit(0);
   }
@@ -170,7 +170,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(`  ${green('3.')} ${bold('Nothing runs without your OK.')} You see every file change and command`);
     console.log(`     before it happens, and can bail at any point.`);
     console.log('');
-    console.log(`  Run ${cyan('npx api setup')} again when you're ready.`);
+    console.log(`  Run ${cyan(`npx ${CLI_NAME} setup`)} again when you're ready.`);
     console.log('');
     process.exit(0);
   }
@@ -320,7 +320,7 @@ if (command === 'setup' || command === 'supercharge') {
   const rawRequestIdArg = process.argv[3];
   if (!rawRequestIdArg) {
     console.log(red('\n  ✗ Missing request ID.\n'));
-    console.log('  Usage: npx api debug <request-id>\n');
+    console.log(`  Usage: npx ${CLI_NAME} debug <request-id>\n`);
     process.exit(1);
   }
 
@@ -449,9 +449,9 @@ if (command === 'setup' || command === 'supercharge') {
   console.log(`\n  ${p.dim('View in browser:')} ${SITE_URL}/logs/${requestId}`);
   if (isPlain && !inlineQuestion) {
     console.log(`\n  ${p.bold('Ask AI about this request')} — ask a question in plain English about this log:`);
-    console.log(`  npx api debug ${displayId} --ask "why did this fail?"`);
-    console.log(`  npx api debug ${displayId} --ask "how do I fix this?"`);
-    console.log(`  npx api debug ${displayId} --ask "show me a working curl command"`);
+    console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "why did this fail?"`);
+    console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "how do I fix this?"`);
+    console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "show me a working curl command"`);
   }
   console.log('');
 
@@ -479,7 +479,7 @@ if (command === 'setup' || command === 'supercharge') {
         console.log(`  ${line}`);
       }
       console.log('');
-      console.log(p.dim(`  Ask a follow-up: npx api debug ${displayId} --ask "your question here"`));
+      console.log(p.dim(`  Ask a follow-up: npx ${CLI_NAME} debug ${displayId} --ask "your question here"`));
       console.log('');
     } catch {
       console.log('  Could not generate a response.\n');
@@ -568,8 +568,8 @@ if (command === 'setup' || command === 'supercharge') {
 
   if (!rawUrl) {
     console.log(red('\n  ✗ Missing docs URL.\n'));
-    console.log('  Usage: npx api skill <docs-url>\n');
-    console.log(`  Example: npx api skill ${dim('docs.example.com/docs/my-project')}\n`);
+    console.log(`  Usage: npx ${CLI_NAME} skill <docs-url>\n`);
+    console.log(`  Example: npx ${CLI_NAME} skill ${dim('docs.example.com/docs/my-project')}\n`);
     process.exit(1);
   }
 
@@ -677,5 +677,5 @@ if (command === 'setup' || command === 'supercharge') {
 
 } else {
   console.log(`Unknown command: ${command}`);
-  console.log('Usage: api setup | clear | debug <request-id> | skill <docs-url>');
+  console.log(`Usage: ${CLI_NAME} setup | clear | debug <request-id> | skill <docs-url>`);
 }

@@ -1,19 +1,41 @@
 {
-  "name": "api",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "api-beta",
+  "version": "0.1.0",
+  "description": "AI-powered SDK installer CLI. Scans your project, generates an OpenAPI spec, and wires up the ReadMe SDK.",
   "type": "module",
   "bin": {
-    "api": "./bin/api.js"
+    "api-beta": "bin/api.js"
   },
+  "files": [
+    "bin",
+    "lib",
+    "prompts",
+    "providers",
+    "schemas",
+    "steps",
+    "docs"
+  ],
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm test"
   },
-  "keywords": [],
-  "author": "",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "api",
+    "openapi",
+    "sdk",
+    "cli",
+    "readme",
+    "restless"
+  ],
+  "author": "ReadMe <support@readme.io>",
   "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.89",
     "js-yaml": "^4.1.1"
