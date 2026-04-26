@@ -1,18 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { runAI, loadPrompt } from '../lib/ai.js';
-import { bold, dim, green, yellow, cyan, terminalRunScreen } from '../lib/ui.js';
+import { bold, dim, green, yellow, terminalRunScreen } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
-import {
-  loadOas,
-  getAuthForOperation,
-  curlHasAuth,
-  authToCurlFragment,
-  parseCurl,
-} from '../lib/oas-auth.js';
+
+/**
+ * Swap the base URL in a saved curl for the user's localhost. The saved
+ * curl was built with the production base, but step 3 wants the user to
+ * hit their local dev server, so we rewrite the first http(s) URL.
+ */
+function rewriteCurlBase(curl, localBase) {
+  return curl.replace(/https?:\/\/[^\s/]+/, localBase);
+}
 
 /**
  * Scan a handful of common source files for a `.listen(PORT)` call so the
@@ -35,33 +36,6 @@ function detectLocalPort(searchDir) {
   return '3000';
 }
 
-/**
- * If the LLM-picked curl is missing the auth the OAS says the endpoint
- * requires, append it. Keeps `API_KEY_HERE` at the end so the user can
- * still edit it in one spot.
- */
-function ensureCurlHasAuth(curlCommand, rootDir) {
-  try {
-    const settings = loadSettings(rootDir);
-    const oasApi = settings.apis?.[0];
-    if (!oasApi?.oasFile) return curlCommand;
-    const oas = loadOas(path.join(rootDir, oasApi.oasFile));
-    if (!oas) return curlCommand;
-
-    const parsed = parseCurl(curlCommand);
-    if (!parsed) return curlCommand;
-
-    const auth = getAuthForOperation(oas, parsed.method, parsed.path);
-    if (!auth || curlHasAuth(curlCommand, auth)) return curlCommand;
-
-    const fragment = authToCurlFragment(auth);
-    if (!fragment) return curlCommand;
-    return `${curlCommand.trimEnd()} ${fragment}`;
-  } catch {
-    return curlCommand;
-  }
-}
-
 export default async function testSetup({
   packageDir,
   rootDir,
@@ -71,7 +45,6 @@ export default async function testSetup({
   domain,
   projectId,
   setupKey,
-  aiTool = 'Claude Code',
 }) {
   await startStep({
     update,
@@ -89,43 +62,31 @@ export default async function testSetup({
       {
         label: "What we'll do",
         body:
-          `Start your server (in another terminal), then ${cyan(aiTool)} picks a safe\n` +
-          `GET endpoint from your OpenAPI spec, we hit it with ${bold('curl')}, and\n` +
-          `watch the log show up live on the dashboard side.`,
+          `Start your server (in another terminal), then we hit the test endpoint\n` +
+          `we picked earlier with ${bold('curl')} and watch the log show up live on the\n` +
+          `dashboard side.`,
       },
     ],
     action: 'run a test request',
   });
 
-  // ── Sub 0: Find test endpoint ────────────────────────────────────────────
-  update({ activeSub: 0, message: [
-    `  Picking a safe endpoint from your OpenAPI spec.`,
-    dim('  Prefer GETs, fill in path params with example values, include auth if the spec declares it.'),
-  ]});
-
+  // The test curl was picked at the end of step 1 (when the OAS was fresh)
+  // and saved to .api/settings.json. Read it back and rewrite its base URL
+  // to localhost so the user can hit their dev server without editing the
+  // command. Falls back to a generic GET / if nothing was saved (e.g. the
+  // framework serves OAS at runtime).
   const searchDir = apiRootDir && apiRootDir !== '.' ? path.resolve(packageDir, apiRootDir) : packageDir;
   const localPort = detectLocalPort(searchDir);
   const localBase = `http://localhost:${localPort}`;
 
-  let curlCommand = `curl -sS ${localBase}/`;
-  try {
-    const oasFileForPrompt = loadSettings(rootDir).apis?.[0]?.oasFile || '.api/openapi.json';
-    const aiResult = await runAI(loadPrompt('find-test-endpoint', { oasFile: oasFileForPrompt }), rootDir, { setSpinner });
-    const jsonMatch = aiResult.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[1]);
-      if (parsed.curl) curlCommand = parsed.curl.replace(/BASE_URL_HERE/g, localBase);
-    }
-  } catch {}
+  const settings = loadSettings(rootDir);
+  const apiEntry = settings.apis?.find((a) => a.rootDir === (apiRootDir || '.')) || settings.apis?.[0];
+  let curlCommand = apiEntry?.testCurl
+    ? rewriteCurlBase(apiEntry.testCurl, localBase)
+    : `curl -sS ${localBase}/`;
 
-  // The LLM is unreliable about including auth — sometimes omits the header
-  // even when the spec requires it. Parse the OAS ourselves and patch in the
-  // required auth if it's missing, so the curl the user sees matches what the
-  // endpoint actually wants.
-  curlCommand = ensureCurlHasAuth(curlCommand, rootDir);
-
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    `  ${green('✓')} Found an endpoint. Make sure your server is running on ${bold(localBase)},`,
+  update({ message: [
+    `  ${green('✓')} Make sure your server is running on ${bold(localBase)},`,
     dim(`  then hit enter in the box below to fire off the request.`),
   ]});
 
@@ -148,7 +109,7 @@ export default async function testSetup({
     },
   });
 
-  update({ sub: { 0: 'done', 1: 'done' }, status: 'done', message: [
+  update({ status: 'done', message: [
     result.success
       ? `  ${green('✓')} Test request succeeded${pollConfig ? ' and logs are flowing' : ''}.`
       : `  ${yellow('⚠')} Request didn't come back clean. Double-check your server's running and try again.`,

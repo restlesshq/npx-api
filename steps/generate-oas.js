@@ -9,6 +9,8 @@ import { fatalError } from '../lib/errors.js';
 import { findEndpoints } from '../lib/find-endpoints.js';
 import { findOasCandidates } from '../lib/find-oas.js';
 import { parseOas } from '../lib/oas-parse.js';
+import { loadOas } from '../lib/oas-auth.js';
+import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
@@ -91,6 +93,50 @@ function buildFindingsSection(packageDir) {
   lines.push('');
 
   return lines.join('\n');
+}
+
+/**
+ * Narrow the OAS to a shortlist of safe candidates, then ask the LLM to
+ * pick the one that'd make the best smoke test. If anything goes wrong we
+ * fall back to the top deterministically-ranked candidate, so the user
+ * always gets a working curl.
+ *
+ * Returns a curl string (with `API_KEY_HERE` if auth is required) or
+ * `null` if the OAS has no usable GET endpoints.
+ */
+async function pickTestCurl({ oasFullPath, baseUrl, packageDir, setSpinner }) {
+  const oas = loadOas(oasFullPath);
+  if (!oas) return null;
+
+  const candidates = findTestCandidates(oas, { max: 10 });
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return buildCurl(oas, candidates[0], baseUrl);
+
+  const formatted = candidates.map((c, i) => {
+    const params = c.pathParams.length
+      ? ` (path params: ${c.pathParams.map((p) => `${p.name}=${p.example}`).join(', ')})`
+      : '';
+    const summary = c.summary || c.description || '(no description)';
+    return `${i}. ${c.method} ${c.path}${params}\n   ${summary}`;
+  }).join('\n\n');
+
+  let pick = 0;
+  try {
+    const result = await runAI(
+      loadPrompt('find-test-endpoint', { candidates: formatted }),
+      packageDir,
+      { setSpinner },
+    );
+    const jsonMatch = result.match(/```json\s*([\s\S]*?)```/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (Number.isInteger(parsed.index) && parsed.index >= 0 && parsed.index < candidates.length) {
+        pick = parsed.index;
+      }
+    }
+  } catch {}
+
+  return buildCurl(oas, candidates[pick], baseUrl);
 }
 
 /**
@@ -201,7 +247,7 @@ async function adoptExistingOas({ rootDir, update, selectedApi = null, isInterna
   });
   saveSettings(rootDir, settings);
 
-  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
+  update({ sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' }, status: 'done', message: [
     `  ${green('✓')} ${bold(name)} registered. Ready for the next step.`,
   ]});
 
@@ -487,8 +533,28 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     } catch {}
   }
 
-  // Sub 2: Write to .api/
-  update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+  // Sub 2: Pick a test endpoint now, while the OAS is fresh in our hands.
+  // Step 3 ("Test your setup") just reads `testCurl` off the API entry,
+  // skipping a whole AI round-trip when the user is sitting at the prompt.
+  // Frameworks that serve OAS at runtime have no on-disk file to read, so
+  // skip the picker — step 3 will fall back to a generic curl.
+  let testCurl = null;
+  if (finalOasFile) {
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+      `  Picking a safe ${bold('GET')} endpoint to use as a smoke test.`,
+    ]});
+    try {
+      testCurl = await pickTestCurl({
+        oasFullPath: path.join(rootDir, finalOasFile),
+        baseUrl: domain,
+        packageDir,
+        setSpinner,
+      });
+    } catch {}
+  }
+
+  // Sub 3: Write to .api/
+  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: [
     dim('  Saving settings...'),
   ]});
 
@@ -502,6 +568,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     language: selectedApi.language?.toLowerCase(),
     baseUrl: domain || null,
     internal: isInternal,
+    ...(testCurl && { testCurl }),
     lastSyncedAt: new Date().toISOString(),
   });
 
@@ -531,7 +598,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     const doneMsg = finalOasFile
       ? `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`
       : `  ${green('✓')} ${bold(selectedApi.name)} registered — ${framework} will serve OAS at runtime${isInternal ? dim(' (internal)') : ''}.`;
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [doneMsg] });
+    update({ sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' }, status: 'done', message: [doneMsg] });
   }
 
   return {

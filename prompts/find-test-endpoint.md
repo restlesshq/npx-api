@@ -1,19 +1,22 @@
-Read the OpenAPI spec at {{oasFile}}. Generate a realistic curl command to test this API.
+Pick the single best endpoint to use as a "hello world" smoke test for this API.
 
-Requirements:
-- Pick a safe, non-destructive endpoint (prefer GET list endpoints, avoid DELETE or dangerous mutations)
-- If the endpoint requires path parameters, fill them with realistic example values (e.g. `1`, `abc-123`)
-- Authentication is MANDATORY whenever the spec's top-level `security` or the operation's `security` is non-empty. Check BOTH places; a per-operation `security` overrides the global one. Only omit auth if the matching requirement is `security: []` or neither is set.
-  - For `type: http, scheme: bearer` → add `-H "Authorization: Bearer API_KEY_HERE"`
-  - For `type: http, scheme: basic` → add `-H "Authorization: Basic API_KEY_HERE"`
-  - For `type: apiKey, in: header` → add `-H "<name>: API_KEY_HERE"`
-  - For `type: apiKey, in: query` → append `?<name>=API_KEY_HERE` to the URL
-  - For `type: apiKey, in: cookie` → add `-H "Cookie: <name>=API_KEY_HERE"`
-- If it's a POST/PUT that needs a request body, include a minimal valid JSON body with required fields filled in with realistic example data
-- The base URL should be `BASE_URL_HERE` (we'll replace it)
-- Make sure `API_KEY_HERE` appears as the very last thing in the command, for easy editing
+We've already filtered to safe candidates (GET/HEAD only, no admin/internal/deprecated paths) and ranked them by simplicity. Your job is just to pick the one a developer would most expect us to hit on their behalf.
 
-Output ONLY a JSON block:
+## Candidates
+
+{{candidates}}
+
+## How to choose
+
+- Prefer endpoints that look like a healthcheck, status, list, or "get current user" — anything that returns useful data with the least setup.
+- Prefer endpoints that don't require path params. If they all do, prefer ones whose params look like they'd accept the example value we picked.
+- Avoid anything that looks expensive, paginated through massive datasets, or domain-specific (e.g. "transfer funds", "delete user data").
+- The candidates are pre-ranked. If nothing stands out, pick the first one — it's the simplest.
+
+## Output
+
+Return ONLY a JSON block with the index (0-based) of your chosen candidate and a one-line reason:
+
 ```json
-{ "curl": "curl -sS BASE_URL_HERE/pets -H \"Authorization: Bearer API_KEY_HERE\"" }
+{ "index": 0, "reason": "list endpoint with no params, returns useful data immediately" }
 ```

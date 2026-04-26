@@ -258,7 +258,6 @@ if (command === 'setup' || command === 'supercharge') {
     domain: oasResult.domain,
     projectId,
     setupKey,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
   });
 
   // Step 4: Set up account (log in + upload OAS specs).
