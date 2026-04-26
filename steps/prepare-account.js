@@ -46,9 +46,9 @@ function existingRestlessKey(envPath) {
 
 /**
  * Sub 0 of Step 2. Generates the project's write key, registers the
- * project with the metrics/site backend, uploads the OAS file so it's
- * ready for the user's eventual login claim, and writes `RESTLESS_KEY`
- * to `.env`.
+ * project with the metrics/site backend, and writes `RESTLESS_KEY` to
+ * `.env`. The OAS upload is deferred to step 4 (Set up account → Upload
+ * specs) so failures land on a step that mentions OAS.
  *
  * Running this BEFORE the SDK install means: when the install step edits
  * the server source file, auto-restarters (nodemon, tsx --watch, node
@@ -121,40 +121,6 @@ export default async function prepareAccount({
     ]);
   }
 
-  // Upload the OAS so it's there waiting when the user logs in later.
-  const settings = loadSettings(rootDir);
-  const oasApi = settings.apis[0];
-  if (oasApi?.oasFile) {
-    setSpinner('Uploading OpenAPI spec');
-    const oasPath = path.join(rootDir, oasApi.oasFile);
-    if (fs.existsSync(oasPath)) {
-      try {
-        const oasRaw = fs.readFileSync(oasPath, 'utf8');
-        const isJson = oasPath.endsWith('.json');
-        const uploadRes = await fetch(`${SITE_URL}/api/projects/${projectId}/oas`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            setup_key: setupKey,
-            oas_raw: oasRaw,
-            format: isJson ? 'json' : 'yaml',
-          }),
-          signal: AbortSignal.timeout(10000),
-        });
-        if (!uploadRes.ok) {
-          const errText = await uploadRes.text().catch(() => '');
-          setSpinner('');
-          fatalError(`OAS upload failed (HTTP ${uploadRes.status}).`, [
-            errText && errText.slice(0, 200),
-            `Endpoint: ${SITE_URL}/api/projects/${projectId}/oas`,
-          ].filter(Boolean));
-        }
-      } catch (err) {
-        setSpinner('');
-        fatalError(`OAS upload error.`, [err.message]);
-      }
-    }
-  }
   setSpinner('');
 
   // Write the key to .env unless it's already there.

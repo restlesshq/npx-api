@@ -220,9 +220,10 @@ if (command === 'setup' || command === 'supercharge') {
     existingOas: hasOas,
   });
 
-  // Step 2 sub 0: Generate API key, register project, upload OAS, write .env.
+  // Step 2 sub 0: Generate API key, register project, write .env.
   // Runs BEFORE the SDK install so the source-file edit in sub 2 triggers an
   // auto-restart (nodemon / tsx --watch / node --watch) that loads the key.
+  // OAS upload is deferred to step 4.
   const { apiKey, projectId, setupKey } = await prepareAccount({
     packageDir,
     rootDir,
@@ -260,10 +261,12 @@ if (command === 'setup' || command === 'supercharge') {
     aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
   });
 
-  // Step 4: Set up account
+  // Step 4: Set up account (log in + upload OAS specs).
   await setupAccount({
     rootDir,
+    apiRootDir: oasResult.apiRootDir,
     update: plan.makeUpdater(3),
+    setSpinner,
     apiKey,
     projectId,
     setupKey,

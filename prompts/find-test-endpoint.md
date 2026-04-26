@@ -1,4 +1,4 @@
-Read the OpenAPI spec at .api/openapi.yaml. Generate a realistic curl command to test this API.
+Read the OpenAPI spec at {{oasFile}}. Generate a realistic curl command to test this API.
 
 Requirements:
 - Pick a safe, non-destructive endpoint (prefer GET list endpoints, avoid DELETE or dangerous mutations)

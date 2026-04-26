@@ -8,6 +8,38 @@ import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
 import { findEndpoints } from '../lib/find-endpoints.js';
 import { findOasCandidates } from '../lib/find-oas.js';
+import { parseOas } from '../lib/oas-parse.js';
+
+const MAX_OAS_FIX_ATTEMPTS = 2;
+
+// Read the file we just wrote and parse it the same way the server will. If
+// it doesn't parse, hand the error back to the LLM and ask it to fix the file
+// in place. Retries up to MAX_OAS_FIX_ATTEMPTS times.
+async function validateAndFixOas({ oasFullPath, packageDir, setSpinner }) {
+  for (let attempt = 0; attempt <= MAX_OAS_FIX_ATTEMPTS; attempt++) {
+    let raw;
+    try {
+      raw = fs.readFileSync(oasFullPath, 'utf8');
+    } catch (err) {
+      return { ok: false, error: `Could not read ${oasFullPath}: ${err.message}` };
+    }
+    const format = oasFullPath.endsWith('.json') ? 'json' : 'yaml';
+    const result = parseOas(raw, format);
+    if (result.ok) return { ok: true };
+
+    if (attempt === MAX_OAS_FIX_ATTEMPTS) {
+      return { ok: false, error: result.error };
+    }
+
+    setSpinner('Fixing OpenAPI spec');
+    const fixPrompt = loadPrompt('fix-oas', {
+      oasFile: oasFullPath,
+      parseError: result.error,
+    });
+    await runAI(fixPrompt, packageDir, { setSpinner });
+  }
+  return { ok: false, error: 'Exhausted fix attempts' };
+}
 
 /**
  * Build a compact findings section to prepend to the LLM prompt.
@@ -374,7 +406,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
   const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
 
-  const oasFile = '.api/openapi.yaml';
+  const oasFile = '.api/openapi.json';
   const placeholderDomain = 'https://example.com';
   let skipReason = null;
   let finalOasFile = oasFile;
@@ -420,6 +452,19 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     };
 
     await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
+
+    // Validate before we go any further — server uses the same parse logic,
+    // so if it fails here it'll fail there too. Hand errors back to the LLM
+    // and let it iterate.
+    const oasFullPath = path.join(rootDir, oasFile);
+    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+    if (!validation.ok) {
+      fatalError('Generated OpenAPI spec failed to parse.', [
+        validation.error,
+        `File: ${oasFullPath}`,
+        'Try re-running, or open the file and fix it by hand.',
+      ]);
+    }
   }
 
   // Ask for the base URL

@@ -109,7 +109,8 @@ export default async function testSetup({
 
   let curlCommand = `curl -sS ${localBase}/`;
   try {
-    const aiResult = await runAI(loadPrompt('find-test-endpoint'), rootDir, { setSpinner });
+    const oasFileForPrompt = loadSettings(rootDir).apis?.[0]?.oasFile || '.api/openapi.json';
+    const aiResult = await runAI(loadPrompt('find-test-endpoint', { oasFile: oasFileForPrompt }), rootDir, { setSpinner });
     const jsonMatch = aiResult.match(/```json\s*([\s\S]*?)```/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[1]);
