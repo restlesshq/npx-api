@@ -17,6 +17,12 @@ import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { loadSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { fatalError } from '../lib/errors.js';
+import * as debug from '../lib/debug.js';
+
+// Initialize debug capture FIRST, before anything else writes to stdout —
+// the stream wrappers need to be in place to record the welcome screen.
+const debugEnabled = debug.init({ argv: process.argv });
+debug.attachExitHandlers();
 
 // Suppress Node's unsettled top-level await warning
 process.removeAllListeners('warning');
@@ -33,7 +39,7 @@ process.on('SIGINT', () => {
   if (setupInProgress) {
     console.log(dim(`\n  Setup interrupted. Run \`npx ${CLI_NAME} setup\` again to resume.\n`));
   }
-  process.exit(0);
+  debug.flushAndExit(0);
 });
 
 function hasClaude() {
@@ -70,6 +76,24 @@ async function runDetectAuth(plan, setSpinner, packageDir, rootDir, settings) {
 
 const command = process.argv[2];
 
+/**
+ * One-shot banner shown when `--debug` is on. Makes it impossible to
+ * miss that the run is being captured and uploaded — keeps the user
+ * in control even though they enabled it themselves. Returns nothing
+ * when debug is off.
+ */
+async function showDebugBanner() {
+  if (!debugEnabled) return;
+  console.log('');
+  console.log(`  ${bold(yellow('⚠  Debug mode is on.'))}`);
+  console.log(`  ${dim('Everything in this run — your input, the AI tool calls, output, and errors —')}`);
+  console.log(`  ${dim('will be uploaded to the Restless team when the CLI exits.')}`);
+  console.log(`  ${dim('Normal runs send nothing. Re-run without --debug to disable.')}`);
+  console.log('');
+}
+
+await showDebugBanner();
+
 if (command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
   console.log('');
@@ -77,15 +101,16 @@ if (command === 'setup' || command === 'supercharge') {
   console.log('');
 
   // "Restless helps make [400 Bad Request] into [200 Okay]."
-  // The two status codes spin as "loading", then resolve into red/green.
+  // Each status code shows a brief spinner, then settles into a colored
+  // circle + the code, and typing continues. No erase-and-replace —
+  // the spinner lands in place where the circle ends up.
   // Swap `spinnerStyle` to try: arc, halfcircle, piefill, pulse, sparkle, concentric, braille
   const spinnerStyle = 'concentric';
-  const demoPath = 'GET /api/endpoint';
 
   await typeOut(`  Restless makes sure every `);
-  await inlineStatus({ code: '400 Bad Request', success: false, style: spinnerStyle, loadingText: demoPath });
+  await inlineStatus({ code: '400 Bad Request', success: false, style: spinnerStyle });
   await typeOut(` turns out `);
-  await inlineStatus({ code: '200 Okay', success: true, style: spinnerStyle, loadingText: demoPath });
+  await inlineStatus({ code: '200 Okay', success: true, style: spinnerStyle });
   await typeLine(`.`);
   console.log('');
 
@@ -107,7 +132,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(`  ${dim('Demo repo flow is coming soon. In the meantime, clone')}`);
     console.log(`  ${dim(`https://github.com/restlessai/demo and run \`npx ${CLI_NAME} setup\` there.`)}`);
     console.log('');
-    process.exit(0);
+    debug.flushAndExit(0);
   }
 
   if (welcomeKey === 'h' || welcomeKey === 'H') {
@@ -120,7 +145,7 @@ if (command === 'setup' || command === 'supercharge') {
       else if (process.platform === 'win32') execSync(`start "${CALENDLY_URL}"`);
       else execSync(`xdg-open "${CALENDLY_URL}"`);
     } catch {}
-    process.exit(0);
+    debug.flushAndExit(0);
   }
 
   // Any other key: continue normal setup.
@@ -172,7 +197,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('');
     console.log(`  Run ${cyan(`npx ${CLI_NAME} setup`)} again when you're ready.`);
     console.log('');
-    process.exit(0);
+    debug.flushAndExit(0);
   }
 
   if (choice === 0 && !hasClaude()) {
@@ -180,7 +205,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(red('  ✗ Claude is not installed.\n'));
     console.log('  Install it with:');
     console.log(cyan('    npm install -g @anthropic-ai/claude-code\n'));
-    process.exit(1);
+    debug.flushAndExit(1);
   }
 
   // TODO: wire Codex and Manual flows. For now, only Claude path continues.
@@ -188,7 +213,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('');
     console.log(dim(`  [dev] ${['Claude','Codex','Manual'][choice]} flow not yet implemented.`));
     console.log('');
-    process.exit(0);
+    debug.flushAndExit(0);
   }
   // packageDir = where the user ran the command (scopes what we analyze)
   // rootDir = git root (where .api/ lives)
@@ -323,7 +348,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (!rawRequestIdArg) {
     console.log(red('\n  ✗ Missing request ID.\n'));
     console.log(`  Usage: npx ${CLI_NAME} debug <request-id>\n`);
-    process.exit(1);
+    debug.flushAndExit(1);
   }
 
   // Strip decorative prefix (e.g. "TST-abc123" → "abc123") — the prefix is interchangeable
@@ -382,7 +407,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (!log) {
     console.log(p.red(`\n  ✗ Log not found for request ID: ${requestId}\n`));
     console.log(p.dim('  Make sure the API server is running and the SDK is configured.\n'));
-    process.exit(1);
+    debug.flushAndExit(1);
   }
 
   const har = log.har || {};
@@ -521,7 +546,7 @@ if (command === 'setup' || command === 'supercharge') {
           } else if (key === '\x03') {
             process.stdin.setRawMode(false);
             process.stdout.write('\n');
-            process.exit(0);
+            debug.flushAndExit(0);
           } else if (key.charCodeAt(0) >= 32) {
             buffer += key;
             process.stdout.write(key);
@@ -572,7 +597,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(red('\n  ✗ Missing docs URL.\n'));
     console.log(`  Usage: npx ${CLI_NAME} skill <docs-url>\n`);
     console.log(`  Example: npx ${CLI_NAME} skill ${dim('docs.example.com/docs/my-project')}\n`);
-    process.exit(1);
+    debug.flushAndExit(1);
   }
 
   // Accept "docs.site.com", "https://docs.site.com/docs/x", "docs.site.com/docs/x/skill.md".
@@ -593,12 +618,12 @@ if (command === 'setup' || command === 'supercharge') {
     if (!res.ok) {
       console.log(`\n  ${red('✗')} ${red(`HTTP ${res.status}`)} ${dim(`from ${skillUrl}`)}\n`);
       console.log(dim('  Make sure the URL points at a project on a Restless docs deployment.\n'));
-      process.exit(1);
+      debug.flushAndExit(1);
     }
     body = await res.text();
   } catch (err) {
     console.log(`\n  ${red('✗')} Could not reach ${cyan(skillUrl)}: ${err.message}\n`);
-    process.exit(1);
+    debug.flushAndExit(1);
   }
 
   // Pull `name:` from the frontmatter so the install path matches whatever
@@ -636,7 +661,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(`    ${cyan(prettyTarget)}\n`);
     console.log(`  Quick way:\n`);
     console.log(`    ${dim('mkdir -p ~/.claude/skills/' + skillName + ' && curl -sSL ' + skillUrl + ' > ' + prettyTarget)}\n`);
-    process.exit(0);
+    debug.flushAndExit(0);
   }
 
   console.log(`  ${dim('This will install to')} ${cyan(prettyTarget)}\n`);
@@ -644,7 +669,7 @@ if (command === 'setup' || command === 'supercharge') {
   const ok = await askYesNo('', { defaultValue: true });
   if (!ok) {
     console.log(dim('\n  Cancelled. To grab it manually, rerun with --manual.\n'));
-    process.exit(0);
+    debug.flushAndExit(0);
   }
 
   // Refuse to overwrite an existing skill silently — could clobber an
@@ -656,7 +681,7 @@ if (command === 'setup' || command === 'supercharge') {
     const overwrite = await askYesNo('', { defaultValue: false });
     if (!overwrite) {
       console.log(dim('\n  Left existing file alone.\n'));
-      process.exit(0);
+      debug.flushAndExit(0);
     }
   }
 

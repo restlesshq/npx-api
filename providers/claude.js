@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import * as debug from '../lib/debug.js';
 
 /**
  * Map a tool_use block into {phase, detail}:
@@ -70,6 +71,7 @@ export default {
 
   async run(prompt, cwd, { onStatus } = {}) {
     let result = '';
+    debug.log('ai.run.start', { provider: 'claude', cwd, promptChars: prompt?.length ?? 0, prompt });
     for await (const message of query({
       prompt,
       options: {
@@ -83,12 +85,15 @@ export default {
           if (block.type === 'text') {
             result += block.text;
             onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
+            debug.log('ai.text', { text: block.text });
           } else if (block.type === 'tool_use') {
             onStatus?.(describeToolUse(block.name, block.input));
+            debug.log('ai.tool_use', { tool: block.name, input: block.input });
           }
         }
       }
     }
+    debug.log('ai.run.end', { provider: 'claude', resultChars: result.length });
     return result;
   },
 };
