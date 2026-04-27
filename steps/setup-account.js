@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
 import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan } from '../lib/ui.js';
 import { loadSettings } from '../lib/settings.js';
@@ -39,23 +38,39 @@ async function pollForAuth(token, signal) {
 
 /**
  * Wait for the user to press Enter, but stay cancellable so polling can
- * cut us off if they click the URL instead. The returned `cancel()` closes
- * the readline interface and resolves the promise with `null`.
+ * cut us off if they click the URL instead. Uses raw-mode keypress
+ * detection rather than readline because readline + rawMode toggling
+ * leaves stdin in configurations that interact badly with the rest of
+ * the CLI's UI (see the note above `askYesNo` in lib/ui.js).
  */
 function waitForEnter() {
   let cancel;
   const promise = new Promise((resolve) => {
-    try { process.stdin.setRawMode(false); } catch {}
-    process.stdin.removeAllListeners('data');
-    process.stdin.removeAllListeners('keypress');
-    process.stdin.removeAllListeners('readable');
-    process.stdin.resume();
+    const { stdin } = process;
+    stdin.removeAllListeners('data');
+    stdin.removeAllListeners('keypress');
+    stdin.removeAllListeners('readable');
+    try { stdin.setRawMode(true); } catch {}
+    stdin.setEncoding('utf8');
+    stdin.resume();
 
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-    rl.once('SIGINT', () => { rl.close(); process.stdout.write('\n'); process.exit(130); });
-    rl.question('', () => { rl.close(); process.stdin.pause(); resolve('enter'); });
+    const cleanup = () => {
+      stdin.removeListener('data', onData);
+      try { stdin.setRawMode(false); } catch {}
+      stdin.pause();
+    };
 
-    cancel = () => { rl.close(); process.stdin.pause(); resolve(null); };
+    const onData = (key) => {
+      if (key === '\x03') { cleanup(); process.stdout.write('\n'); process.exit(130); }
+      if (key === '\r' || key === '\n') { cleanup(); resolve('enter'); }
+      // Ignore everything else — typing in the terminal at this prompt
+      // shouldn't do anything except wait for Enter or get pre-empted by
+      // the polling success.
+    };
+
+    stdin.on('data', onData);
+
+    cancel = () => { cleanup(); resolve(null); };
   });
   return { promise, cancel: () => cancel() };
 }
@@ -76,11 +91,61 @@ export default async function setupAccount({
   projectId,
   setupKey,
 }) {
-  // ── Sub 0: Log in to claim the project ──────────────────────────
+  // ── Sub 0: Upload OpenAPI specs ─────────────────────────────────
+  // Stage everything the server needs BEFORE the user logs in, so the
+  // claim flow has nothing left to do but mark the project as theirs.
+  // The OAS lands in `PendingOAS` keyed by setupKeyHash; the claim
+  // route picks it up after auth completes.
+  const settings = loadSettings(rootDir);
+  const apiEntry = pickApiEntry(settings, apiRootDir);
+  const oasFile = apiEntry?.oasFile;
+  const oasPath = oasFile ? path.join(rootDir, oasFile) : null;
+  const hasLocalOas = !!(oasPath && fs.existsSync(oasPath));
+
+  update({ status: 'active', activeSub: 0, message: hasLocalOas
+    ? [`  Uploading ${bold(oasFile)} to your account.`]
+    : [dim('  No local OpenAPI spec to upload — your framework serves it at runtime.')],
+  });
+
+  if (hasLocalOas) {
+    setSpinner?.('Uploading OpenAPI spec');
+    try {
+      const oasRaw = fs.readFileSync(oasPath, 'utf8');
+      const isJson = oasPath.endsWith('.json');
+      const uploadRes = await fetch(`${SITE_URL}/api/projects/${projectId}/oas`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          setup_key: setupKey,
+          oas_raw: oasRaw,
+          format: isJson ? 'json' : 'yaml',
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      setSpinner?.('');
+      if (!uploadRes.ok) {
+        const errText = await uploadRes.text().catch(() => '');
+        update({ status: 'failed', message: [
+          `  ${red('✗')} OAS upload failed (HTTP ${uploadRes.status}).`,
+          errText ? dim(`  ${errText.slice(0, 200)}`) : null,
+          dim(`  Endpoint: ${SITE_URL}/api/projects/${projectId}/oas`),
+        ].filter(Boolean) });
+        return { apiKey };
+      }
+    } catch (err) {
+      setSpinner?.('');
+      update({ status: 'failed', message: [
+        `  ${red('✗')} OAS upload error: ${err.message}`,
+      ]});
+      return { apiKey };
+    }
+  }
+
+  // ── Sub 1: Log in to claim the project ──────────────────────────
   // Hand the project + setupKey to the server up front, keyed by an
-  // opaque token. The login URL we display only needs that token, so the
-  // setupKey never lands in browser history, the OAuth referer, the
-  // user's terminal scrollback, or screen shares.
+  // opaque token. The login URL we display only needs that token, so
+  // the setupKey never lands in browser history, the OAuth referer,
+  // the user's terminal scrollback, or screen shares.
   const token = crypto.randomBytes(16).toString('hex');
   setSpinner?.('Preparing login link');
   try {
@@ -92,7 +157,7 @@ export default async function setupAccount({
     if (!startRes.ok) {
       const text = await startRes.text().catch(() => '');
       setSpinner?.('');
-      update({ status: 'failed', message: [
+      update({ sub: { 0: 'done' }, status: 'failed', message: [
         `  ${red('✗')} Couldn't prepare login link (HTTP ${startRes.status}).`,
         text ? dim(`  ${text.slice(0, 200)}`) : null,
       ].filter(Boolean) });
@@ -100,7 +165,7 @@ export default async function setupAccount({
     }
   } catch (err) {
     setSpinner?.('');
-    update({ status: 'failed', message: [
+    update({ sub: { 0: 'done' }, status: 'failed', message: [
       `  ${red('✗')} Couldn't reach ${SITE_URL} to prepare the login link.`,
       dim(`  ${err.message}`),
     ]});
@@ -109,13 +174,19 @@ export default async function setupAccount({
   setSpinner?.('');
   const loginUrl = `${SITE_URL}/login?token=${token}`;
 
-  update({ status: 'active', activeSub: 0, message: [
+  const uploadDoneLine = hasLocalOas
+    ? `  ${green('✓')} Uploaded ${bold(oasFile)}.`
+    : null;
+
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    uploadDoneLine,
+    uploadDoneLine ? '' : null,
     '  Now log in to claim your project on Restless.',
     '',
     `    ${cyan(loginUrl)}`,
     '',
     dim('  Press Enter to open in your browser, or click the link above.'),
-  ]});
+  ].filter((l) => l !== null) });
 
   // Race the Enter prompt against polling: if the user clicks the link
   // directly (skipping Enter), polling finishes first and we cancel the
@@ -132,11 +203,13 @@ export default async function setupAccount({
   let result;
   if (winner.kind === 'enter') {
     openBrowser(loginUrl);
-    update({ activeSub: 0, message: [
+    update({ activeSub: 1, message: [
+      uploadDoneLine,
+      uploadDoneLine ? '' : null,
       '  Waiting for you to log in...',
       '',
       dim('  Complete the login in your browser. We\'ll continue automatically.'),
-    ]});
+    ].filter((l) => l !== null) });
     process.stdin.resume();
     result = await pollPromise;
     process.stdin.pause();
@@ -148,70 +221,11 @@ export default async function setupAccount({
 
   const { email, slug } = result;
 
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    `  ${green('✓')} Logged in as ${bold(email)}.`,
-    `  ${green('✓')} Project claimed: ${cyan(`${SITE_URL}/api/${slug}`)}`,
-  ]});
-
-  // ── Sub 1: Upload OpenAPI specs ─────────────────────────────────
-  const settings = loadSettings(rootDir);
-  const apiEntry = pickApiEntry(settings, apiRootDir);
-  const oasFile = apiEntry?.oasFile;
-  const oasPath = oasFile ? path.join(rootDir, oasFile) : null;
-
-  if (!oasPath || !fs.existsSync(oasPath)) {
-    // No local OAS file (framework serves it natively, or nothing was generated).
-    update({ sub: { 0: 'done', 1: 'done' }, status: 'done', message: [
-      `  ${green('✓')} Logged in as ${bold(email)}.`,
-      `  ${green('✓')} Project claimed: ${cyan(`${SITE_URL}/api/${slug}`)}`,
-      dim('  No local OpenAPI spec to upload — your framework serves it at runtime.'),
-    ]});
-    return { apiKey, email, slug };
-  }
-
-  update({ activeSub: 1, message: [
-    `  Uploading ${bold(oasFile)} to your account.`,
-  ]});
-  setSpinner?.('Uploading OpenAPI spec');
-
-  try {
-    const oasRaw = fs.readFileSync(oasPath, 'utf8');
-    const isJson = oasPath.endsWith('.json');
-    const uploadRes = await fetch(`${SITE_URL}/api/projects/${projectId}/oas`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        setup_key: setupKey,
-        oas_raw: oasRaw,
-        format: isJson ? 'json' : 'yaml',
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-    setSpinner?.('');
-    if (!uploadRes.ok) {
-      const errText = await uploadRes.text().catch(() => '');
-      update({ sub: { 0: 'done' }, activeSub: 1, status: 'failed', message: [
-        `  ${green('✓')} Logged in as ${bold(email)}.`,
-        `  ${red('✗')} OAS upload failed (HTTP ${uploadRes.status}).`,
-        errText ? dim(`  ${errText.slice(0, 200)}`) : null,
-        dim(`  Endpoint: ${SITE_URL}/api/projects/${projectId}/oas`),
-      ].filter(Boolean) });
-      return { apiKey, email, slug };
-    }
-  } catch (err) {
-    setSpinner?.('');
-    update({ sub: { 0: 'done' }, activeSub: 1, status: 'failed', message: [
-      `  ${green('✓')} Logged in as ${bold(email)}.`,
-      `  ${red('✗')} OAS upload error: ${err.message}`,
-    ]});
-    return { apiKey, email, slug };
-  }
-
   update({ sub: { 0: 'done', 1: 'done' }, status: 'done', message: [
+    uploadDoneLine,
     `  ${green('✓')} Logged in as ${bold(email)}.`,
     `  ${green('✓')} Project claimed: ${cyan(`${SITE_URL}/api/${slug}`)}`,
-    `  ${green('✓')} OpenAPI spec uploaded.`,
-  ]});
+  ].filter(Boolean) });
 
   return { apiKey, email, slug };
 }

@@ -1,4 +1,4 @@
-Pick the single best endpoint to use as a "hello world" smoke test for this API.
+Pick the single best endpoint to use as a "hello world" demo endpoint for this API.
 
 We've already filtered to safe candidates (GET/HEAD only, no admin/internal/deprecated paths) and ranked them by simplicity. Your job is just to pick the one a developer would most expect us to hit on their behalf.
 

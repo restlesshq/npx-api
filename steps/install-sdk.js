@@ -46,10 +46,23 @@ function isSdkWired(packageDir) {
 }
 
 function isSdkInstalled(packageDir) {
-  return (
-    fs.existsSync(path.join(packageDir, 'node_modules', '@restlessai', 'sdk')) ||
-    fs.existsSync(path.join(packageDir, 'node_modules', 'restlessai'))
-  );
+  // Check for a readable package.json — not just that the directory exists.
+  // A bare existsSync would return true for a broken symlink (e.g. left
+  // behind after a local link was renamed), making the install step skip
+  // without ever replacing the dangling link, and then `require()`
+  // explodes at runtime.
+  const candidates = [
+    path.join(packageDir, 'node_modules', '@restlessai', 'sdk', 'package.json'),
+    path.join(packageDir, 'node_modules', 'restlessai', 'package.json'),
+  ];
+  return candidates.some((p) => {
+    try {
+      fs.accessSync(p, fs.constants.R_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**

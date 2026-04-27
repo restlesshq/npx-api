@@ -97,7 +97,7 @@ function buildFindingsSection(packageDir) {
 
 /**
  * Narrow the OAS to a shortlist of safe candidates, then ask the LLM to
- * pick the one that'd make the best smoke test. If anything goes wrong we
+ * pick the one that'd make the best demo endpoint. If anything goes wrong we
  * fall back to the top deterministically-ranked candidate, so the user
  * always gets a working curl.
  *
@@ -541,7 +541,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   let testCurl = null;
   if (finalOasFile) {
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
-      `  Picking a safe ${bold('GET')} endpoint to use as a smoke test.`,
+      `  Picking a safe ${bold('GET')} endpoint to use as a demo endpoint.`,
     ]});
     try {
       testCurl = await pickTestCurl({
