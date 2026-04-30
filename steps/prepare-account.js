@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { bold, dim, green, cyan, ask, askYesNo } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, cyan, ask, askYesNo, waitForKey } from '../lib/ui.js';
 import { loadSettings, saveSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
 import { fatalError } from '../lib/errors.js';
@@ -150,12 +150,18 @@ export default async function prepareAccount({
     ]});
   } else {
     update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  Add this line to ${bold(envRelative)}:`,
+      `  ${bold('Add this line to')} ${bold(envRelative)}  ${yellow("— we won't show this key again:")}`,
       '',
       `    ${bold(appendLine)}`,
       '',
-      dim(`  Then restart your server once the next sub-step finishes wiring the middleware.`),
+      dim(`  Restart your server after the next sub-step wires the middleware.`),
+      '',
+      `  ${dim('Press ENTER once you\'ve saved the key.')}`,
     ]});
+    while (true) {
+      const k = await waitForKey();
+      if (k === '\r' || k === '\n') break;
+    }
   }
 
   return { apiKey, projectId, setupKey, envFile, envRelative };

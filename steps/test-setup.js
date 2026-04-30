@@ -7,12 +7,33 @@ import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 
 /**
- * Swap the base URL in a saved curl for the user's localhost. The saved
- * curl was built with the production base, but step 3 wants the user to
- * hit their local dev server, so we rewrite the first http(s) URL.
+ * Force every absolute URL in the saved curl to point at the local
+ * dev server. The saved curl was built with the OAS `servers[0].url`
+ * (often a production host); step 3 must always hit localhost so the
+ * SDK middleware actually runs against the dev process.
+ *
+ * We replace ALL `http(s)://host[:port]` occurrences (not just the
+ * first) so an edge-case URL inside `--data` can't smuggle in a prod
+ * call, and we trim trailing slashes to avoid a double-slash when the
+ * curl path is itself absolute.
  */
 function rewriteCurlBase(curl, localBase) {
-  return curl.replace(/https?:\/\/[^\s/]+/, localBase);
+  const clean = localBase.replace(/\/+$/, '');
+  return curl.replace(/https?:\/\/[^\s/'"`]+/g, clean);
+}
+
+/**
+ * Belt-and-braces guard: after rewriting, sniff the actual URL the
+ * curl will hit and confirm it's localhost. If somehow it isn't (the
+ * user edited the box, the saved curl had a non-URL form, etc.) we
+ * refuse to run and surface a clear error instead of silently firing
+ * a request at production.
+ */
+function curlTargetIsLocal(curl) {
+  const match = curl.match(/\bhttps?:\/\/([^\s/'"`]+)/);
+  if (!match) return true; // no absolute URL → curl will use a relative one, which means localhost only if the cwd makes it so. Treat as ok and let curl fail loudly.
+  const host = match[1].toLowerCase().split(':')[0];
+  return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || host === '::1';
 }
 
 /**
@@ -101,23 +122,75 @@ function diagnoseFromHeaders(headers) {
 }
 
 /**
- * Scan a handful of common source files for a `.listen(PORT)` call so the
- * default curl hits the right localhost port. Falls back to 3000.
+ * Best-effort detection of the port the dev server runs on. We check
+ * multiple sources because frameworks differ in where the port is
+ * declared:
+ *
+ *   1. `package.json` scripts — `next dev -p 4000`, `vite --port 4000`,
+ *      `nodemon -p 4000`, etc. Most JS/TS apps surface their port here.
+ *   2. `.env*` files — `PORT=4000`. Common for Express/Fastify/Koa and
+ *      also honored by `next dev` and `nuxt dev`.
+ *   3. Source files — `.listen(PORT)` literal or `PORT = N` constant.
+ *      Catches the bare-Express path; Next.js / Nuxt have no such call.
+ *
+ * Falls back to 3000 (Next.js / Express convention) when nothing
+ * matches. We deliberately read .env* here even though AI prompts
+ * forbid it — this is a local Node read, not a value sent to an LLM,
+ * and the port is the only field we extract.
  */
 function detectLocalPort(searchDir) {
+  // 1. package.json scripts.
+  try {
+    const pkgPath = path.join(searchDir, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const scripts = pkg.scripts || {};
+      // Try the conventional dev-script names first, then any script.
+      const ordered = [
+        ...['dev', 'start:dev', 'start', 'serve', 'develop'].map((k) => scripts[k]).filter(Boolean),
+        ...Object.values(scripts),
+      ];
+      for (const cmd of ordered) {
+        if (typeof cmd !== 'string') continue;
+        // Match `-p 4000`, `--port 4000`, `--port=4000`, and inline
+        // `PORT=4000 next dev`. Anchor on word boundaries so we don't
+        // grab e.g. `--polyfill 1234`.
+        const m =
+          cmd.match(/(?:^|\s)(?:-p|--port)\s*=?\s*(\d{2,5})\b/) ||
+          cmd.match(/\bPORT\s*=\s*(\d{2,5})\b/);
+        if (m) return m[1];
+      }
+    }
+  } catch {}
+
+  // 2. .env* files. We don't list every variant by hand — glob the dir.
+  try {
+    const envFiles = fs.readdirSync(searchDir).filter((f) => /^\.env(\..+)?$/.test(f));
+    for (const f of envFiles) {
+      try {
+        const content = fs.readFileSync(path.join(searchDir, f), 'utf8');
+        // `PORT=4000` (no quotes), `PORT="4000"`, `PORT='4000'`.
+        const m = content.match(/^\s*PORT\s*=\s*["']?(\d{2,5})["']?\s*$/m);
+        if (m) return m[1];
+      } catch {}
+    }
+  } catch {}
+
+  // 3. Source files. Broader extension list now (.tsx, .jsx, .mjs, .cjs).
   try {
     const files = execSync(
-      'find . -maxdepth 2 -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.rb" | head -20',
+      'find . -maxdepth 3 \\( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.py" -o -name "*.rb" \\) -not -path "*/node_modules/*" | head -40',
       { cwd: searchDir, encoding: 'utf8' },
     );
     for (const file of files.trim().split('\n').filter(Boolean)) {
       try {
         const content = fs.readFileSync(path.join(searchDir, file), 'utf8');
-        const match = content.match(/\.listen\(\s*(\d{4,5})\s*[,)]/) || content.match(/PORT\s*(?:=|:)\s*(\d{4,5})/);
+        const match = content.match(/\.listen\(\s*(\d{2,5})\s*[,)]/) || content.match(/\bPORT\s*(?:=|:)\s*(\d{2,5})\b/);
         if (match) return match[1];
       } catch {}
     }
   } catch {}
+
   return '3000';
 }
 
@@ -195,8 +268,8 @@ export default async function testSetup({
   // Hint copy. The row's icon column already shows the warning glyph,
   // so the strings here lead straight into the message.
   const noSdkHint = [
-    `The Restless SDK didn't run on this request.`,
-    `Add the middleware (see ${bold('.api/INSTALL.md')}) and ${bold('restart')} your server.`,
+    `The Restless SDK didn't fire on this request.`,
+    `Either the middleware isn't wired in, or ${bold('RESTLESS_KEY')} isn't set in the running process — ${bold('restart')} your server after fixing either.`,
   ];
   const noKeyHint = [
     `Server is loaded, but ${bold('RESTLESS_KEY')} isn't set in the running process.`,
@@ -218,6 +291,20 @@ export default async function testSetup({
       let runCmd = cmd;
       if (!curlHasIncludeFlag(runCmd)) {
         runCmd = runCmd.replace(/^curl\b/, 'curl -i');
+      }
+
+      // If the user pasted a non-local URL (or somehow the rewrite
+      // missed one), refuse to run rather than firing at production.
+      // Force the host back to the detected localBase and re-display.
+      if (!curlTargetIsLocal(runCmd)) {
+        runCmd = rewriteCurlBase(runCmd, localBase);
+        if (!curlTargetIsLocal(runCmd)) {
+          return {
+            output: `This step only runs against your local server (${localBase}). Edit the URL above to a localhost address and try again.`,
+            success: false,
+            command: runCmd,
+          };
+        }
       }
       try {
         const raw = execSync(runCmd, { encoding: 'utf8', timeout: 10000 });

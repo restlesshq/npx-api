@@ -299,13 +299,10 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   let selectedApi;
   let selectedExisting;  // matching settings.apis[] entry if already set up
   while (!selectedApi) {
-    update({ status: 'active', activeSub: 0, message: [
-      hint
-        ? `  Searching again with your hint…`
-        : `  Let's take a look at your project and see what APIs you have.`,
-      '',
-      `  ${dim('Note: we currently only support Node and TypeScript.')}`,
-    ]});
+    update({ status: 'active', activeSub: 0, message: hint
+      ? [`  ${dim('Searching again with your hint…')}`]
+      : []
+    });
 
     const apis = await locateApis({ packageDir, setSpinner, hint });
 
@@ -324,30 +321,24 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       return { ...a, existing: match, isSetup };
     });
 
-    const termW = process.stdout.columns || 80;
-    const indentW = 9; // "  ❯ N.   " leading prefix rendered by singleSelect
-    // Cap the row width so the right-aligned status doesn't drift halfway
-    // across a wide terminal. 60 keeps both pieces visually adjacent.
-    const rowWidth = Math.min(60, Math.max(40, termW - indentW - 2));
     const labels = annotated.map((a) => {
       const count = (a.endpoints?.length || 0) + (a.internalEndpoints?.length || 0);
       const lang = a.framework ? `${a.language}/${a.framework}` : a.language || 'unknown';
       const locPath = a.rootDir && a.rootDir !== '.' ? `./${a.rootDir}` : './';
-      const statusText = a.isSetup ? 'Already set up' : 'Needs setup';
-      const statusColored = a.isSetup ? green(statusText) : dim(statusText);
-      const padLen = Math.max(2, rowWidth - a.name.length - statusText.length);
-      const line1 = `${bold(a.name)}${' '.repeat(padLen)}${statusColored}`;
-      const line2 = dim(`${count} endpoints  ·  ${lang}  ·  ${locPath}`);
-      return `${line1}\n${line2}`;
+      const setupBadge = a.isSetup ? `  ${green('✓ already set up')}` : '';
+      const meta = dim(`${count} endpoints · ${lang} · ${locPath}`);
+      return `${bold(a.name)}${setupBadge}\n${meta}`;
     });
     // Always include "Other" as the last option so the user can redirect us.
-    labels.push(`${bold('Other')} ${dim('— tell us where to look')}`);
+    labels.push(`${bold('Other')}\n${dim('tell us where to look')}`);
 
+    console.log('');
+    console.log(`  ${dim('We support Node and TypeScript projects (more coming soon).')}`);
     console.log('');
     const chosenIdx = await singleSelect(labels, {
       message: apis.length === 0
         ? "We couldn't find any APIs. Can you point us at one?"
-        : 'Which API do you want to map out?',
+        : 'Which API should we map out?',
       defaultIndex: 0,
     });
 

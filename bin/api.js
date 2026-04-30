@@ -4,8 +4,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, ask, askYesNo, startSpinner, singleSelect, typeLine, typeOut, inlineStatus, waitForKey } from '../lib/ui.js';
-import { runAI, loadPrompt } from '../lib/ai.js';
+import { bold, dim, green, red, cyan, yellow, orange, ask, askYesNo, startSpinner, singleSelect, typeLine, typeOut, inlineStatus, waitForKey } from '../lib/ui.js';
+import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs } from '../lib/project.js';
 import generateOas from '../steps/generate-oas.js';
@@ -46,6 +46,28 @@ function hasClaude() {
   try {
     execSync('which claude', { stdio: 'ignore' });
     return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasCodex() {
+  try {
+    execSync('which codex', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Codex stores auth in ~/.codex/auth.json after `codex login`. We also accept
+// OPENAI_API_KEY as a fallback because env-only setups skip the login dance
+// entirely. We check both rather than running `codex` itself, since spawning
+// the CLI just to validate auth is slow and noisy.
+function hasCodexAuth() {
+  if (process.env.OPENAI_API_KEY) return true;
+  try {
+    return fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json'));
   } catch {
     return false;
   }
@@ -120,19 +142,55 @@ if (command === 'setup' || command === 'supercharge') {
   await typeLine(`  Think of us more as an API success platform. We give humans, AI and`);
   await typeLine(`  you the tools to quickly make successful calls.`);
   console.log('');
-  await typeLine(`  ${dim("We use AI for the setup, but we'll ask permission before we do anything.")}`);
+  await typeLine(`  ${bold(yellow('Ready to supercharge your API?'))}`);
   console.log('');
-  await typeLine(`  ${bold(yellow('Ready to supercharge your API?'))} ${cyan('Hit any key to get started!')}`);
-  // Secondary shortcuts: print instantly, on the next line, no typing animation.
-  process.stdout.write(`  ${dim(`Press [${bold('d')}${'\x1b[2m'}] to try this on a demo repo · Press [${bold('h')}${'\x1b[2m'}] to set up time with a human`)}\n`);
-  const welcomeKey = await waitForKey();
+
+  // Boxed CTA: the focal point of the welcome. The ▸ inside pulses while
+  // we wait for input, so we hide the native blinking cursor — one cue
+  // instead of two.
+  const ctaText = 'Press ENTER to get started';
+  const boxBody = `  ▸  ${ctaText}  `;
+  const w = boxBody.length;
+  console.log(`  ${dim('╭' + '─'.repeat(w) + '╮')}`);
+  console.log(`  ${dim('│')}  ${cyan('▸')}  ${bold(cyan(ctaText))}  ${dim('│')}`);
+  console.log(`  ${dim('╰' + '─'.repeat(w) + '╯')}`);
+  console.log('');
+  console.log(`  ${dim("We use AI for the setup, but we'll ask permission before we do anything.")}`);
+  console.log(`  ${dim(`Press [${bold('d')}${'\x1b[2m'}] to try this on a demo repo · Press [${bold('h')}${'\x1b[2m'}] to set up time with a human`)}`);
+
+  process.stdout.write('\x1b[?25l'); // hide terminal cursor while we own the screen
+  process.stdout.write('\x1b7');     // save current row as the home position for the animation
+
+  // Pulse: dim → cyan → bold cyan → cyan, repeat. Cycles through ~1.1s.
+  // Arrow lives 5 rows above the saved cursor (3 box rows + blank + 2 dim
+  // copy rows), at column 6 inside the box.
+  const arrowFrames = [dim('▸'), cyan('▸'), bold(cyan('▸')), cyan('▸')];
+  let arrowFrame = 0;
+  const arrowInterval = setInterval(() => {
+    arrowFrame = (arrowFrame + 1) % arrowFrames.length;
+    process.stdout.write('\x1b8\x1b[5A\x1b[6G' + arrowFrames[arrowFrame] + '\x1b8');
+  }, 280);
+
+  let welcomeKey;
+  while (true) {
+    welcomeKey = await waitForKey();
+    if (
+      welcomeKey === '\r' || welcomeKey === '\n' ||
+      welcomeKey === 'd' || welcomeKey === 'D' ||
+      welcomeKey === 'h' || welcomeKey === 'H'
+    ) break;
+  }
+
+  clearInterval(arrowInterval);
+  process.stdout.write('\x1b[?25h'); // show cursor again
+  process.stdout.write('\n');         // start subsequent output on a fresh line
 
   if (welcomeKey === 'd' || welcomeKey === 'D') {
     console.log('');
     console.log(`  ${dim('Demo repo flow is coming soon. In the meantime, clone')}`);
     console.log(`  ${dim(`https://github.com/restlessai/demo and run \`npx ${CLI_NAME} setup\` there.`)}`);
     console.log('');
-    debug.flushAndExit(0);
+    await debug.flushAndExit(0);
   }
 
   if (welcomeKey === 'h' || welcomeKey === 'H') {
@@ -145,10 +203,10 @@ if (command === 'setup' || command === 'supercharge') {
       else if (process.platform === 'win32') execSync(`start "${CALENDLY_URL}"`);
       else execSync(`xdg-open "${CALENDLY_URL}"`);
     } catch {}
-    debug.flushAndExit(0);
+    await debug.flushAndExit(0);
   }
 
-  // Any other key: continue normal setup.
+  // ENTER: continue normal setup.
   // Clear the viewport + scrollback so the welcome doesn't linger.
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
   // ──────────────────────────────────────────────────────────────────────
@@ -163,8 +221,16 @@ if (command === 'setup' || command === 'supercharge') {
   plan.drawInitial();
 
   console.log('');
+  const claudeInstalled = hasClaude();
+  const codexInstalled = hasCodex();
+  console.log(`  ${dim("We won't upload anything to our servers without asking first.")}`);
+  console.log('');
+  const claudeLabel = claudeInstalled
+    ? `${orange('Claude')} ${dim('(Recommended)')}`
+    : `${dim('Claude (Recommended)')}`;
+  const codexLabel = codexInstalled ? green('Codex') : dim('Codex');
   const choice = await singleSelect(
-    ['Claude', 'Codex', 'Manual', 'Tell me more'],
+    [claudeLabel, codexLabel, 'Manual install', 'Learn more'],
     { message: 'How would you like to set this up?', defaultIndex: 0 },
   );
 
@@ -172,13 +238,14 @@ if (command === 'setup' || command === 'supercharge') {
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
 
   if (choice === 3) {
-    // "Tell me more" — explain how it works
+    // "Learn more" - explain how it works
     console.log('');
     console.log(`  ${bold('What this does')}`);
     console.log('');
-    console.log(`  Restless wires your API up for observability. This CLI does the boring part:`);
-    console.log(`  scans your code, generates an OpenAPI spec, installs the SDK, and hooks it`);
-    console.log(`  into your server's middleware.`);
+    console.log(`  Restless wires your API up so you can see what's happening in real time and`);
+    console.log(`  help your users make successful calls. This CLI does the boring part: scans`);
+    console.log(`  your code, generates an OpenAPI spec, installs the SDK, and hooks it into`);
+    console.log(`  your server's middleware.`);
     console.log('');
     console.log(`  When it finishes, you sign in to claim the project and your logs start`);
     console.log(`  showing up on the dashboard.`);
@@ -197,23 +264,66 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('');
     console.log(`  Run ${cyan(`npx ${CLI_NAME} setup`)} again when you're ready.`);
     console.log('');
-    debug.flushAndExit(0);
+    await debug.flushAndExit(0);
   }
 
-  if (choice === 0 && !hasClaude()) {
+  if (choice === 0 && !claudeInstalled) {
     console.log('');
     console.log(red('  ✗ Claude is not installed.\n'));
     console.log('  Install it with:');
-    console.log(cyan('    npm install -g @anthropic-ai/claude-code\n'));
-    debug.flushAndExit(1);
+    console.log(cyan('    npm install -g @anthropic-ai/claude-code'));
+    console.log('');
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    await debug.flushAndExit(1);
   }
 
-  // TODO: wire Codex and Manual flows. For now, only Claude path continues.
-  if (choice !== 0) {
+  if (choice === 1 && !codexInstalled) {
     console.log('');
-    console.log(dim(`  [dev] ${['Claude','Codex','Manual'][choice]} flow not yet implemented.`));
+    console.log(red('  ✗ Codex is not installed.\n'));
+    console.log('  Install it with:');
+    console.log(cyan('    npm install -g @openai/codex'));
     console.log('');
-    debug.flushAndExit(0);
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    await debug.flushAndExit(1);
+  }
+
+  if (choice === 1 && !hasCodexAuth()) {
+    console.log('');
+    console.log(red("  ✗ Codex isn't logged in.\n"));
+    console.log('  Sign in with:');
+    console.log(cyan('    codex login'));
+    console.log('');
+    console.log(`  ${dim(`Or set ${cyan('OPENAI_API_KEY')}${'\x1b[2m'} in your env.`)}`);
+    console.log('');
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    await debug.flushAndExit(1);
+  }
+
+  // Pick the AI provider before any step calls runAI(). Manual / Learn-more
+  // never reach here.
+  if (choice === 0) setProvider('claude');
+  else if (choice === 1) setProvider('codex');
+
+  // Manual: not supported yet — punt to Calendly so they can talk to a human.
+  if (choice === 2) {
+    const { execSync } = await import('child_process');
+    console.log('');
+    console.log(`  We don't support a manual setup currently, but book time with a`);
+    console.log(`  human if you'd want!`);
+    console.log('');
+    process.stdout.write(`  ${dim(`Press ENTER to open ${CALENDLY_URL} in your browser`)}`);
+    while (true) {
+      const k = await waitForKey();
+      if (k === '\r' || k === '\n') break;
+    }
+    console.log('');
+    console.log('');
+    try {
+      if (process.platform === 'darwin') execSync(`open "${CALENDLY_URL}"`);
+      else if (process.platform === 'win32') execSync(`start "${CALENDLY_URL}"`);
+      else execSync(`xdg-open "${CALENDLY_URL}"`);
+    } catch {}
+    await debug.flushAndExit(0);
   }
   // packageDir = where the user ran the command (scopes what we analyze)
   // rootDir = git root (where .api/ lives)
@@ -245,6 +355,13 @@ if (command === 'setup' || command === 'supercharge') {
     existingOas: hasOas,
   });
 
+  debug.log('discovered', {
+    language: oasResult.detectedLanguage,
+    framework: oasResult.detectedFramework,
+    domain: oasResult.domain,
+    apiRootDir: oasResult.apiRootDir,
+  });
+
   // Step 2 sub 0: Generate API key, register project, write .env.
   // Runs BEFORE the SDK install so the source-file edit in sub 2 triggers an
   // auto-restart (nodemon / tsx --watch / node --watch) that loads the key.
@@ -255,6 +372,16 @@ if (command === 'setup' || command === 'supercharge') {
     apiRootDir: oasResult.apiRootDir,
     update: plan.makeUpdater(1),
     setSpinner,
+  });
+
+  // Tag the debug log with the metrics project id so staff can join
+  // back to the dashboard once the user claims this project (the same
+  // UUID becomes Project.metricsId at claim time).
+  const projectApi = loadSettings(rootDir).apis?.find((a) => a.projectId === projectId);
+  debug.log('project', {
+    id: projectId,
+    name: projectApi?.name || null,
+    domain: projectApi?.baseUrl || oasResult.domain || null,
   });
 
   // Step 2 subs 1-2: Install package + configure SDK.
@@ -296,8 +423,6 @@ if (command === 'setup' || command === 'supercharge') {
     setupKey,
   });
 
-  // Step 5: Done!
-  plan.makeUpdater(4)({ status: 'done' });
   setupInProgress = false;
 
 } else if (command === 'clear') {
@@ -348,7 +473,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (!rawRequestIdArg) {
     console.log(red('\n  ✗ Missing request ID.\n'));
     console.log(`  Usage: npx ${CLI_NAME} debug <request-id>\n`);
-    debug.flushAndExit(1);
+    await debug.flushAndExit(1);
   }
 
   // Strip decorative prefix (e.g. "TST-abc123" → "abc123") — the prefix is interchangeable
@@ -407,7 +532,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (!log) {
     console.log(p.red(`\n  ✗ Log not found for request ID: ${requestId}\n`));
     console.log(p.dim('  Make sure the API server is running and the SDK is configured.\n'));
-    debug.flushAndExit(1);
+    await debug.flushAndExit(1);
   }
 
   const har = log.har || {};
@@ -546,6 +671,8 @@ if (command === 'setup' || command === 'supercharge') {
           } else if (key === '\x03') {
             process.stdin.setRawMode(false);
             process.stdout.write('\n');
+            // Sync handler: fire-and-forget. Nothing runs after, the inner
+            // process.exit lands once the flush settles.
             debug.flushAndExit(0);
           } else if (key.charCodeAt(0) >= 32) {
             buffer += key;
@@ -597,7 +724,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(red('\n  ✗ Missing docs URL.\n'));
     console.log(`  Usage: npx ${CLI_NAME} skill <docs-url>\n`);
     console.log(`  Example: npx ${CLI_NAME} skill ${dim('docs.example.com/docs/my-project')}\n`);
-    debug.flushAndExit(1);
+    await debug.flushAndExit(1);
   }
 
   // Accept "docs.site.com", "https://docs.site.com/docs/x", "docs.site.com/docs/x/skill.md".
@@ -618,12 +745,12 @@ if (command === 'setup' || command === 'supercharge') {
     if (!res.ok) {
       console.log(`\n  ${red('✗')} ${red(`HTTP ${res.status}`)} ${dim(`from ${skillUrl}`)}\n`);
       console.log(dim('  Make sure the URL points at a project on a Restless docs deployment.\n'));
-      debug.flushAndExit(1);
+      await debug.flushAndExit(1);
     }
     body = await res.text();
   } catch (err) {
     console.log(`\n  ${red('✗')} Could not reach ${cyan(skillUrl)}: ${err.message}\n`);
-    debug.flushAndExit(1);
+    await debug.flushAndExit(1);
   }
 
   // Pull `name:` from the frontmatter so the install path matches whatever
@@ -661,7 +788,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(`    ${cyan(prettyTarget)}\n`);
     console.log(`  Quick way:\n`);
     console.log(`    ${dim('mkdir -p ~/.claude/skills/' + skillName + ' && curl -sSL ' + skillUrl + ' > ' + prettyTarget)}\n`);
-    debug.flushAndExit(0);
+    await debug.flushAndExit(0);
   }
 
   console.log(`  ${dim('This will install to')} ${cyan(prettyTarget)}\n`);
@@ -669,7 +796,7 @@ if (command === 'setup' || command === 'supercharge') {
   const ok = await askYesNo('', { defaultValue: true });
   if (!ok) {
     console.log(dim('\n  Cancelled. To grab it manually, rerun with --manual.\n'));
-    debug.flushAndExit(0);
+    await debug.flushAndExit(0);
   }
 
   // Refuse to overwrite an existing skill silently — could clobber an
@@ -681,7 +808,7 @@ if (command === 'setup' || command === 'supercharge') {
     const overwrite = await askYesNo('', { defaultValue: false });
     if (!overwrite) {
       console.log(dim('\n  Left existing file alone.\n'));
-      debug.flushAndExit(0);
+      await debug.flushAndExit(0);
     }
   }
 

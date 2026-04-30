@@ -12,9 +12,9 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 3. **The API key comes from the environment.** The SDK auto-reads `process.env.RESTLESS_KEY` — you do NOT need to pass it explicitly.
 
-4. **Wire up user identification via `setup(cb)`.** Look at how this API authenticates its users (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. Run it through `restless.mask()` before logging — that's what identifies the user on the dashboard without exposing the plaintext secret.
+4. **Wire up user identification via `setup(cb)`.** Look at how this API authenticates its users (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. The returned object MUST include `apiKey: restless.mask(<credential>)` at the top level — that's what identifies the user on the dashboard. Without it, every log shows up as "anonymous".
 
-5. **Lazy enrichment (optional).** If resolving the user's full info (email, label, company) requires a DB lookup or external call, put that code inside an `enrich: async () => { ... }` function on the SetupResult. The SDK only runs `enrich` on the first request from each user; subsequent requests skip it entirely. This is way better than running a DB query on every request.
+5. **Lazy enrichment (optional).** If resolving the customer/tenant info (email, label, company) requires a DB lookup or external call, put `enrich` **inside `project`**, never at the top level. The shape is `{ apiKey, project: { id, enrich: async (id) => ({ label, email, ... }) } }`. `project.id` is required as the cache key — the SDK calls `enrich` only on the first request from each id, then caches by id. If the lookup is cheap (in-memory map, header read), skip `enrich` and just set `project.label` / `project.email` inline.
 
 ## Rules
 

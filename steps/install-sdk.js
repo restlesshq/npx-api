@@ -124,7 +124,8 @@ export default async function installSdk({
           `wire things up, and we never touch ${bold('.env')} or anything in ${bold('node_modules/')}.`,
       },
     ],
-    action: 'install the SDK',
+    // The terminal prompt below is the action — no separate keypress gate.
+    skipWait: true,
   });
 
   // Sub 0 ("Generate API key") is handled by prepareAccount() before we get
@@ -142,10 +143,8 @@ export default async function installSdk({
   } else {
     const defaultCmd = installCommands[guideLanguage] || installCommands.javascript;
     const cdPrefix = installDirRel !== '.' ? `cd ${installDirRel} && ` : '';
-    update({ activeSub: 1, message: [
-      `  Run this to pull the SDK into ${bold(installDirRel)}.`,
-      dim('  Edit the command if you use a different package manager.'),
-    ]});
+    // Keep the step intro visible above the prompt — just advance the cursor.
+    update({ activeSub: 1 });
     const cmd = await terminalPrompt(cdPrefix + defaultCmd);
 
     update({ activeSub: 1, message: [
@@ -183,7 +182,7 @@ export default async function installSdk({
 
     const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
     const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
-    const setupSection = guide.split('## Setup')[1]?.split('## Verify')[0] || guide;
+    const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
 
     const prompt = loadPrompt('setup-sdk', {
       language: detectedLanguage,

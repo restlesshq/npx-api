@@ -17,7 +17,7 @@ Before installing, figure out the right location:
 After installing, you MUST also set up the SDK in the actual server code:
 
 1. **Find where the server is created and routes are registered.** Don't assume it's in any particular file — search the codebase for where the framework is initialized (e.g. `fastify()`, `express()`, `createServer()`, `new Hono()`, etc.) and where routes are added. That's where the middleware goes.
-2. Add the import for the SDK (use the right adapter for the framework — Express, Fastify, Koa, Hono, Next, http).
+2. Add the import for the SDK. Always use the unified entry `@restlessai/sdk`; it auto-detects the framework at runtime. Do NOT use framework-specific subpaths like `@restlessai/sdk/express` or `@restlessai/sdk/fastify`.
 3. Add the middleware/plugin registration using the setup code from the guide above.
 4. The API key is read automatically by the SDK from `process.env.RESTLESS_KEY`. You do NOT need to pass it explicitly — the factory takes it as an argument and falls back to the env var.
 5. Look at how this API authenticates its users (Authorization header, JWT, X-API-Key header, query param, etc.) and extract that credential inside the setup callback. Run it through `restless.mask(...)` before logging.

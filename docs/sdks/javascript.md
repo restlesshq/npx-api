@@ -8,12 +8,16 @@ Full reference: the `install.md` file at the root of the `@restlessai/sdk` packa
 npm install @restlessai/sdk --save
 ```
 
+## Setup
+
+The single entry point `@restlessai/sdk` auto-detects the framework at runtime (Express, Fastify, Koa, Hono, Next, bare http) from the call signature. Use it for every framework. Do NOT import a framework-specific subpath like `@restlessai/sdk/fastify`. The same `require('@restlessai/sdk')(process.env.RESTLESS_KEY)` line works everywhere; only the registration pattern differs per framework.
+
 ## Setup — Express
 
 Register BEFORE any route definitions:
 
 ```js
-const restless = require('@restlessai/sdk/express')(process.env.RESTLESS_KEY);
+const restless = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 
 app.use(restless.setup((req) => ({
   // `apiKey` identifies the individual end-user. Extract the API key from
@@ -90,8 +94,7 @@ app.use(restless.setup((req) => ({
 ## Setup — Fastify
 
 ```js
-const restlessFactory = require('@restlessai/sdk/fastify');
-const restless = restlessFactory(process.env.RESTLESS_KEY);
+const restless = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 
 await fastify.register(restless.setup((req) => ({
   apiKey: restless.mask(extractApiKey(req)),
@@ -101,7 +104,7 @@ await fastify.register(restless.setup((req) => ({
 ## Setup — Koa
 
 ```js
-const restless = require('@restlessai/sdk/koa')(process.env.RESTLESS_KEY);
+const restless = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 
 app.use(restless.setup((ctx) => ({
   apiKey: restless.mask(extractApiKey(ctx.request)),
