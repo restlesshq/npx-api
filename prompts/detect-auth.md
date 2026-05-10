@@ -14,14 +14,14 @@ The SDK already redacts the common defaults (`Authorization`, `Cookie`, `Set-Coo
 
 ## Where to look
 
-1. **The OpenAPI spec, if there is one** — `{{oasFile}}`. The `components.securitySchemes` block tells you exactly what headers / query params this API accepts for auth. Read this first.
-2. **The source code** — look for middleware, auth decorators, route guards, and any `req.headers[...]` / `req.query[...]` reads that are gated by auth checks. Frameworks vary: Express has middleware, Fastify has hooks, Koa has `ctx.state`, Next has `headers()` helpers.
+1. **The OpenAPI spec, if there is one** - `{{oasFile}}`. The `components.securitySchemes` block tells you exactly what headers / query params this API accepts for auth. Read this first.
+2. **The source code** - look for middleware, auth decorators, route guards, and any `req.headers[...]` / `req.query[...]` reads that are gated by auth checks. Frameworks vary: Express has middleware, Fastify has hooks, Koa has `ctx.state`, Next has `headers()` helpers.
 3. **The route handlers** for fields that take passwords, secrets, or sensitive PII in the request body.
 
 ## Rules
 
 - Output ONLY the JSON block below. No prose.
-- List names in their natural form — the SDK normalizes them (strips `-`/`_`, lowercases) when matching, so `X-Company-Auth` and `x_company_auth` both work.
+- List names in their natural form - the SDK normalizes them (strips `-`/`_`, lowercases) when matching, so `X-Company-Auth` and `x_company_auth` both work.
 - Err on the side of inclusion if you're unsure whether a field is sensitive. Over-redaction is cheap; under-redaction leaks secrets.
 - Do NOT include the built-in defaults listed above.
 - Do NOT read files in `node_modules/`, `.env*`, or any credentials file.

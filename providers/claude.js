@@ -1,5 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import * as debug from '../lib/debug.js';
+import { isInsideRoot, getGitRoot } from '../lib/pathGuard.js';
 
 // AI tool inputs (especially Write/Edit) carry full file contents that
 // blow up the debug log size. Truncate every string field at the source
@@ -92,16 +93,77 @@ function describeToolUse(toolName, input) {
   }
 }
 
+/**
+ * Pull every absolute path token out of a Bash command. Best-effort:
+ * matches `/`-prefixed POSIX paths separated by whitespace, quotes, or
+ * shell metacharacters. We use this to refuse Bash invocations that
+ * touch a path outside the git root - it isn't perfect (a clever AI
+ * could obfuscate via env-var indirection or `eval`) but it stops the
+ * common cases (cd, cat, mv with absolute paths above the root).
+ */
+function extractAbsPaths(cmd) {
+  if (typeof cmd !== 'string') return [];
+  const out = [];
+  const re = /(?<![\w\\])(\/[^\s"';|&<>()`$]+)/g;
+  let m;
+  while ((m = re.exec(cmd)) !== null) out.push(m[1]);
+  return out;
+}
+
+/**
+ * `canUseTool` callback for the Claude Agent SDK. Hard-rejects any
+ * Write / Edit / NotebookEdit whose target path is outside the git
+ * root, plus any Bash command that mentions an absolute path outside
+ * the git root. Defense in depth alongside the safe fs helpers - if
+ * the AI dreams up a path we'd write somewhere bad, this layer kills
+ * the call before it reaches disk.
+ */
+function makeCanUseTool(gitRoot) {
+  return async (toolName, input) => {
+    if (!gitRoot) return { behavior: 'allow' };
+
+    if (toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') {
+      const fp = input?.file_path || input?.notebook_path;
+      if (typeof fp === 'string' && fp && !isInsideRoot(fp, gitRoot)) {
+        debug.log('ai.tool.denied', { tool: toolName, path: fp, reason: 'outside-git-root' });
+        return {
+          behavior: 'deny',
+          message:
+            `${toolName} ${fp} is outside the git root ${gitRoot}. ` +
+            `The CLI never lets writes escape the repository it was invoked from. ` +
+            `Use a path inside ${gitRoot} instead.`,
+        };
+      }
+    }
+    if (toolName === 'Bash') {
+      for (const p of extractAbsPaths(input?.command)) {
+        if (!isInsideRoot(p, gitRoot)) {
+          debug.log('ai.tool.denied', { tool: 'Bash', path: p, reason: 'outside-git-root' });
+          return {
+            behavior: 'deny',
+            message:
+              `Bash command references ${p}, which is outside the git root ${gitRoot}. ` +
+              `Refusing to run; nothing the CLI does is allowed to escape the repo.`,
+          };
+        }
+      }
+    }
+    return { behavior: 'allow' };
+  };
+}
+
 export default {
   name: 'claude',
 
   async run(prompt, cwd, { onStatus } = {}) {
     let result = '';
+    const gitRoot = getGitRoot();
     debug.log('ai.run.start', {
       provider: 'claude',
       cwd,
+      gitRoot,
       promptChars: prompt?.length ?? 0,
-      // Just the first slice — full prompt is reproducible from
+      // Just the first slice - full prompt is reproducible from
       // prompts/*.md + the variables, so don't send the whole thing.
       promptHead: typeof prompt === 'string' ? truncate(prompt, 400) : '',
     });
@@ -111,6 +173,7 @@ export default {
         maxTurns: 30,
         allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
         cwd,
+        canUseTool: makeCanUseTool(gitRoot),
       }
     })) {
       if (message.type === 'assistant') {

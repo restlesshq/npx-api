@@ -8,10 +8,10 @@ We've already filtered to safe candidates (GET/HEAD only, no admin/internal/depr
 
 ## How to choose
 
-- Prefer endpoints that look like a healthcheck, status, list, or "get current user" — anything that returns useful data with the least setup.
+- Prefer endpoints that look like a healthcheck, status, list, or "get current user" - anything that returns useful data with the least setup.
 - Prefer endpoints that don't require path params. If they all do, prefer ones whose params look like they'd accept the example value we picked.
 - Avoid anything that looks expensive, paginated through massive datasets, or domain-specific (e.g. "transfer funds", "delete user data").
-- The candidates are pre-ranked. If nothing stands out, pick the first one — it's the simplest.
+- The candidates are pre-ranked. If nothing stands out, pick the first one - it's the simplest.
 
 ## Output
 

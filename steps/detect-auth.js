@@ -8,7 +8,7 @@ import { bold, dim, green } from '../lib/ui.js';
  * write them to `.api/settings.json` under `apis[].redact`.
  *
  * The Restless SDK reads this block at startup and merges it with its
- * defaults — so anything detected here gets automatically redacted from
+ * defaults - so anything detected here gets automatically redacted from
  * captured request logs.
  */
 export default async function detectAuth({ packageDir, rootDir, apiId, apiName, oasFile, update, setSpinner, subIndex = 0, prevSubs = {} }) {
@@ -36,7 +36,7 @@ export default async function detectAuth({ packageDir, rootDir, apiId, apiName, 
     }
   } catch (err) {
     update({ sub: { ...prevSubs, [subIndex]: 'done' }, message: [
-      `  ${dim(`Could not auto-detect auth fields — the SDK's built-in redaction will still apply.`)}`,
+      `  ${dim(`Could not auto-detect auth fields - the SDK's built-in redaction will still apply.`)}`,
       `  ${dim(`You can add custom fields by hand in .api/settings.json → apis[].redact.`)}`,
     ]});
     return { redact: null };

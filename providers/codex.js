@@ -155,12 +155,12 @@ export default {
             onStatus?.({ phase: 'Working', detail: data.tool || data.server || 'Tool call' });
             break;
           case 'error':
-            // Don't reject — Codex sometimes recovers within a turn. The
+            // Don't reject - Codex sometimes recovers within a turn. The
             // process exit code will tell us if the run actually failed.
             debug.log('ai.error', { message: truncate(data.message || JSON.stringify(data), 500) });
             break;
           default:
-            // Unrecognized event — log it so we can extend the mapping if a
+            // Unrecognized event - log it so we can extend the mapping if a
             // new event type appears in a future Codex release.
             debug.log('ai.event', { type });
         }

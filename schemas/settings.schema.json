@@ -22,7 +22,7 @@
           "id": {
             "type": "string",
             "format": "uuid",
-            "description": "Unique identifier for this API — stable across machines for syncing"
+            "description": "Unique identifier for this API, stable across machines for syncing"
           },
           "name": {
             "type": "string",

@@ -41,7 +41,7 @@ function curlTargetIsLocal(curl) {
  * middleware ran and whether `RESTLESS_KEY` is loaded. We do that by
  * including `-i` (or `--include`) in the curl, which prefixes the body
  * with the response headers. We refuse to run a curl without one of
- * these flags rather than silently re-add it — the visible command and
+ * these flags rather than silently re-add it - the visible command and
  * the executed command should match.
  */
 function curlHasIncludeFlag(curl) {
@@ -50,7 +50,7 @@ function curlHasIncludeFlag(curl) {
 
 /**
  * Pull `{ method, url }` out of a curl command for display in the
- * "in-flight" placeholder. We show the path (not the full URL) — the
+ * "in-flight" placeholder. We show the path (not the full URL) - the
  * box already established it's hitting localhost, so the path alone is
  * less noisy.
  */
@@ -89,7 +89,7 @@ function splitCurlIncludeOutput(text) {
     if (/^HTTP\//i.test(block)) {
       lastHeaderBlock = block;
     } else {
-      // Wasn't a header block — rewind so it ends up in the body.
+      // Wasn't a header block - rewind so it ends up in the body.
       cursor = text.indexOf(block);
       break;
     }
@@ -111,7 +111,7 @@ function splitCurlIncludeOutput(text) {
  *                 so the SDK middleware never ran in the request path
  *   - 'no-key'  → SDK ran but RESTLESS_KEY isn't set in process.env;
  *                 the SDK marks this by emitting `missing-key` as the
- *                 header value (see node-sdk-new/src/adapters/_shared.ts)
+ *                 header value (see node-sdk/src/adapters/_shared.ts)
  *   - 'ok'      → SDK ran with a key, header carries a real request ID
  */
 function diagnoseFromHeaders(headers) {
@@ -126,16 +126,16 @@ function diagnoseFromHeaders(headers) {
  * multiple sources because frameworks differ in where the port is
  * declared:
  *
- *   1. `package.json` scripts — `next dev -p 4000`, `vite --port 4000`,
+ *   1. `package.json` scripts - `next dev -p 4000`, `vite --port 4000`,
  *      `nodemon -p 4000`, etc. Most JS/TS apps surface their port here.
- *   2. `.env*` files — `PORT=4000`. Common for Express/Fastify/Koa and
+ *   2. `.env*` files - `PORT=4000`. Common for Express/Fastify/Koa and
  *      also honored by `next dev` and `nuxt dev`.
- *   3. Source files — `.listen(PORT)` literal or `PORT = N` constant.
+ *   3. Source files - `.listen(PORT)` literal or `PORT = N` constant.
  *      Catches the bare-Express path; Next.js / Nuxt have no such call.
  *
  * Falls back to 3000 (Next.js / Express convention) when nothing
  * matches. We deliberately read .env* here even though AI prompts
- * forbid it — this is a local Node read, not a value sent to an LLM,
+ * forbid it - this is a local Node read, not a value sent to an LLM,
  * and the port is the only field we extract.
  */
 function detectLocalPort(searchDir) {
@@ -163,7 +163,7 @@ function detectLocalPort(searchDir) {
     }
   } catch {}
 
-  // 2. .env* files. We don't list every variant by hand — glob the dir.
+  // 2. .env* files. We don't list every variant by hand - glob the dir.
   try {
     const envFiles = fs.readdirSync(searchDir).filter((f) => /^\.env(\..+)?$/.test(f));
     for (const f of envFiles) {
@@ -225,6 +225,7 @@ export default async function testSetup({
           `dashboard side.`,
       },
     ],
+    actionRequired: 'Make sure your server is up and running so we can test everything locally.',
     action: 'run a test request',
   });
 
@@ -243,7 +244,7 @@ export default async function testSetup({
     ? rewriteCurlBase(apiEntry.testCurl, localBase)
     : `curl -sS ${localBase}/`;
 
-  // Show `-i` in the visible command — what the user runs is exactly
+  // Show `-i` in the visible command - what the user runs is exactly
   // what we run. We need it to read response headers and confirm the
   // SDK middleware actually ran on this request.
   const curlCommand = curlHasIncludeFlag(baseCurl)
@@ -255,7 +256,7 @@ export default async function testSetup({
     dim(`  then hit enter in the box below to fire off the request.`),
   ]});
 
-  // ── Sub 1: Verify — interactive terminal with live log polling ──────────
+  // ── Sub 1: Verify - interactive terminal with live log polling ──────────
   const pollConfig = projectId
     ? { url: `${SITE_URL}/api/logs/poll`, projectId, setupKey }
     : null;
@@ -269,7 +270,7 @@ export default async function testSetup({
   // so the strings here lead straight into the message.
   const noSdkHint = [
     `The Restless SDK didn't fire on this request.`,
-    `Either the middleware isn't wired in, or ${bold('RESTLESS_KEY')} isn't set in the running process — ${bold('restart')} your server after fixing either.`,
+    `Either the middleware isn't wired in, or ${bold('RESTLESS_KEY')} isn't set in the running process - ${bold('restart')} your server after fixing either.`,
   ];
   const noKeyHint = [
     `Server is loaded, but ${bold('RESTLESS_KEY')} isn't set in the running process.`,
@@ -313,13 +314,13 @@ export default async function testSetup({
         const diag = diagnoseFromHeaders(headers);
         lastDiagState = diag.state;
 
-        // Show only the body to the user — the headers are for us.
+        // Show only the body to the user - the headers are for us.
         // Pretty-print JSON when possible.
         let output = body;
         try { output = JSON.stringify(JSON.parse(body), null, 2); } catch {}
 
         // Push an immediate hint when we already know logs aren't
-        // coming — no point making the user wait the noLogsHint timeout
+        // coming - no point making the user wait the noLogsHint timeout
         // for a definite negative.
         const immediateHint =
           diag.state === 'no-sdk' ? noSdkHint :
@@ -369,12 +370,12 @@ export default async function testSetup({
   } else if (diag.state === 'ok') {
     // We got an upload upstream if the log polling has anything from
     // this run. If nothing landed, the most likely culprit is a wrong
-    // RESTLESS_KEY — a valid one would have produced a log already.
+    // RESTLESS_KEY - a valid one would have produced a log already.
     doneMessage = pollConfig
       ? [`  ${green('✓')} Test request succeeded and logs are flowing.`]
       : [`  ${green('✓')} Test request succeeded.`];
   } else {
-    // 'no-headers' — couldn't read the dump (user edited the curl, etc).
+    // 'no-headers' - couldn't read the dump (user edited the curl, etc).
     // Don't pretend we know more than we do.
     doneMessage = [`  ${green('✓')} Test request succeeded.`];
   }

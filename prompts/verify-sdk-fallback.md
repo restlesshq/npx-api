@@ -8,4 +8,4 @@ For JavaScript / TypeScript projects, the package is `@restlessai/sdk`. Check:
 
 For other languages, check for the language-appropriate Restless package (`restlessai` on PyPI / RubyGems, `github.com/restlessai/go` in Go).
 
-Just verify — don't fix anything. Report whether it's working.
+Just verify - don't fix anything. Report whether it's working.

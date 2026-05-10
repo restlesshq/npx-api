@@ -11,6 +11,7 @@ import { findOasCandidates } from '../lib/find-oas.js';
 import { parseOas } from '../lib/oas-parse.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
+import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
@@ -52,7 +53,7 @@ async function validateAndFixOas({ oasFullPath, packageDir, setSpinner }) {
  * from package.json, and choose an existing OAS file if we found one.
  *
  * If the scans find nothing (unusual framework, non-Node codebase), we
- * still fall back to letting the LLM explore — see the prompt.
+ * still fall back to letting the LLM explore - see the prompt.
  */
 function buildFindingsSection(packageDir) {
   const endpointResult = findEndpoints(packageDir);
@@ -78,7 +79,7 @@ function buildFindingsSection(packageDir) {
       lines.push(`  … ${endpointResult.endpoints.length - capped.length} more truncated`);
     }
   } else {
-    lines.push('Endpoints: none found by the pre-scan. The codebase may use a framework/language our regex does not cover — please explore.');
+    lines.push('Endpoints: none found by the pre-scan. The codebase may use a framework/language our regex does not cover - please explore.');
   }
   lines.push('');
 
@@ -154,7 +155,7 @@ async function locateApis({ packageDir, setSpinner, hint = '' }) {
         '',
         `> ${hint}`,
         '',
-        'Search based on this hint. The hint is authoritative — prioritize it over anything else.',
+        'Search based on this hint. The hint is authoritative - prioritize it over anything else.',
         '',
       ].join('\n')
     : '';
@@ -181,7 +182,10 @@ async function locateApis({ packageDir, setSpinner, hint = '' }) {
 async function adoptExistingOas({ rootDir, update, selectedApi = null, isInternal = null }) {
   console.log('');
   const location = await singleSelect(
-    ["It's in my codebase", "It's at a URL"],
+    [
+      { label: "It's in my codebase", hint: "We'll read it from a path you give us." },
+      { label: "It's at a URL", hint: "We'll fetch it once and copy it into .api/." },
+    ],
     { message: 'Where is it?', defaultIndex: 0 },
   );
 
@@ -199,9 +203,9 @@ async function adoptExistingOas({ rootDir, update, selectedApi = null, isInterna
 
     const rel = path.relative(rootDir, absPath);
     if (rel.startsWith('..')) {
-      // Outside the repo — copy into .api/ so it lives alongside the codebase.
+      // Outside the repo - copy into .api/ so it lives alongside the codebase.
       const apiDir = path.join(rootDir, '.api');
-      if (!fs.existsSync(apiDir)) fs.mkdirSync(apiDir, { recursive: true });
+      if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
       const ext = path.extname(absPath) || '.yaml';
       const dest = path.join(apiDir, `openapi${ext}`);
       fs.copyFileSync(absPath, dest);
@@ -247,7 +251,7 @@ async function adoptExistingOas({ rootDir, update, selectedApi = null, isInterna
   });
   saveSettings(rootDir, settings);
 
-  update({ sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' }, status: 'done', message: [
+  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
     `  ${green('✓')} ${bold(name)} registered. Ready for the next step.`,
   ]});
 
@@ -299,9 +303,12 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   let selectedApi;
   let selectedExisting;  // matching settings.apis[] entry if already set up
   while (!selectedApi) {
-    update({ status: 'active', activeSub: 0, message: hint
-      ? [`  ${dim('Searching again with your hint…')}`]
-      : []
+    update({
+      status: 'active',
+      activeSub: 0,
+      message: hint
+        ? [`  ${dim('Searching again with your hint…')}`]
+        : [`  We're looking through your code to find every endpoint and detect the framework.`],
     });
 
     const apis = await locateApis({ packageDir, setSpinner, hint });
@@ -342,12 +349,12 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       defaultIndex: 0,
     });
 
-    // "Other" — prompt for a plain-English hint, then loop and re-detect.
+    // "Other" - prompt for a plain-English hint, then loop and re-detect.
     if (chosenIdx === labels.length - 1) {
       console.log('');
       console.log(`  ${dim('Tell us where to look. For example:')}`);
       console.log(`  ${dim('• "it\'s a Python FastAPI in backend/api"')}`);
-      console.log(`  ${dim('• "look in services/gateway — it\'s a Go server"')}`);
+      console.log(`  ${dim('• "look in services/gateway - it\'s a Go server"')}`);
       console.log(`  ${dim('• "there are three workers in packages/, I want the one named billing"')}`);
       console.log('');
       const newHint = (await ask('  Where should we look? ')).trim();
@@ -384,20 +391,99 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   const framework = selectedApi.framework || selectedApi.language || 'unknown';
   {
     const lines = [
-      `  Setting up ${bold(selectedApi.name)} — ${bold(framework)} with ${bold(String(totalEp))} endpoint${totalEp === 1 ? '' : 's'}${internal > 0 ? ` ${dim(`(${internal} internal)`)}` : ''}.`,
+      `  Setting up ${bold(selectedApi.name)} - ${bold(framework)} with ${bold(String(totalEp))} endpoint${totalEp === 1 ? '' : 's'}${internal > 0 ? ` ${dim(`(${internal} internal)`)}` : ''}.`,
     ];
     if (selectedApi.rootDir && selectedApi.rootDir !== '.') {
       lines.push(`  ${dim(`Located in ${selectedApi.rootDir}`)}`);
     }
-    update({ sub: { 0: 'done' }, activeSub: -1, message: lines });
+    update({ sub: { 0: 'done' }, activeSub: 1, message: lines });
   }
 
-  // === Internal vs external (ask early, best-guess default) ===
+  // === Detection: can we skip OAS generation? ===
+  const existingOasPath = selectedApi.existingOasFile
+    ? path.join(rootDir, selectedApi.existingOasFile)
+    : null;
+  const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
+  const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
+
+  const oasFile = '.api/openapi.json';
+  const placeholderDomain = 'https://example.com';
+  let skipReason = null;
+  let finalOasFile = oasFile;
+
+  if (hasExistingOas) {
+    // Point settings at their file - don't overwrite their work.
+    finalOasFile = selectedApi.existingOasFile;
+    skipReason = `found OAS at ${bold(selectedApi.existingOasFile)}`;
+  } else if (frameworkGenerates) {
+    // Framework serves OAS natively at runtime - mark and move on.
+    skipReason = `${bold(framework)} generates OAS natively`;
+    finalOasFile = null;
+  }
+
+  if (skipReason) {
+    update({ sub: { 0: 'done' }, activeSub: 1, message: [
+      `  ${green('✓')} Skipped OAS generation ${dim(skipReason)}.`,
+    ]});
+  } else {
+    // Run the AI generator.
+    update({ sub: { 0: 'done' }, activeSub: 1, message: [
+      `  Turning your ${bold(String(totalEp))} endpoints into an OpenAPI spec - the standard`,
+      `  format tools and SDKs use to talk to your API.`,
+      '',
+    ]});
+
+    const existingOasNote = selectedApi.existingOasFile
+      ? `An existing OAS file was found at ${selectedApi.existingOasFile}. Use it as a starting point - update it if the code has diverged, but preserve any hand-written descriptions or examples.`
+      : '';
+    const frameworkNote = selectedApi.frameworkCanGenerateOas
+      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively. Try using the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps manually.`
+      : '';
+    const internalNote = selectedApi.internalEndpoints?.length
+      ? `The following endpoints were detected as internal/admin and should be marked as such:\n${selectedApi.internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`
+      : '';
+
+    // Pass an absolute path to the AI so it can't accidentally walk up
+    // the tree and write into a parent's `.api/` directory. The relative
+    // path was getting resolved against whatever the AI considered "the
+    // project root," which sometimes meant the monorepo above the user's
+    // actual package.
+    const oasFileAbsolute = path.resolve(rootDir, oasFile);
+    const vars = {
+      name: selectedApi.name,
+      domain: placeholderDomain,
+      oasFile: oasFileAbsolute,
+      existingOasNote,
+      frameworkNote,
+      internalNote,
+    };
+
+    await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
+
+    // Validate before we go any further - server uses the same parse logic,
+    // so if it fails here it'll fail there too. Hand errors back to the LLM
+    // and let it iterate.
+    const oasFullPath = oasFileAbsolute;
+    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+    if (!validation.ok) {
+      fatalError('Generated OpenAPI spec failed to parse.', [
+        validation.error,
+        `File: ${oasFullPath}`,
+        'Try re-running, or open the file and fix it by hand.',
+      ]);
+    }
+  }
+
+  // Ask the user the two things we need to finalize the spec: visibility
+  // and the production base URL. Grouped so they answer them back to back
+  // instead of having visibility split off into its own pre-AI screen.
+
+  // Heuristic default for visibility - bias toward "internal" if the name,
+  // framework, or routes look service-y.
   const nameLower = (selectedApi.name || '').toLowerCase();
   const frameworkLower = (selectedApi.framework || '').toLowerCase();
   const endpointsLower = (selectedApi.endpoints || []).map((e) => e.toLowerCase());
   const allPaths = endpointsLower.join(' ');
-
   const internalSignals = [
     nameLower.includes('internal'),
     nameLower.includes('admin'),
@@ -419,96 +505,28 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     frameworkLower.includes('grpc'),
     frameworkLower.includes('trpc'),
   ].filter(Boolean).length;
-
   const looksInternal = internalSignals >= 2;
-  const recommended = looksInternal ? 'internal' : 'external';
 
-  console.log('');
+  const firstEndpoint = selectedApi.endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    '  Two quick things before we wrap up the spec.',
+  ]});
+
   const visibilityIndex = await singleSelect(
     [
-      'External (public-facing, for your API consumers)',
-      'Internal (private, internal use only)',
+      { label: 'External', hint: 'Public-facing, used by your API consumers.' },
+      { label: 'Internal', hint: 'Private, only your own services or staff hit it.' },
     ],
     {
-      message: `Is ${selectedApi.name} external or internal? (our guess: ${recommended})`,
+      message: `Is ${selectedApi.name} external or internal?`,
       defaultIndex: looksInternal ? 1 : 0,
     },
   );
   const isInternal = visibilityIndex === 1;
 
-  // === Detection: can we skip OAS generation? ===
-  const existingOasPath = selectedApi.existingOasFile
-    ? path.join(rootDir, selectedApi.existingOasFile)
-    : null;
-  const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
-  const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
-
-  const oasFile = '.api/openapi.json';
-  const placeholderDomain = 'https://example.com';
-  let skipReason = null;
-  let finalOasFile = oasFile;
-
-  if (hasExistingOas) {
-    // Point settings at their file — don't overwrite their work.
-    finalOasFile = selectedApi.existingOasFile;
-    skipReason = `found OAS at ${bold(selectedApi.existingOasFile)}`;
-  } else if (frameworkGenerates) {
-    // Framework serves OAS natively at runtime — mark and move on.
-    skipReason = `${bold(framework)} generates OAS natively`;
-    finalOasFile = null;
-  }
-
-  if (skipReason) {
-    update({ sub: { 0: 'done', 1: 'done' }, activeSub: -1, message: [
-      `  ${green('✓')} Skipped OAS generation ${dim(skipReason)}.`,
-    ]});
-  } else {
-    // Run the AI generator.
-    update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  Turning your ${bold(String(totalEp))} endpoints into an OpenAPI spec — the standard`,
-      `  format tools and SDKs use to talk to your API.`,
-    ]});
-
-    const existingOasNote = selectedApi.existingOasFile
-      ? `An existing OAS file was found at ${selectedApi.existingOasFile}. Use it as a starting point — update it if the code has diverged, but preserve any hand-written descriptions or examples.`
-      : '';
-    const frameworkNote = selectedApi.frameworkCanGenerateOas
-      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively. Try using the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps manually.`
-      : '';
-    const internalNote = selectedApi.internalEndpoints?.length
-      ? `The following endpoints were detected as internal/admin and should be marked as such:\n${selectedApi.internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`
-      : '';
-
-    const vars = {
-      name: selectedApi.name,
-      domain: placeholderDomain,
-      oasFile,
-      existingOasNote,
-      frameworkNote,
-      internalNote,
-    };
-
-    await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
-
-    // Validate before we go any further — server uses the same parse logic,
-    // so if it fails here it'll fail there too. Hand errors back to the LLM
-    // and let it iterate.
-    const oasFullPath = path.join(rootDir, oasFile);
-    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
-    if (!validation.ok) {
-      fatalError('Generated OpenAPI spec failed to parse.', [
-        validation.error,
-        `File: ${oasFullPath}`,
-        'Try re-running, or open the file and fix it by hand.',
-      ]);
-    }
-  }
-
-  // Ask for the base URL
-  const firstEndpoint = selectedApi.endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
-  update({ sub: { 0: 'done', 1: 'done' }, activeSub: -1, message: [
-    '  For the OpenAPI spec, we need to know the base URL of your API in production.',
-    `  ${dim(`This is so we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    '  And the base URL of your API in production:',
+    `  ${dim(`So we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
   ]});
   const domain = await ask(`\n  ${bold('Base URL:')} `);
 
@@ -520,7 +538,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     try {
       const oasContent = fs.readFileSync(oasFullPath, 'utf8');
       const updated = oasContent.replaceAll(placeholderDomain, domain || 'http://localhost:3000');
-      fs.writeFileSync(oasFullPath, updated);
+      safeWriteFileSync(oasFullPath, updated);
     } catch {}
   }
 
@@ -528,12 +546,16 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   // Step 3 ("Test your setup") just reads `testCurl` off the API entry,
   // skipping a whole AI round-trip when the user is sitting at the prompt.
   // Frameworks that serve OAS at runtime have no on-disk file to read, so
-  // skip the picker — step 3 will fall back to a generic curl.
+  // skip the picker - step 3 will fall back to a generic curl.
+  // Picking a test endpoint is rolled into the Generate OAS file sub-step
+  // since it's a small post-generation pick. We surface it via the spinner
+  // so it doesn't disappear, but it's not a top-level sub.
   let testCurl = null;
   if (finalOasFile) {
-    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+    update({ sub: { 0: 'done' }, activeSub: 1, message: [
       `  Picking a safe ${bold('GET')} endpoint to use as a demo endpoint.`,
     ]});
+    setSpinner({ phase: 'Picking a test endpoint', detail: `Reading ${finalOasFile}` });
     try {
       testCurl = await pickTestCurl({
         oasFullPath: path.join(rootDir, finalOasFile),
@@ -542,10 +564,11 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
         setSpinner,
       });
     } catch {}
+    setSpinner('');
   }
 
-  // Sub 3: Write to .api/
-  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: [
+  // Sub 2: Write to .api/
+  update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
     dim('  Saving settings...'),
   ]});
 
@@ -588,8 +611,8 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   {
     const doneMsg = finalOasFile
       ? `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`
-      : `  ${green('✓')} ${bold(selectedApi.name)} registered — ${framework} will serve OAS at runtime${isInternal ? dim(' (internal)') : ''}.`;
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' }, status: 'done', message: [doneMsg] });
+      : `  ${green('✓')} ${bold(selectedApi.name)} registered - ${framework} will serve OAS at runtime${isInternal ? dim(' (internal)') : ''}.`;
+    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [doneMsg] });
   }
 
   return {

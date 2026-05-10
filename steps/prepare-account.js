@@ -1,17 +1,18 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { bold, dim, green, red, yellow, cyan, ask, askYesNo, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, cyan, ask, askYesNo, singleSelect, waitForKey } from '../lib/ui.js';
 import { loadSettings, saveSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
 import { fatalError } from '../lib/errors.js';
+import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 
 /**
  * Resolve the directory that owns the detected API's `package.json`, so
  * `.env` lands next to the server that will read it. Mirrors the same
  * walk we do in install-sdk.js.
  */
-function resolveApiDir(packageDir, apiRootDir) {
+export function resolveApiDir(packageDir, apiRootDir) {
   if (!apiRootDir || apiRootDir === '.') return packageDir;
   let dir = path.resolve(packageDir, apiRootDir);
   const stop = path.resolve(packageDir);
@@ -25,10 +26,27 @@ function resolveApiDir(packageDir, apiRootDir) {
 }
 
 /**
- * Read a `.env` file and return whether it already defines `RESTLESS_KEY`.
- * Minimal parser — just checks for a line starting with `RESTLESS_KEY=`.
+ * Find a real `.env` (or `.env.local`) regular file inside `apiDir`.
+ * `existsSync` alone matches symlinks and directories - we want a plain
+ * file. Only checks `apiDir` itself, never escapes upward, so a `.env` in
+ * a parent or grandparent directory is invisible to us.
  */
-function existingRestlessKey(envPath) {
+export function findExistingEnvFile(apiDir) {
+  for (const name of ['.env', '.env.local']) {
+    const p = path.join(apiDir, name);
+    try {
+      const stat = fs.statSync(p);
+      if (stat.isFile()) return p;
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Read a `.env` file and return whether it already defines `RESTLESS_KEY`.
+ * Minimal parser - just checks for a line starting with `RESTLESS_KEY=`.
+ */
+export function existingRestlessKey(envPath) {
   if (!fs.existsSync(envPath)) return null;
   try {
     const content = fs.readFileSync(envPath, 'utf8');
@@ -52,44 +70,51 @@ function existingRestlessKey(envPath) {
  *
  * Running this BEFORE the SDK install means: when the install step edits
  * the server source file, auto-restarters (nodemon, tsx --watch, node
- * --watch) will restart once — and that restart will already see
+ * --watch) will restart once - and that restart will already see
  * `RESTLESS_KEY` in `.env`.
  */
-export default async function prepareAccount({
-  packageDir,
-  rootDir,
-  apiRootDir,
-  update,
-  setSpinner,
-}) {
-  const apiDir = resolveApiDir(packageDir, apiRootDir);
+export default async function prepareAccount({ ctx, update, setSpinner }) {
+  const { packageDir, rootDir, apiRootDir, apiDir } = ctx;
   const apiDirRel = path.relative(packageDir, apiDir) || '.';
 
-  // Prefer an existing .env, fall back to .env.local, else create a new .env.
-  const envCandidates = ['.env', '.env.local'].map((f) => path.join(apiDir, f));
-  let envFile = envCandidates.find((f) => fs.existsSync(f));
-  if (!envFile) envFile = path.join(apiDir, '.env');
-  const envRelative = path.relative(packageDir, envFile);
+  // Only treat .env / .env.local as "existing" if it's a real regular file
+  // inside apiDir - never walk above. Avoids false positives from symlinks,
+  // directories, or env files in parent repos.
+  const existingEnvFile = findExistingEnvFile(apiDir);
+  let envFile = existingEnvFile || path.join(apiDir, '.env');
+  let envRelative = path.relative(packageDir, envFile);
 
-  // Idempotency: if the file already has a RESTLESS_KEY, reuse it and
-  // re-register with the backend using the same hash.
-  const existingKey = existingRestlessKey(envFile);
+  // Idempotency: if a pre-existing .env already has a RESTLESS_KEY, reuse it
+  // and re-register with the backend using the same hash.
+  const existingKey = existingEnvFile ? existingRestlessKey(envFile) : null;
   const apiKey = existingKey || 'rdme_' + crypto.randomBytes(32).toString('hex');
   const writeKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
 
-  update({ status: 'active', activeSub: 0, message: [
+  update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
     `  Generating a key for this project and registering it with Restless.`,
     dim('  The key goes in .env; we only send its hash to our server.'),
   ]});
 
   let projectId, setupKey;
-  setSpinner('Registering project');
-  try {
-    const res = await fetch(`${SITE_URL}/api/projects/init`, {
+  // Retry once on 500 / network failure - the metrics service cold-starts
+  // and the first request often times out at the Vercel layer with a 500.
+  // The second attempt almost always hits a warm container.
+  async function callInit() {
+    return fetch(`${SITE_URL}/api/projects/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ write_key_hash: writeKeyHash }),
     });
+  }
+
+  setSpinner({ phase: 'Registering project', detail: `POST ${SITE_URL}/api/projects/init` });
+  try {
+    let res = await callInit();
+    if (res.status >= 500) {
+      setSpinner({ phase: 'Server warming up, retrying', detail: `POST ${SITE_URL}/api/projects/init` });
+      await new Promise((r) => setTimeout(r, 2000));
+      res = await callInit();
+    }
     if (!res.ok) {
       const text = await res.text();
       setSpinner('');
@@ -102,7 +127,7 @@ export default async function prepareAccount({
     projectId = data.project_id;
     setupKey = data.setup_key;
     const regSettings = loadSettings(rootDir);
-    // projectId lives on the API entry (one Restless project per API) — not
+    // projectId lives on the API entry (one Restless project per API) - not
     // at the root. Match by rootDir; fall back to the first API if no match
     // is found (typical single-API setup).
     const apiRootKey = apiRootDir || '.';
@@ -123,34 +148,74 @@ export default async function prepareAccount({
 
   setSpinner('');
 
-  // Write the key to .env unless it's already there.
+  // Reusing a key that's already in .env - nothing more to do.
   if (existingKey) {
-    update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
       `  ${green('✓')} Using the ${bold('RESTLESS_KEY')} already in ${bold(envRelative)}.`,
     ]});
-    return { apiKey, projectId, setupKey, envFile, envRelative };
+    return { apiKey, projectId, setupKey, envFile, envRelative, keyDelivery: 'env' };
   }
 
   const appendLine = `RESTLESS_KEY=${apiKey}`;
   const keyPreview = `${cyan(apiKey.slice(0, 8))}${dim('...')}${cyan(apiKey.slice(-4))}`;
+  let keyDelivery; // 'env' | 'manual' | 'inline'
 
-  update({ status: 'active', activeSub: 0, message: [
-    `  Add ${bold('RESTLESS_KEY')} (${keyPreview}) to ${bold(envRelative)}?`,
-    '',
-    `  ${bold('y')} ${dim('append the line')}  ·  ${bold('n')} ${dim("I'll add it myself")}`,
+  // Build the option list. The first option differs based on whether we'd
+  // be appending to an existing .env or creating a new one. The inline
+  // option is always offered as an explicit testing-only escape hatch.
+  const options = [
+    existingEnvFile
+      ? {
+          label: `Append RESTLESS_KEY to ${envRelative}`,
+          hint: 'We tack it onto the end of the file. Your other vars stay put.',
+        }
+      : {
+          label: `Create ${envRelative}`,
+          hint: 'A new .env at your project root with just RESTLESS_KEY in it.',
+        },
+    {
+      label: 'Add the key inline',
+      hint: 'Insecure, but good for testing. Move before committing.',
+    },
+    {
+      label: "Give me the key and I'll set RESTLESS_KEY myself",
+      hint: "We'll print the line so you can paste it wherever you load env vars.",
+    },
+  ];
+
+  update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
+    `  We've generated your ${bold('RESTLESS_KEY')}: ${keyPreview}.`,
   ]});
+  const choice = await singleSelect(options, {
+    message: 'Where do you want it to be stored?',
+    defaultIndex: 0,
+  });
 
-  const appended = await askYesNo('  ', { defaultValue: true });
-  if (appended) {
-    fs.appendFileSync(envFile, `\n${appendLine}\n`);
-    update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  ${green('✓')} Added ${bold('RESTLESS_KEY')} to ${bold(envRelative)}.`,
-      dim(`  If your server is running with a file watcher (nodemon, tsx --watch, node --watch),`),
-      dim(`  it'll restart automatically once we wire the middleware in the next sub-step.`),
+  if (choice === 0) {
+    if (existingEnvFile) {
+      safeAppendFileSync(envFile, `\n${appendLine}\n`);
+    } else {
+      safeWriteFileSync(envFile, `${appendLine}\n`);
+    }
+    keyDelivery = 'env';
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+      existingEnvFile
+        ? `  ${green('✓')} Added ${bold('RESTLESS_KEY')} to ${bold(envRelative)}.`
+        : `  ${green('✓')} Created ${bold(envRelative)} with ${bold('RESTLESS_KEY')}.`,
+      ...(existingEnvFile ? [] : [dim(`  Make sure ${bold('.env')} is in your ${bold('.gitignore')} before committing.`)]),
+      dim(`  If your server uses a file watcher (nodemon, tsx --watch, node --watch),`),
+      dim(`  it'll restart automatically after we wire the middleware in.`),
+    ]});
+  } else if (choice === 1) {
+    keyDelivery = 'inline';
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+      `  ${yellow('⚠')} Inline mode: we'll embed the key directly in the SDK init line during the next sub-step.`,
+      dim(`  Suitable for quick local testing only - don't commit this code.`),
     ]});
   } else {
-    update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  ${bold('Add this line to')} ${bold(envRelative)}  ${yellow("— we won't show this key again:")}`,
+    keyDelivery = 'manual';
+    update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+      `  ${bold('Set RESTLESS_KEY however your server reads env vars')}  ${yellow("- we won't show this key again:")}`,
       '',
       `    ${bold(appendLine)}`,
       '',
@@ -164,5 +229,13 @@ export default async function prepareAccount({
     }
   }
 
-  return { apiKey, projectId, setupKey, envFile, envRelative };
+  // Write through to the SetupContext - downstream steps read from here.
+  ctx.apiKey = apiKey;
+  ctx.projectId = projectId;
+  ctx.setupKey = setupKey;
+  ctx.envFile = envFile;
+  ctx.envRelative = envRelative;
+  ctx.keyDelivery = keyDelivery;
+
+  return { apiKey, projectId, setupKey, envFile, envRelative, keyDelivery };
 }

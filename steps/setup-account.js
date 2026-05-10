@@ -63,7 +63,7 @@ function waitForEnter() {
     const onData = (key) => {
       if (key === '\x03') { cleanup(); process.stdout.write('\n'); process.exit(130); }
       if (key === '\r' || key === '\n') { cleanup(); resolve('enter'); }
-      // Ignore everything else — typing in the terminal at this prompt
+      // Ignore everything else - typing in the terminal at this prompt
       // shouldn't do anything except wait for Enter or get pre-empted by
       // the polling success.
     };
@@ -104,7 +104,7 @@ export default async function setupAccount({
 
   update({ status: 'active', activeSub: 0, message: hasLocalOas
     ? [`  Uploading ${bold(oasFile)} to your account.`]
-    : [dim('  No local OpenAPI spec to upload — your framework serves it at runtime.')],
+    : [dim('  No local OpenAPI spec to upload - your framework serves it at runtime.')],
   });
 
   if (hasLocalOas) {

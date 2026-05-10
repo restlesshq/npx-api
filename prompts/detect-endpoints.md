@@ -8,15 +8,15 @@ Discover all APIs in this **Node.js / TypeScript** codebase. You MUST finish wit
 
 ## Your job
 
-The findings above already include every route our regex could find and every YAML/JSON file whose parsed content has a top-level `openapi` or `swagger` field. Treat them as authoritative — you do NOT need to re-run that search. Just synthesize them into the output JSON.
+The findings above already include every route our regex could find and every YAML/JSON file whose parsed content has a top-level `openapi` or `swagger` field. Treat them as authoritative - you do NOT need to re-run that search. Just synthesize them into the output JSON.
 
-## Step 1 — Confirm the project shape (1 tool call)
+## Step 1 - Confirm the project shape (1 tool call)
 
 Read `package.json` at the repo root (or, for a monorepo, at each sub-package's root) to identify the framework: Express, Fastify, Koa, Hono, NestJS, Next.js, etc. If you see multiple plausible candidates, look at which framework the files in the findings actually import.
 
-If the findings show zero endpoints AND no `package.json` exists, return `{"apis": []}` immediately — we only support Node.
+If the findings show zero endpoints AND no `package.json` exists, return `{"apis": []}` immediately - we only support Node.
 
-## Step 2 — Grep for routes ONLY if findings are empty (0–1 tool calls)
+## Step 2 - Grep for routes ONLY if findings are empty (0–1 tool calls)
 
 If the Findings section above already lists endpoints, skip this step. Only if findings are empty and you suspect our regex missed a framework we don't cover, run Grep with this combined pattern:
 ```
@@ -24,13 +24,13 @@ If the Findings section above already lists endpoints, skip this step. Only if f
 ```
 Glob: `*.{js,ts,mjs,cjs}`. Use `output_mode: "content"`.
 
-## Step 3 — Group endpoints into APIs
+## Step 3 - Group endpoints into APIs
 
-If all endpoints come from a single directory / single package.json, emit one API. In a monorepo with multiple package.json files, emit one API per package that has its own endpoints — use `rootDir` relative to the repo root.
+If all endpoints come from a single directory / single package.json, emit one API. In a monorepo with multiple package.json files, emit one API per package that has its own endpoints - use `rootDir` relative to the repo root.
 
-## Step 4 — Output JSON
+## Step 4 - Output JSON
 
-Output ONLY this JSON block — no explanation before or after:
+Output ONLY this JSON block - no explanation before or after:
 ```json
 {
   "apis": [

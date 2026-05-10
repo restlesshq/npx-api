@@ -4,25 +4,33 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, orange, ask, askYesNo, startSpinner, singleSelect, typeLine, typeOut, inlineStatus, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, yellow, orange, ask, askYesNo, startSpinner, singleSelect, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
-import { resolveProjectDirs } from '../lib/project.js';
+import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
+import { setGitRoot } from '../lib/pathGuard.js';
 import generateOas from '../steps/generate-oas.js';
-import prepareAccount from '../steps/prepare-account.js';
-import installSdk from '../steps/install-sdk.js';
-import detectAuth from '../steps/detect-auth.js';
+import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
+import installSdk, { resolveInstallDir } from '../steps/install-sdk.js';
+import { createSetupContext, redactSetupContext, getSdkLineSpec } from '../lib/setup-context.js';
+import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { loadSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
-import { fatalError } from '../lib/errors.js';
+import { fatalError, isFatalExit } from '../lib/errors.js';
 import * as debug from '../lib/debug.js';
 
-// Initialize debug capture FIRST, before anything else writes to stdout —
+// Initialize debug capture FIRST, before anything else writes to stdout -
 // the stream wrappers need to be in place to record the welcome screen.
 const debugEnabled = debug.init({ argv: process.argv });
 debug.attachExitHandlers();
+
+// Hard ceiling: no fs write, AI tool, or helper anywhere in this process
+// is allowed to touch a path outside the git root the user invoked us
+// from. Set BEFORE any user-flow code runs so even early bootstrap
+// writes pass through the guard.
+setGitRoot(findGitRoot(process.cwd()));
 
 // Suppress Node's unsettled top-level await warning
 process.removeAllListeners('warning');
@@ -41,6 +49,31 @@ process.on('SIGINT', () => {
   }
   debug.flushAndExit(0);
 });
+
+// Last-resort safety net. Any thrown error or rejected promise that nothing
+// else caught funnels into fatalError so the user always sees something
+// concrete instead of a silent exit / red step with no message.
+function _surfaceFatal(err) {
+  // FatalExit is the sentinel `fatalError` throws to stop the calling
+  // stack - the error has already been reported and an async exit is in
+  // flight. Just keep the screen alive while the exit completes.
+  if (isFatalExit(err)) {
+    process.stdout.write('\x1b[?25h');
+    return;
+  }
+  process.stdout.write('\x1b[?25h'); // make sure the cursor is visible
+  const message = err?.message ? String(err.message) : String(err);
+  const stack = err?.stack ? String(err.stack).split('\n').slice(0, 4) : [];
+  try {
+    fatalError(`Unexpected error: ${message}`, stack);
+  } catch (e) {
+    // fatalError throws FatalExit by design - swallow so the handler
+    // doesn't re-fire on itself.
+    if (!isFatalExit(e)) throw e;
+  }
+}
+process.on('uncaughtException', _surfaceFatal);
+process.on('unhandledRejection', _surfaceFatal);
 
 function hasClaude() {
   try {
@@ -73,34 +106,12 @@ function hasCodexAuth() {
   }
 }
 
-/**
- * Run the auth-detection AI pass to populate .api/settings.json with custom
- * redaction rules. Skips if the current API already has a `redact` block
- * (user re-running setup → don't re-spend an AI call).
- */
-async function runDetectAuth(plan, setSpinner, packageDir, rootDir, settings) {
-  const api = settings.apis?.[0];
-  if (!api) return;
-  if (api.redact) return; // already detected — don't re-run
-
-  await detectAuth({
-    packageDir,
-    rootDir,
-    apiId: api.id,
-    apiName: api.name,
-    oasFile: api.oasFile,
-    update: plan.makeUpdater(1),
-    setSpinner,
-    subIndex: 3,
-    prevSubs: { 0: 'done', 1: 'done', 2: 'done' },
-  });
-}
 
 const command = process.argv[2];
 
 /**
  * One-shot banner shown when `--debug` is on. Makes it impossible to
- * miss that the run is being captured and uploaded — keeps the user
+ * miss that the run is being captured and uploaded - keeps the user
  * in control even though they enabled it themselves. Returns nothing
  * when debug is off.
  */
@@ -108,7 +119,7 @@ async function showDebugBanner() {
   if (!debugEnabled) return;
   console.log('');
   console.log(`  ${bold(yellow('⚠  Debug mode is on.'))}`);
-  console.log(`  ${dim('Everything in this run — your input, the AI tool calls, output, and errors —')}`);
+  console.log(`  ${dim('Everything in this run - your input, the AI tool calls, output, and errors -')}`);
   console.log(`  ${dim('will be uploaded to the Restless team when the CLI exits.')}`);
   console.log(`  ${dim('Normal runs send nothing. Re-run without --debug to disable.')}`);
   console.log('');
@@ -119,12 +130,12 @@ await showDebugBanner();
 if (command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
   console.log('');
-  await typeLine(`  ${bold(cyan('Welcome to Restless'))}`);
+  await animateLogoIn();
   console.log('');
 
   // "Restless helps make [400 Bad Request] into [200 Okay]."
   // Each status code shows a brief spinner, then settles into a colored
-  // circle + the code, and typing continues. No erase-and-replace —
+  // circle + the code, and typing continues. No erase-and-replace -
   // the spinner lands in place where the circle ends up.
   // Swap `spinnerStyle` to try: arc, halfcircle, piefill, pulse, sparkle, concentric, braille
   const spinnerStyle = 'concentric';
@@ -146,13 +157,13 @@ if (command === 'setup' || command === 'supercharge') {
   console.log('');
 
   // Boxed CTA: the focal point of the welcome. The ▸ inside pulses while
-  // we wait for input, so we hide the native blinking cursor — one cue
+  // we wait for input, so we hide the native blinking cursor - one cue
   // instead of two.
   const ctaText = 'Press ENTER to get started';
   const boxBody = `  ▸  ${ctaText}  `;
   const w = boxBody.length;
   console.log(`  ${dim('╭' + '─'.repeat(w) + '╮')}`);
-  console.log(`  ${dim('│')}  ${cyan('▸')}  ${bold(cyan(ctaText))}  ${dim('│')}`);
+  console.log(`  ${dim('│')}  ${green('▸')}  ${green(ctaText)}  ${dim('│')}`);
   console.log(`  ${dim('╰' + '─'.repeat(w) + '╯')}`);
   console.log('');
   console.log(`  ${dim("We use AI for the setup, but we'll ask permission before we do anything.")}`);
@@ -161,10 +172,10 @@ if (command === 'setup' || command === 'supercharge') {
   process.stdout.write('\x1b[?25l'); // hide terminal cursor while we own the screen
   process.stdout.write('\x1b7');     // save current row as the home position for the animation
 
-  // Pulse: dim → cyan → bold cyan → cyan, repeat. Cycles through ~1.1s.
+  // Pulse: dim → green → bold green → green, repeat. Cycles through ~1.1s.
   // Arrow lives 5 rows above the saved cursor (3 box rows + blank + 2 dim
   // copy rows), at column 6 inside the box.
-  const arrowFrames = [dim('▸'), cyan('▸'), bold(cyan('▸')), cyan('▸')];
+  const arrowFrames = [dim('▸'), green('▸'), bold(green('▸')), green('▸')];
   let arrowFrame = 0;
   const arrowInterval = setInterval(() => {
     arrowFrame = (arrowFrame + 1) % arrowFrames.length;
@@ -214,7 +225,7 @@ if (command === 'setup' || command === 'supercharge') {
   const plan = createPlanManager();
 
   console.log('');
-  console.log(`  ${bold("Here's what we're going to do:")}`);
+  printLogo();
   console.log('');
 
   // Show the initial plan as static output (not managed by the redraw system)
@@ -223,14 +234,22 @@ if (command === 'setup' || command === 'supercharge') {
   console.log('');
   const claudeInstalled = hasClaude();
   const codexInstalled = hasCodex();
-  console.log(`  ${dim("We won't upload anything to our servers without asking first.")}`);
+  console.log(`  We use your local AI tooling (Claude or Codex) to set up the project.`);
+  console.log(`  None of your code is ever seen by us. The AI runs on your machine and`);
+  console.log(`  talks to our SDKs directly. We won't upload anything to our servers`);
+  console.log(`  without checking with you first.`);
   console.log('');
   const claudeLabel = claudeInstalled
-    ? `${orange('Claude')} ${dim('(Recommended)')}`
+    ? `Claude ${dim('(Recommended)')}`
     : `${dim('Claude (Recommended)')}`;
-  const codexLabel = codexInstalled ? green('Codex') : dim('Codex');
+  const codexLabel = codexInstalled ? 'Codex' : dim('Codex');
   const choice = await singleSelect(
-    [claudeLabel, codexLabel, 'Manual install', 'Learn more'],
+    [
+      { label: claudeLabel, hint: claudeInstalled ? 'Use Claude Code running locally on your machine.' : "Claude Code isn't installed - we'll show you how." },
+      { label: codexLabel, hint: codexInstalled ? 'Use the Codex CLI running locally on your machine.' : "Codex isn't installed - we'll show you how." },
+      { label: 'Manual install', hint: "We'll book a quick call so we can pair on it together." },
+      { label: 'Learn more', hint: "Read about how setup works and what we touch before deciding." },
+    ],
     { message: 'How would you like to set this up?', defaultIndex: 0 },
   );
 
@@ -304,7 +323,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (choice === 0) setProvider('claude');
   else if (choice === 1) setProvider('codex');
 
-  // Manual: not supported yet — punt to Calendly so they can talk to a human.
+  // Manual: not supported yet - punt to Calendly so they can talk to a human.
   if (choice === 2) {
     const { execSync } = await import('child_process');
     console.log('');
@@ -329,12 +348,9 @@ if (command === 'setup' || command === 'supercharge') {
   // rootDir = git root (where .api/ lives)
   const { packageDir, rootDir } = resolveProjectDirs(process.cwd());
 
-  // Set the header (static content above the plan) and pin — from here on, render() manages the whole screen.
-  plan.setHeader([
-    '',
-    `  ${bold("Here's what we're going to do:")}`,
-    '',
-  ]);
+  // Pin the plan view; from here on, render() manages the whole screen.
+  // No textual header - the logo + step list inside the plan is the heading.
+  plan.setHeader(['']);
   plan.pin();
   setupInProgress = true;
 
@@ -343,7 +359,7 @@ if (command === 'setup' || command === 'supercharge') {
   const settings = loadSettings(rootDir);
   const hasOas = settings.apis.length > 0 && settings.apis.some(a => a.oasFile && fs.existsSync(path.join(rootDir, a.oasFile)));
 
-  // Step 1: Generate OAS file — always run so the user sees the intro screen,
+  // Step 1: Generate OAS file - always run so the user sees the intro screen,
   // even on re-runs where an OAS already exists. generateOas decides internally
   // whether to re-scan or reuse.
   const oasResult = await generateOas({
@@ -362,42 +378,57 @@ if (command === 'setup' || command === 'supercharge') {
     apiRootDir: oasResult.apiRootDir,
   });
 
-  // Step 2 sub 0: Generate API key, register project, write .env.
-  // Runs BEFORE the SDK install so the source-file edit in sub 2 triggers an
-  // auto-restart (nodemon / tsx --watch / node --watch) that loads the key.
-  // OAS upload is deferred to step 4.
-  const { apiKey, projectId, setupKey } = await prepareAccount({
+  // Build the SetupContext once we know the project shape. Every step
+  // downstream reads from this object and writes back into it - no step
+  // re-derives keyDelivery / envLoader / sdkLineSpec.
+  const ctx = createSetupContext({
     packageDir,
     rootDir,
     apiRootDir: oasResult.apiRootDir,
+    installDir: resolveInstallDir(packageDir, oasResult.apiRootDir),
+    apiDir: resolveApiDir(packageDir, oasResult.apiRootDir),
+    language: oasResult.detectedLanguage,
+    framework: oasResult.detectedFramework,
+    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+  });
+  debug.log('setup-context', redactSetupContext(ctx));
+
+  // Step 2: Install SDK. Order of subs (matches what the user sees):
+  //   0. Install package
+  //   1. Generate API key (delegated to prepareAccount via callback so the
+  //      visible substep order matches the actual run order - install
+  //      happens first, then key gen, then the AI wires the middleware)
+  //   2. Configure SDK
+  // The source-file edit in Configure SDK still triggers a watcher restart
+  // that picks up the just-written .env from step 1.
+  await installSdk({
+    ctx,
     update: plan.makeUpdater(1),
     setSpinner,
+    prepareAccountStep: () => prepareAccount({ ctx, update: plan.makeUpdater(1), setSpinner }),
   });
+  debug.log('setup-context-after-install', redactSetupContext(ctx));
 
   // Tag the debug log with the metrics project id so staff can join
   // back to the dashboard once the user claims this project (the same
   // UUID becomes Project.metricsId at claim time).
-  const projectApi = loadSettings(rootDir).apis?.find((a) => a.projectId === projectId);
+  const projectApi = loadSettings(rootDir).apis?.find((a) => a.projectId === ctx.projectId);
   debug.log('project', {
-    id: projectId,
+    id: ctx.projectId,
     name: projectApi?.name || null,
     domain: projectApi?.baseUrl || oasResult.domain || null,
   });
 
-  // Step 2 subs 1-2: Install package + configure SDK.
-  await installSdk({
-    packageDir,
-    rootDir,
-    apiRootDir: oasResult.apiRootDir,
+  // Step 2 sub 3: Run final checks. Verifies the install is correct and
+  // surfaces issues for the user to opt into fixing - it never edits the
+  // SDK init line itself (that's the CLI's responsibility, not the AI's).
+  await finalChecks({
+    ctx,
     update: plan.makeUpdater(1),
     setSpinner,
-    detectedLanguage: oasResult.detectedLanguage,
-    detectedFramework: oasResult.detectedFramework,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+    subIndex: 3,
+    prevSubs: { 0: 'done', 1: 'done', 2: 'done' },
   });
-
-  // Step 2 sub 3: Flag custom auth fields for redaction.
-  await runDetectAuth(plan, setSpinner, packageDir, rootDir, loadSettings(rootDir));
   plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' } });
 
   // Step 3: Test your setup (with live log polling)
@@ -408,8 +439,8 @@ if (command === 'setup' || command === 'supercharge') {
     setSpinner,
     update: plan.makeUpdater(2),
     domain: oasResult.domain,
-    projectId,
-    setupKey,
+    projectId: ctx.projectId,
+    setupKey: ctx.setupKey,
   });
 
   // Step 4: Set up account (log in + upload OAS specs).
@@ -418,9 +449,9 @@ if (command === 'setup' || command === 'supercharge') {
     apiRootDir: oasResult.apiRootDir,
     update: plan.makeUpdater(3),
     setSpinner,
-    apiKey,
-    projectId,
-    setupKey,
+    apiKey: ctx.apiKey,
+    projectId: ctx.projectId,
+    setupKey: ctx.setupKey,
   });
 
   setupInProgress = false;
@@ -434,7 +465,7 @@ if (command === 'setup' || command === 'supercharge') {
     const res = await fetch(`${SITE_URL}/api/reset`, { method: 'POST' });
     if (res.ok) console.log(green('  ✓ Site database cleared.'));
   } catch {
-    console.log(dim('  Site not running — skipped DB reset.'));
+    console.log(dim('  Site not running - skipped DB reset.'));
   }
 
   // Remove .api/ directory
@@ -464,7 +495,7 @@ if (command === 'setup' || command === 'supercharge') {
         execSync(`npm uninstall ${toRemove}`, { cwd, stdio: 'pipe' });
         console.log(green(`  ✓ Uninstalled ${toRemove}.`));
       } catch {
-        console.log(dim(`  Could not uninstall ${toRemove} — remove manually.`));
+        console.log(dim(`  Could not uninstall ${toRemove} - remove manually.`));
       }
     }
   }
@@ -476,10 +507,10 @@ if (command === 'setup' || command === 'supercharge') {
     await debug.flushAndExit(1);
   }
 
-  // Strip decorative prefix (e.g. "TST-abc123" → "abc123") — the prefix is interchangeable
+  // Strip decorative prefix (e.g. "TST-abc123" → "abc123") - the prefix is interchangeable
   const requestId = stripRequestIdPrefix(rawRequestIdArg);
 
-  // Load prefix for display — check per-API first, fall back to top-level for backwards compat
+  // Load prefix for display - check per-API first, fall back to top-level for backwards compat
   const { packageDir: debugPackageDir, rootDir: debugRootDir } = resolveProjectDirs(process.cwd());
   const debugSettings = loadSettings(debugRootDir);
   const idPrefix = debugSettings.apis?.[0]?.requestIdPrefix || debugSettings.requestIdPrefix || '';
@@ -502,7 +533,7 @@ if (command === 'setup' || command === 'supercharge') {
   };
 
 
-  // Fetch log by request ID (UUID) — no projectId needed, the server searches all projects
+  // Fetch log by request ID (UUID) - no projectId needed, the server searches all projects
   const logUrl = `${SITE_URL}/api/logs/${requestId}/public`;
   let log;
   try {
@@ -600,7 +631,7 @@ if (command === 'setup' || command === 'supercharge') {
   // Footer
   console.log(`\n  ${p.dim('View in browser:')} ${SITE_URL}/logs/${requestId}`);
   if (isPlain && !inlineQuestion) {
-    console.log(`\n  ${p.bold('Ask AI about this request')} — ask a question in plain English about this log:`);
+    console.log(`\n  ${p.bold('Ask AI about this request')} - ask a question in plain English about this log:`);
     console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "why did this fail?"`);
     console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "how do I fix this?"`);
     console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "show me a working curl command"`);
@@ -769,7 +800,7 @@ if (command === 'setup' || command === 'supercharge') {
   const targetDir = path.join(os.homedir(), '.claude', 'skills', skillName);
   const targetPath = path.join(targetDir, 'SKILL.md');
 
-  // Preview block — same in auto and manual modes so the user always
+  // Preview block - same in auto and manual modes so the user always
   // sees what's about to land on disk before any side effect.
   console.log();
   console.log(`  ${dim('─'.repeat(64))}`);
@@ -799,7 +830,7 @@ if (command === 'setup' || command === 'supercharge') {
     await debug.flushAndExit(0);
   }
 
-  // Refuse to overwrite an existing skill silently — could clobber an
+  // Refuse to overwrite an existing skill silently - could clobber an
   // edited copy. Confirm the overwrite explicitly.
   if (fs.existsSync(targetPath)) {
     console.log();
@@ -819,7 +850,7 @@ if (command === 'setup' || command === 'supercharge') {
 
   console.log(`  ${bold('How to use it')}`);
   console.log();
-  console.log(`  Claude Code picks the skill up automatically — start a new session`);
+  console.log(`  Claude Code picks the skill up automatically - start a new session`);
   console.log(`  (or reload the running one) and ask anything about this API.`);
   console.log();
   console.log(`  Try:`);
