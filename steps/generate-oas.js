@@ -173,8 +173,8 @@ async function locateApis({ packageDir, setSpinner, hint = '' }) {
 
 /**
  * "User already has an OAS file" branch. Asks whether it's in the codebase
- * or at a URL, registers it in .api/settings.json, copies the file into
- * .api/ if it's outside the repo.
+ * or at a URL, registers it in .restless/settings.json, copies the file into
+ * .restless/ if it's outside the repo.
  *
  * If `selectedApi` is provided, reuses its name/framework/language instead
  * of prompting. If not, asks for a name.
@@ -184,7 +184,7 @@ async function adoptExistingOas({ rootDir, update, selectedApi = null, isInterna
   const location = await singleSelect(
     [
       { label: "It's in my codebase", hint: "We'll read it from a path you give us." },
-      { label: "It's at a URL", hint: "We'll fetch it once and copy it into .api/." },
+      { label: "It's at a URL", hint: "We'll fetch it once and copy it into .restless/." },
     ],
     { message: 'Where is it?', defaultIndex: 0 },
   );
@@ -203,8 +203,8 @@ async function adoptExistingOas({ rootDir, update, selectedApi = null, isInterna
 
     const rel = path.relative(rootDir, absPath);
     if (rel.startsWith('..')) {
-      // Outside the repo - copy into .api/ so it lives alongside the codebase.
-      const apiDir = path.join(rootDir, '.api');
+      // Outside the repo - copy into .restless/ so it lives alongside the codebase.
+      const apiDir = path.join(rootDir, '.restless');
       if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
       const ext = path.extname(absPath) || '.yaml';
       const dest = path.join(apiDir, `openapi${ext}`);
@@ -281,7 +281,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
         body:
           `Point ${cyan(aiTool)} (running locally on your machine) at\n` +
           `your codebase, find your routes, and write an OAS file. It lands in a new\n` +
-          `${bold('.api/')} folder, commit that along with your code, it's meant to live there.`,
+          `${bold('.restless/')} folder, commit that along with your code, it's meant to live there.`,
       },
       {
         label: 'Privacy',
@@ -296,7 +296,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
 
   // Detect APIs in the repo and let the user pick one.
   //
-  // Loop: detect → (optionally cross-reference with .api/settings.json for
+  // Loop: detect → (optionally cross-reference with .restless/settings.json for
   // already-set-up markers) → pick. If user picks "Other", collect a free-form
   // hint and re-detect with it.
   let hint = '';
@@ -313,7 +313,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
 
     const apis = await locateApis({ packageDir, setSpinner, hint });
 
-    // Cross-reference each detected API with .api/settings.json. Match by
+    // Cross-reference each detected API with .restless/settings.json. Match by
     // rootDir first, then by name.
     const settings = loadSettings(rootDir);
     const annotated = apis.map((a) => {
@@ -375,7 +375,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   if (selectedApi.isSetup && selectedExisting) {
     update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
       `  ${green('✓')} ${bold(selectedApi.name)} is already set up (${selectedExisting.oasFile}).`,
-      `  ${dim('Delete the entry from .api/settings.json if you want to regenerate.')}`,
+      `  ${dim('Delete the entry from .restless/settings.json if you want to regenerate.')}`,
     ]});
     return {
       detectedLanguage: selectedExisting.language || selectedApi.language || null,
@@ -406,7 +406,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
   const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
 
-  const oasFile = '.api/openapi.json';
+  const oasFile = '.restless/openapi.json';
   const placeholderDomain = 'https://example.com';
   let skipReason = null;
   let finalOasFile = oasFile;
@@ -444,7 +444,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       : '';
 
     // Pass an absolute path to the AI so it can't accidentally walk up
-    // the tree and write into a parent's `.api/` directory. The relative
+    // the tree and write into a parent's `.restless/` directory. The relative
     // path was getting resolved against whatever the AI considered "the
     // project root," which sometimes meant the monorepo above the user's
     // actual package.
@@ -567,7 +567,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     setSpinner('');
   }
 
-  // Sub 2: Write to .api/
+  // Sub 2: Write to .restless/
   update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
     dim('  Saving settings...'),
   ]});

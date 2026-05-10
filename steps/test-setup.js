@@ -230,7 +230,7 @@ export default async function testSetup({
   });
 
   // The test curl was picked at the end of step 1 (when the OAS was fresh)
-  // and saved to .api/settings.json. Read it back and rewrite its base URL
+  // and saved to .restless/settings.json. Read it back and rewrite its base URL
   // to localhost so the user can hit their dev server without editing the
   // command. Falls back to a generic GET / if nothing was saved (e.g. the
   // framework serves OAS at runtime).
@@ -359,7 +359,7 @@ export default async function testSetup({
   } else if (diag.state === 'no-sdk') {
     doneMessage = [
       `  ${red('✗')} The Restless SDK didn't run on this request.`,
-      `  Add the middleware to your server (see ${bold('.api/INSTALL.md')}) and ${bold('restart')} it.`,
+      `  Add the middleware to your server (see ${bold('.restless/INSTALL.md')}) and ${bold('restart')} it.`,
     ];
   } else if (diag.state === 'no-key') {
     doneMessage = [

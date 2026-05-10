@@ -112,7 +112,7 @@ app.use(restless.setup((ctx) => ({
 - **Never read `.env`, `.env.local`, or any credentials file.** This is non-negotiable.
 - **Never read files inside `node_modules/`.** The SDK is a black box.
 - **`restless.mask()` gotcha:** always pass the raw value. If it's missing, `mask()` returns `undefined` - that's fine. **Do NOT write `restless.mask(value || 'anonymous')`** - the string `'anonymous'` would get hashed and its last 4 characters (`mous`) would appear as the tail of every anonymous log's mask, defeating the purpose.
-- **`.api/settings.json` is read automatically by the SDK at startup.** You do NOT need to read it yourself - the SDK walks up from cwd to find it.
+- **`.restless/settings.json` is read automatically by the SDK at startup.** You do NOT need to read it yourself - the SDK walks up from cwd to find it.
 - **`setupMode`, `apiId`, `email` (top-level), `project: { id, name }`, and `hooks.getUser` are OBSOLETE.** The old SDK used them. The new SDK uses `restless.setup(cb)` with `apiKey` / `projectId` / `enrich` - do NOT pass any of the old fields.
 
 ## Verify

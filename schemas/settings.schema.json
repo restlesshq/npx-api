@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "API Settings",
-  "description": "Configuration file stored in .api/settings.json",
+  "description": "Configuration file stored in .restless/settings.json",
   "type": "object",
   "properties": {
     "$schema": {
@@ -34,7 +34,7 @@
           },
           "oasFile": {
             "type": "string",
-            "description": "Relative path to the generated OAS file (e.g. .api/openapi.yaml)"
+            "description": "Relative path to the generated OAS file (e.g. .restless/openapi.yaml)"
           },
           "framework": {
             "type": "string",

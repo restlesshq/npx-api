@@ -18,4 +18,4 @@ After installing, set up the SDK in the actual server code:
 2. Add the import for the SDK (use the right adapter for the framework - Express, Fastify, etc.)
 3. Add the middleware/plugin registration BEFORE route definitions
 4. The API key is read automatically by the SDK from `process.env.RESTLESS_KEY` (or the language equivalent). Do NOT pass it explicitly.
-5. Do NOT read `.api/settings.json` manually - the SDK reads it automatically at startup.
+5. Do NOT read `.restless/settings.json` manually - the SDK reads it automatically at startup.

@@ -56,6 +56,6 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 - Don't break existing imports, code structure, or formatting.
 - Use `require()` style imports if the project uses CommonJS (no `"type": "module"` in package.json). Use `import` style if the project uses ESM.
 - **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, or `hooks.beforeSend`** - these are from the OLD SDK API. The new SDK will ignore them.
-- **Do NOT read `.api/settings.json` manually.** The SDK reads it automatically at startup.
+- **Do NOT read `.restless/settings.json` manually.** The SDK reads it automatically at startup.
 - **Do NOT substitute `|| 'anonymous'` inside `restless.mask()`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it gracefully. Writing `restless.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.
 - Keep changes minimal - just add the SDK setup, don't refactor anything else.

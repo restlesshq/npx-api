@@ -139,9 +139,10 @@ export function runChecks(ctx) {
       : dim('(none set - logs roll up as anonymous; open the SDK block to add one)'),
   });
 
-  // ── 4. .gitignore covers .env (only if .gitignore exists).
+  // ── 4. .gitignore covers .env. Only run when we created the .env file
+  // ourselves - if the user already had one, we trust they manage it.
   const gi = path.join(ctx.installDir, '.gitignore');
-  if (fs.existsSync(gi)) {
+  if (ctx.createdEnvFile && fs.existsSync(gi)) {
     let giContent = '';
     try { giContent = fs.readFileSync(gi, 'utf8'); } catch {}
     const covered = /(^|\n)\.env(\s|$|\/)/.test(giContent);

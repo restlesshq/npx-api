@@ -345,7 +345,7 @@ if (command === 'setup' || command === 'supercharge') {
     await debug.flushAndExit(0);
   }
   // packageDir = where the user ran the command (scopes what we analyze)
-  // rootDir = git root (where .api/ lives)
+  // rootDir = git root (where .restless/ lives)
   const { packageDir, rootDir } = resolveProjectDirs(process.cwd());
 
   // Pin the plan view; from here on, render() manages the whole screen.
@@ -468,13 +468,13 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(dim('  Site not running - skipped DB reset.'));
   }
 
-  // Remove .api/ directory
-  const target = path.join(clearRoot, '.api');
+  // Remove .restless/ directory
+  const target = path.join(clearRoot, '.restless');
   if (fs.existsSync(target)) {
     fs.rmSync(target, { recursive: true });
-    console.log(green('  ✓ .api/ removed.'));
+    console.log(green('  ✓ .restless/ removed.'));
   } else {
-    console.log(dim('  No .api/ directory found.'));
+    console.log(dim('  No .restless/ directory found.'));
   }
 
   // Uninstall SDK package

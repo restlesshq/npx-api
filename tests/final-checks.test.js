@@ -51,8 +51,8 @@ describe('runChecks', () => {
   beforeEach(() => {
     dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'final-checks-')));
     setGitRoot(dir);
-    fs.mkdirSync(path.join(dir, '.api'));
-    fs.writeFileSync(path.join(dir, '.api', 'settings.json'), JSON.stringify({ apis: [{ rootDir: '.', redact: { headers: ['x-api-key'] } }] }));
+    fs.mkdirSync(path.join(dir, '.restless'));
+    fs.writeFileSync(path.join(dir, '.restless', 'settings.json'), JSON.stringify({ apis: [{ rootDir: '.', redact: { headers: ['x-api-key'] } }] }));
   });
   afterEach(() => {
     setGitRoot(null);
@@ -140,18 +140,28 @@ describe('runChecks', () => {
     expect(rows.find((r) => r.kind === 'project-id').ok).toBe(true);
   });
 
-  it('flags missing .gitignore coverage and exposes a fix', () => {
+  it('flags missing .gitignore coverage and exposes a fix when we created .env', () => {
+    const block = generate(ctxFor(), {
+      module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
+    });
+    writeSource(`const app = require('express')();\n${block}`);
+    fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules\n');
+    const rows = runChecks(ctxFor({ createdEnvFile: true }));
+    const gi = rows.find((r) => r.kind === 'gitignore');
+    expect(gi.ok).toBe(false);
+    expect(typeof gi.fix).toBe('function');
+    gi.fix();
+    expect(fs.readFileSync(path.join(dir, '.gitignore'), 'utf8')).toContain('.env');
+  });
+
+  it('skips the .gitignore check when we did not create the .env file', () => {
     const block = generate(ctxFor(), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
     writeSource(`const app = require('express')();\n${block}`);
     fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules\n');
     const rows = runChecks(ctxFor());
-    const gi = rows.find((r) => r.kind === 'gitignore');
-    expect(gi.ok).toBe(false);
-    expect(typeof gi.fix).toBe('function');
-    gi.fix();
-    expect(fs.readFileSync(path.join(dir, '.gitignore'), 'utf8')).toContain('.env');
+    expect(rows.find((r) => r.kind === 'gitignore')).toBeUndefined();
   });
 
   it('canonicalize fix actually rewrites the init line', () => {

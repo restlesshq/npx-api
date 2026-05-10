@@ -32,7 +32,7 @@ describe('resolveProjectDirs', () => {
 
   it('uses cwd as rootDir when cwd has its own package.json (monorepo subpackage)', () => {
     // Simulates running `npx api setup` inside a monorepo subpackage:
-    // even though git root is the monorepo, `.api/` should live next to
+    // even though git root is the monorepo, `.restless/` should live next to
     // the subpackage's own package.json, not at the monorepo root.
     const monorepo = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
     execSync('git init', { cwd: monorepo, stdio: 'pipe' });
@@ -76,7 +76,7 @@ describe('resolveProjectDirs', () => {
 
   it('never escapes the git root', () => {
     // If the user runs from inside a git repo and there's a package.json
-    // ABOVE the git root, we must NOT pick it - that'd write `.api/`
+    // ABOVE the git root, we must NOT pick it - that'd write `.restless/`
     // outside the repo.
     const outer = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
     fs.writeFileSync(path.join(outer, 'package.json'), '{}'); // package.json above git root

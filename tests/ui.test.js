@@ -125,14 +125,10 @@ describe('pickContextualHint', () => {
       pickContextualHint(),
       pickContextualHint({ logs: [{ status: 200 }] }),
       pickContextualHint({ failedAttempts: [{}, {}, {}] }),
+      pickContextualHint({ command: 'curl x API_KEY_HERE' }),
     ]) {
-      // Tab should appear bolded (escape code 1) somewhere in the lines.
       const raw = variant.lines.join('');
-      // 'success' and 'failing' both cite Tab; the default variant doesn't,
-      // so we only check non-default variants for the bolded keyword.
-      if (variant.kind !== 'default' && variant.kind !== 'placeholder') {
-        expect(raw).toMatch(/\x1b\[1mTab\x1b\[0m/);
-      }
+      expect(raw).toMatch(/\x1b\[1mTab\x1b\[0m/);
     }
   });
 

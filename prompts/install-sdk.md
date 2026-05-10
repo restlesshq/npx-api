@@ -26,5 +26,5 @@ Make sure to:
 - Place the middleware BEFORE route definitions so it captures all requests.
 - Don't break existing imports or code structure.
 - **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, or `hooks.beforeSend`** - those are from the OLD SDK API. The new SDK will ignore them.
-- **Do NOT read `.api/settings.json` manually.** The SDK reads it automatically at startup.
+- **Do NOT read `.restless/settings.json` manually.** The SDK reads it automatically at startup.
 - **Do NOT substitute `|| 'anonymous'` inside `restless.mask(...)`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it. Writing `restless.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.

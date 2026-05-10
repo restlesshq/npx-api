@@ -191,11 +191,13 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
     defaultIndex: 0,
   });
 
+  let createdEnvFile = false;
   if (choice === 0) {
     if (existingEnvFile) {
       safeAppendFileSync(envFile, `\n${appendLine}\n`);
     } else {
       safeWriteFileSync(envFile, `${appendLine}\n`);
+      createdEnvFile = true;
     }
     keyDelivery = 'env';
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
@@ -236,6 +238,7 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   ctx.envFile = envFile;
   ctx.envRelative = envRelative;
   ctx.keyDelivery = keyDelivery;
+  ctx.createdEnvFile = createdEnvFile;
 
   return { apiKey, projectId, setupKey, envFile, envRelative, keyDelivery };
 }

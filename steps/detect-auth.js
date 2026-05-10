@@ -5,7 +5,7 @@ import { bold, dim, green } from '../lib/ui.js';
 /**
  * Scan the project for custom auth mechanisms (headers, query params, body
  * fields) not already covered by the SDK's built-in redaction defaults, and
- * write them to `.api/settings.json` under `apis[].redact`.
+ * write them to `.restless/settings.json` under `apis[].redact`.
  *
  * The Restless SDK reads this block at startup and merges it with its
  * defaults - so anything detected here gets automatically redacted from
@@ -37,7 +37,7 @@ export default async function detectAuth({ packageDir, rootDir, apiId, apiName, 
   } catch (err) {
     update({ sub: { ...prevSubs, [subIndex]: 'done' }, message: [
       `  ${dim(`Could not auto-detect auth fields - the SDK's built-in redaction will still apply.`)}`,
-      `  ${dim(`You can add custom fields by hand in .api/settings.json → apis[].redact.`)}`,
+      `  ${dim(`You can add custom fields by hand in .restless/settings.json → apis[].redact.`)}`,
     ]});
     return { redact: null };
   }
