@@ -225,6 +225,9 @@ export default async function setupAccount({
     uploadDoneLine,
     `  ${green('✓')} Logged in as ${bold(email)}.`,
     `  ${green('✓')} Project claimed: ${cyan(`${SITE_URL}/api/${slug}`)}`,
+    '',
+    `  ${bold('Next steps:')}`,
+    `    Commit ${cyan('.restless/')} to your repo so your team and CI use the same config.`,
   ].filter(Boolean) });
 
   return { apiKey, email, slug };
