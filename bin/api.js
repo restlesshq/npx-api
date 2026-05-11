@@ -129,6 +129,10 @@ await showDebugBanner();
 
 if (command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
+  // Clear viewport + scrollback so the welcome starts at the top of the
+  // terminal, matching where every subsequent screen lands after each
+  // transition clears + homes the cursor.
+  process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
   console.log('');
   await animateLogoIn();
   console.log('');
