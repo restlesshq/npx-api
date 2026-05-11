@@ -37,34 +37,19 @@ function findWiredSourceFile(installDir) {
 }
 
 /**
- * After the AI writes the sentinel-bracketed SDK block, the CLI takes
- * ownership of the init line: it rewrites the init arg to match
- * `getSdkLineSpec(ctx)` (literal / env-ref / no-arg). Auth extraction
- * and project.id (the AI's domain-specific work) are preserved.
- *
- * Falls back to the legacy regex inliner when the AI forgot the
- * sentinels - covers older installs and AI runs that ignore the
- * sentinel instruction.
+ * After the AI wires in the SDK, the CLI takes ownership of the init
+ * line: rewrites the init arg to match `getSdkLineSpec(ctx)` (literal /
+ * env-ref / no-arg). Auth extraction and project.id (the AI's
+ * domain-specific work) are preserved.
  */
 function canonicalizeSdkBlock(ctx) {
   const writer = getSdkWriter(ctx.language);
   const file = findWiredSourceFile(ctx.installDir);
   if (!file) return { mode: 'no-source', file: null };
   const content = fs.readFileSync(file, 'utf8');
-  const found = writer.parse(content);
-  if (found) {
-    const next = writer.canonicalizeInitArg(content, ctx);
-    if (next !== content) safeWriteFileSync(file, next);
-    return { mode: 'canonicalized', file: path.relative(ctx.installDir, file) };
-  }
-  // Legacy fallback: AI didn't add sentinels. Use the old inliner so we at
-  // least get the literal key in for inline mode. Future runs after the
-  // user re-runs setup will get sentinel-wrapped blocks.
-  if (ctx.keyDelivery === 'inline' && ctx.apiKey) {
-    const touched = inlineKeyIntoSource(ctx.installDir, ctx.apiKey);
-    if (touched.length) return { mode: 'legacy-inline', file: touched[0] };
-  }
-  return { mode: 'unwrapped', file: path.relative(ctx.installDir, file) };
+  const next = writer.canonicalizeInitArg(content, ctx);
+  if (next !== content) safeWriteFileSync(file, next);
+  return { mode: 'canonicalized', file: path.relative(ctx.installDir, file) };
 }
 
 const languageAliases = {
@@ -394,11 +379,8 @@ export default async function installSdk({
       ? `  ${green('✓')} SDK is already wired into your source - leaving it alone.`
       : `  ${green('✓')} SDK installed and configured.`;
     const baseMsg = [headerLine];
-    if (inlineMode && (canon.mode === 'canonicalized' || canon.mode === 'legacy-inline')) {
+    if (inlineMode && canon.mode === 'canonicalized') {
       baseMsg.push(dim(`  Inlined the API key in ${bold(canon.file)} - testing only, don't commit.`));
-    }
-    if (canon.mode === 'unwrapped') {
-      baseMsg.push(dim(`  Note: ${bold(canon.file)} doesn't have managed sentinels. Re-run setup to migrate.`));
     }
     update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: baseMsg });
   }

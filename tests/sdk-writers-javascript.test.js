@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  generate, parse, readBlockFields, replaceInContent, canonicalizeInitArg,
-  BLOCK_START, BLOCK_END,
+  generate, parse, readBlockFields, canonicalizeInitArg, setProjectId,
 } from '../lib/sdk-writers/javascript.js';
 
 function ctxWith(overrides = {}) {
@@ -14,16 +13,17 @@ function ctxWith(overrides = {}) {
 }
 
 describe('generate', () => {
-  it('emits a sentinel-bracketed block with a no-arg CJS init when no env loader', () => {
+  it('emits a no-arg CJS init when no env loader is present, with no sentinel comments', () => {
     const out = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app',
       credentialExpr: 'req.headers.authorization', projectIdExpr: null,
     });
-    expect(out).toContain(BLOCK_START);
-    expect(out).toContain(BLOCK_END);
     expect(out).toContain("const sdk = require('@restlessai/sdk')();");
     expect(out).toContain('app.use(sdk.setup(');
     expect(out).toContain('sdk.mask(req.headers.authorization)');
+    expect(out).not.toContain('restless-sdk-start');
+    expect(out).not.toContain('restless-sdk-end');
+    expect(out).not.toContain('managed by');
   });
 
   it('uses process.env.RESTLESS_KEY when an env loader is detected', () => {
@@ -75,54 +75,50 @@ describe('generate', () => {
 });
 
 describe('parse', () => {
-  it('finds a sentinel-bracketed block', () => {
-    const content = `// imports\n${BLOCK_START}\nconst sdk = require('@restlessai/sdk')();\napp.use(sdk.setup(req => ({ apiKey: sdk.mask(req.headers.authorization) })));\n${BLOCK_END}\n// rest`;
+  it('returns a wrapper when the file references @restlessai/sdk', () => {
+    const content = "const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup(req => ({ apiKey: sdk.mask(req.headers.authorization) })));\n";
     const found = parse(content);
     expect(found).not.toBeNull();
-    expect(found.block).toContain(BLOCK_START);
-    expect(found.block).toContain(BLOCK_END);
+    expect(found.block).toBe(content);
+    expect(found.startIdx).toBe(0);
+    expect(found.endIdx).toBe(content.length);
   });
 
-  it('returns null when no block exists', () => {
-    expect(parse("const x = require('@restlessai/sdk')();\n")).toBeNull();
+  it('returns null when the file has no SDK reference', () => {
+    expect(parse('const x = 1;\n')).toBeNull();
     expect(parse('')).toBeNull();
-  });
-
-  it('returns null when start marker is present but end marker is missing', () => {
-    expect(parse(`${BLOCK_START}\nconst sdk = require('@restlessai/sdk')();\n`)).toBeNull();
+    expect(parse(null)).toBeNull();
   });
 });
 
 describe('readBlockFields', () => {
   it('reads a literal key out of a CJS init line', () => {
-    const block = `${BLOCK_START}\nconst sdk = require('@restlessai/sdk')("rdme_abc");\n${BLOCK_END}`;
-    const r = readBlockFields(block);
+    const content = `const sdk = require('@restlessai/sdk')("rdme_abc");\n`;
+    const r = readBlockFields(content);
     expect(r.initArgForm).toBe('literal');
     expect(r.initArgValue).toBe('rdme_abc');
   });
 
   it('reads an env-ref init line', () => {
-    const block = `${BLOCK_START}\nconst sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);\n${BLOCK_END}`;
-    const r = readBlockFields(block);
+    const content = `const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);\n`;
+    const r = readBlockFields(content);
     expect(r.initArgForm).toBe('env-ref');
     expect(r.initArgValue).toBe('RESTLESS_KEY');
   });
 
   it('reads a no-arg init line', () => {
-    const block = `${BLOCK_START}\nconst sdk = require('@restlessai/sdk')();\n${BLOCK_END}`;
-    const r = readBlockFields(block);
+    const content = `const sdk = require('@restlessai/sdk')();\n`;
+    const r = readBlockFields(content);
     expect(r.initArgForm).toBe('no-arg');
   });
 
   it('extracts the credential expression and project.id expression', () => {
-    const block = `${BLOCK_START}
-const sdk = require('@restlessai/sdk')();
+    const content = `const sdk = require('@restlessai/sdk')();
 app.use(sdk.setup((req) => ({
   apiKey: sdk.mask(req.headers['x-api-key']),
   project: { id: workspace.id },
-})));
-${BLOCK_END}`;
-    const r = readBlockFields(block);
+})));`;
+    const r = readBlockFields(content);
     expect(r.credentialExpr).toBe("req.headers['x-api-key']");
     expect(r.projectIdExpr).toBe('workspace.id');
   });
@@ -131,14 +127,12 @@ ${BLOCK_END}`;
 describe('canonicalizeInitArg', () => {
   // The AI wrote a placeholder; the CLI must replace it deterministically
   // based on ctx.sdkLineSpec. This is the bug-class fix: CLI authoritatively
-  // owns the init line, AI's auth/project work inside the block is preserved.
-  const placeholderBlock = `${BLOCK_START}
-const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
+  // owns the init line, AI's auth/project work in the callback is preserved.
+  const placeholderBlock = `const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 app.use(sdk.setup((req) => ({
   apiKey: sdk.mask(req.headers['x-api-key']),
   project: { id: workspace.id },
-})));
-${BLOCK_END}`;
+})));`;
 
   it('swaps placeholder for the literal key in inline mode', () => {
     const out = canonicalizeInitArg(placeholderBlock, ctxWith({ keyDelivery: 'inline', apiKey: 'rdme_abc' }));
@@ -178,45 +172,65 @@ ${BLOCK_END}`;
   });
 
   it('rewrites an ESM init call', () => {
-    const esmBlock = `${BLOCK_START}
-import restless from '@restlessai/sdk';
+    const esmBlock = `import restless from '@restlessai/sdk';
 const sdk = restless(process.env.RESTLESS_KEY);
-app.use(sdk.setup((req) => ({ apiKey: sdk.mask(req.headers.authorization) })));
-${BLOCK_END}`;
+app.use(sdk.setup((req) => ({ apiKey: sdk.mask(req.headers.authorization) })));`;
     const out = canonicalizeInitArg(esmBlock, ctxWith({ keyDelivery: 'inline', apiKey: 'rdme_abc' }));
     expect(out).toContain('const sdk = restless("rdme_abc");');
   });
 
-  it('returns content unchanged when there is no block', () => {
+  it('returns content unchanged when there is no SDK reference', () => {
     expect(canonicalizeInitArg('const x = 1;\n', ctxWith({ keyDelivery: 'inline', apiKey: 'rdme_abc' })))
       .toBe('const x = 1;\n');
   });
 });
 
-describe('replaceInContent', () => {
-  it('replaces an existing block with a freshly generated one', () => {
-    const initialBlock = generate(ctxWith({ keyDelivery: 'manual' }), {
+describe('setProjectId', () => {
+  it('inserts project.id after apiKey when the block has none', () => {
+    const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
-    const content = `// header\n${initialBlock}// trailer\n`;
-    const next = replaceInContent(
-      content,
-      ctxWith({ keyDelivery: 'inline', apiKey: 'rdme_abc' }),
-      { module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth' },
-    );
-    expect(next).toContain('"rdme_abc"');
-    expect(next).toContain('TODO: move this out of the codebase');
-    expect(next).toContain('// header');
-    expect(next).toContain('// trailer');
-    // Only one block - we replaced, not duplicated.
-    expect(next.match(/restless-sdk-start/g)).toHaveLength(1);
+    const content = `const app = require('express')();\n${initial}`;
+    const next = setProjectId(content, 'user.workspaceId');
+    expect(next).toContain('project: { id: user.workspaceId },');
+    // apiKey line still present, no duplicate project lines.
+    expect(next.match(/apiKey:\s*sdk\.mask/g)).toHaveLength(1);
+    expect(next.match(/project\s*:\s*\{\s*id:/g)).toHaveLength(1);
   });
 
-  it('returns content unchanged when no existing block is present', () => {
-    const content = `const x = 1;\n`;
-    const next = replaceInContent(content, ctxWith({ keyDelivery: 'manual' }), {
+  it('replaces an existing risky project.id in place', () => {
+    const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
+      module: 'cjs', framework: 'express', appVar: 'app',
+      credentialExpr: 'auth', projectIdExpr: 'req.headers.authorization',
+    });
+    const content = `const app = require('express')();\n${initial}`;
+    const next = setProjectId(content, 'user.id');
+    expect(next).toContain('project: { id: user.id }');
+    expect(next).not.toContain('req.headers.authorization');
+  });
+
+  it('preserves the apiKey line indentation when inserting', () => {
+    const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
-    expect(next).toBe(content);
+    const next = setProjectId(initial, 'user.id');
+    // The new project line should share the same leading whitespace as apiKey.
+    const apiKeyIndent = next.match(/^([ \t]*)apiKey\s*:/m)[1];
+    const projectIndent = next.match(/^([ \t]*)project\s*:/m)[1];
+    expect(projectIndent).toBe(apiKeyIndent);
+  });
+
+  it('returns content unchanged when there is no managed block', () => {
+    const content = `const x = 1;\n`;
+    expect(setProjectId(content, 'user.id')).toBe(content);
+  });
+
+  it('returns content unchanged when the expression is empty or whitespace', () => {
+    const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
+      module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
+    });
+    expect(setProjectId(initial, '')).toBe(initial);
+    expect(setProjectId(initial, '   ')).toBe(initial);
   });
 });
+

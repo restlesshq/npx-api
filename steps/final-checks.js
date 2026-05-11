@@ -1,10 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, yellow, red, cyan, askYesNo, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, yellow, red, cyan, ask, askYesNo, waitForKey } from '../lib/ui.js';
 import { loadSettings } from '../lib/settings.js';
 import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
+import { runAI, loadPrompt } from '../lib/ai.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
 
 /**
@@ -84,20 +85,8 @@ export function runChecks(ctx) {
 
   const relSource = path.relative(ctx.installDir, sourceFile);
   const content = fs.readFileSync(sourceFile, 'utf8');
-  const block = writer.parse(content);
   const rows = [];
-
-  if (!block) {
-    rows.push({
-      kind: 'unwrapped-block',
-      ok: false,
-      label: 'SDK block management',
-      detail: `${bold(relSource)} doesn't have managed sentinels. Re-run setup to migrate.`,
-    });
-    return rows;
-  }
-
-  const fields = writer.readBlockFields(block.block);
+  const fields = writer.readBlockFields(content);
   const want = getSdkLineSpec(ctx);
 
   // ── 1. Init form matches sdkLineSpec.
@@ -179,6 +168,70 @@ function renderRow(row) {
 }
 
 /**
+ * Repair a missing or risky `project.id` in two passes: first hand the
+ * problem back to the AI with a focused prompt (it has more codebase
+ * context than us), then if it still can't find a stable identity, ask
+ * the user to type one in. Either way the writer patches just the
+ * project.id line - the rest of the block is left alone.
+ *
+ * Returns nothing; the caller re-runs `runChecks` to see the new state.
+ */
+async function repairProjectId({ ctx, sourceFile, writer, update, setSpinner, subIndex, prevSubs, baseMessage }) {
+  const aiTool = ctx.aiTool || 'Claude Code';
+
+  update({ activeSub: subIndex, sub: prevSubs, message: [
+    ...baseMessage,
+    `  Asking ${cyan(aiTool)} to look again for a stable tenant or user id.`,
+    dim('  It re-scans your codebase and patches only the project.id line.'),
+  ]});
+
+  try {
+    const prompt = loadPrompt('fix-project-id', {
+      language: ctx.language || 'javascript',
+      framework: ctx.framework || ctx.language || 'your framework',
+    });
+    await runAI(prompt, ctx.installDir, { setSpinner });
+  } catch (err) {
+    update({ activeSub: subIndex, sub: prevSubs, message: [
+      ...baseMessage,
+      `  ${yellow('⚠')} AI retry didn't complete: ${err.message}`,
+    ]});
+  }
+
+  const afterAi = fs.readFileSync(sourceFile, 'utf8');
+  const aiFields = writer.readBlockFields(afterAi);
+  const aiOk = !!aiFields.projectIdExpr && !projectIdLooksRisky(aiFields.projectIdExpr);
+  if (aiOk) return;
+
+  update({ activeSub: subIndex, sub: prevSubs, message: [
+    ...baseMessage,
+    `  ${yellow('⚠')} Couldn't auto-pick a stable project ID.`,
+    dim('  This identifies each customer on the dashboard. Some examples:'),
+    `    ${cyan('req.user.workspaceId')}        ${dim('tenant from your auth context')}`,
+    `    ${cyan("req.headers['x-workspace-id']")} ${dim('header set by your gateway')}`,
+    `    ${cyan('req.user.id')}                 ${dim("user's stable internal id")}`,
+    '',
+  ]});
+
+  const answer = await ask(`  Enter an expression to use as project.id ${dim('(or press Enter to skip)')}: `);
+  const expr = (answer || '').trim();
+  if (!expr) return;
+
+  if (projectIdLooksRisky(expr)) {
+    update({ activeSub: subIndex, sub: prevSubs, message: [
+      ...baseMessage,
+      `  ${red('✗')} ${cyan(expr)} looks like a raw secret - project.id leaves the user's machine on every request.`,
+      dim('  Use a stable internal id (user / workspace / org) instead, or run setup again later.'),
+    ]});
+    return;
+  }
+
+  const latest = fs.readFileSync(sourceFile, 'utf8');
+  const next = writer.setProjectId(latest, expr);
+  if (next !== latest) safeWriteFileSync(sourceFile, next);
+}
+
+/**
  * Verifier-only final check step. Runs deterministic checks against
  * the wired SDK block and project state. When a check fails AND has a
  * fix function, prompts the user to apply it. The AI is never
@@ -210,10 +263,41 @@ export default async function finalChecks({
 
   update({ activeSub: subIndex, sub: prevSubs, message: renderReview(rows) });
 
-  // Walk the failed-with-fix rows and offer to apply each.
+  // Walk the failed rows and offer to apply each. Most checks expose a
+  // pure `row.fix` thunk; `project-id` is special - it needs an AI retry
+  // plus a user-input fallback, so it gets its own repair flow.
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    if (row.ok || !row.fix) continue;
+    if (row.ok) continue;
+
+    if (row.kind === 'project-id') {
+      const writer = getSdkWriter(ctx.language);
+      const sourceFile = findWiredSourceFile(ctx.installDir);
+      if (!sourceFile) continue;
+
+      const yes = await askYesNo(
+        `\n  ${yellow('⚠')} ${bold(row.label)}: ${row.detail}\n    Try to set this up now?`,
+        { defaultValue: true },
+      );
+      if (!yes) continue;
+
+      try {
+        await repairProjectId({
+          ctx, sourceFile, writer, update, setSpinner, subIndex, prevSubs,
+          baseMessage: renderReview(rows),
+        });
+        rows = runChecks(ctx);
+        update({ activeSub: subIndex, sub: prevSubs, message: renderReview(rows) });
+      } catch (err) {
+        update({ activeSub: subIndex, sub: prevSubs, message: [
+          ...renderReview(rows),
+          `  ${red('✗')} Could not repair project ID: ${err.message}`,
+        ]});
+      }
+      continue;
+    }
+
+    if (!row.fix) continue;
 
     const yes = await askYesNo(
       `\n  ${yellow('⚠')} ${bold(row.label)}: ${row.detail}\n    Fix this now?`,

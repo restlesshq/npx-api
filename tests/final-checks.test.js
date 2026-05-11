@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { projectIdLooksRisky, runChecks } from '../steps/final-checks.js';
 import { setGitRoot } from '../lib/pathGuard.js';
-import { generate, BLOCK_START, BLOCK_END } from '../lib/sdk-writers/javascript.js';
+import { generate } from '../lib/sdk-writers/javascript.js';
 
 describe('projectIdLooksRisky', () => {
   it('flags a raw key variable', () => {
@@ -81,12 +81,6 @@ describe('runChecks', () => {
     expect(rows[0].ok).toBe(false);
   });
 
-  it('reports unwrapped-block when SDK is imported without sentinels', () => {
-    writeSource("const r = require('@restlessai/sdk')();\n");
-    const rows = runChecks(ctxFor());
-    expect(rows.find((r) => r.kind === 'unwrapped-block')).toBeDefined();
-  });
-
   it('flags init-form mismatch and exposes a fix function', () => {
     // Write a sentinel block in env-ref form, but ctx says inline.
     const block = generate(
@@ -112,7 +106,7 @@ describe('runChecks', () => {
   });
 
   it('flags missing credential and missing project.id when callback is empty', () => {
-    const block = `${BLOCK_START}\nconst sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({})));\n${BLOCK_END}\n`;
+    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({})));\n`;
     writeSource(`const app = require('express')();\n${block}`);
     const rows = runChecks(ctxFor());
     expect(rows.find((r) => r.kind === 'credential').ok).toBe(false);
@@ -120,7 +114,7 @@ describe('runChecks', () => {
   });
 
   it('flags risky project.id (raw secret)', () => {
-    const block = `${BLOCK_START}\nconst sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  project: { id: req.headers.authorization },\n})));\n${BLOCK_END}\n`;
+    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  project: { id: req.headers.authorization },\n})));\n`;
     writeSource(`const app = require('express')();\n${block}`);
     const rows = runChecks(ctxFor());
     const idRow = rows.find((r) => r.kind === 'project-id');

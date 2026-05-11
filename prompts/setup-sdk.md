@@ -6,29 +6,15 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 1. **Find the server entry point.** Open the file where the framework is initialized (`express()`, `fastify()`, `new Hono()`, `createServer()`, etc.) and where routes are registered. That's where the SDK goes.
 
-2. **Wrap the SDK code in sentinel comments.** The CLI owns the init line on subsequent runs and uses these markers to find its block. Your wired-in code MUST start with this exact line:
-
-   ```
-   // >>> restless-sdk-start (managed by `npx api setup`)
-   ```
-
-   And end with this exact line:
-
-   ```
-   // >>> restless-sdk-end
-   ```
-
-   Everything between (init line + `setup(cb)` registration) goes inside the markers. Do NOT put unrelated code inside the markers - only the SDK init and its registration.
-
-3. **Follow the installation pattern in the guide exactly.** Here's the pattern:
+2. **Follow the installation pattern in the guide exactly.** Here's the pattern:
 
 {{guide}}
 
-4. **API key handling.** Always write `process.env.RESTLESS_KEY` as the argument in the SDK init line - the CLI replaces it with the canonical form (literal key, env-ref, or no-arg) after you finish, based on what the user picked. Don't reason about env loaders, don't install dotenv, don't modify package.json.
+3. **API key handling.** Always write `process.env.RESTLESS_KEY` as the argument in the SDK init line - the CLI replaces it with the canonical form (literal key, env-ref, or no-arg) after you finish, based on what the user picked. Don't reason about env loaders, don't install dotenv, don't modify package.json.
 
-5. **Wire up user identification via `setup(cb)`.** Look at how this API authenticates its users (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. The returned object MUST include `apiKey: restless.mask(<credential>)` at the top level - that's what identifies the user on the dashboard. Without it, every log shows up as "anonymous".
+4. **Wire up user identification via `setup(cb)`.** Look at how this API authenticates its users (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. The returned object MUST include `apiKey: restless.mask(<credential>)` at the top level - that's what identifies the user on the dashboard. Without it, every log shows up as "anonymous".
 
-6. **Pick `project.id` carefully — it's the immutable, permanent identifier the dashboard uses to group every log this customer ever produces.** Walk this decision tree:
+5. **Pick `project.id` carefully — it's the immutable, permanent identifier the dashboard uses to group every log this customer ever produces.** Walk this decision tree:
 
    a. Look for an existing tenant / workspace / org concept (e.g. `workspaces`, `orgs`, `teams`, `accounts` table; a `companyId` JWT claim; an `X-Workspace-Id` header). Use that table's stable internal id. Multiple users on the same key all roll up under one project.
 
@@ -43,7 +29,7 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
    **HARD RULE: never put a raw API key, password, token, or any other secret into `project.id`.** The id leaves the user's machine and gets sent to Restless on every request. Secrets must not.
 
-7. **Lazy enrichment (optional).** If resolving the customer/tenant info (email, label, company) requires a DB lookup or external call, put `enrich` **inside `project`**, never at the top level. The shape is `{ apiKey, project: { id, enrich: async (id) => ({ label, email, ... }) } }`. The SDK calls `enrich` only on the first request from each id, then caches by id. If the lookup is cheap (in-memory map, header read), skip `enrich` and just set `project.label` / `project.email` inline.
+6. **Lazy enrichment (optional).** If resolving the customer/tenant info (email, label, company) requires a DB lookup or external call, put `enrich` **inside `project`**, never at the top level. The shape is `{ apiKey, project: { id, enrich: async (id) => ({ label, email, ... }) } }`. The SDK calls `enrich` only on the first request from each id, then caches by id. If the lookup is cheap (in-memory map, header read), skip `enrich` and just set `project.label` / `project.email` inline.
 
 ## Rules
 
