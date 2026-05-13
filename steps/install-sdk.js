@@ -382,7 +382,7 @@ export default async function installSdk({
         `Install didn't complete - ${bold('@restlessai/sdk')} isn't reachable from ${bold(installDirRel)}.`,
         [
           `Tried to find it walking up from ${installDir} - nothing readable in any node_modules.`,
-          `Try running the command yourself, then re-run \`npx ${CLI_NAME} setup\`:`,
+          `Try running the command yourself, then re-run \`npx ${CLI_NAME} init\`:`,
           `  ${cmd}`,
         ],
       );
@@ -565,7 +565,7 @@ export default async function installSdk({
       [
         `${aiTool} read your project but never modified a source file, even after retries.`,
         `Install the SDK by hand following docs/sdks/${guideLanguage}.md,`,
-        `then re-run \`npx ${CLI_NAME} setup\`.`,
+        `then re-run \`npx ${CLI_NAME} init\`.`,
         '',
         'Re-running with --debug helps us see exactly what the AI did.',
       ],

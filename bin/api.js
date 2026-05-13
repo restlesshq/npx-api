@@ -46,7 +46,7 @@ process.on('SIGINT', () => {
   // Show cursor in case it was hidden, move below current output
   process.stdout.write('\x1b[?25h\n');
   if (setupInProgress) {
-    console.log(dim(`\n  Setup interrupted. Run \`npx ${CLI_NAME} setup\` again to resume.\n`));
+    console.log(dim(`\n  Setup interrupted. Run \`npx ${CLI_NAME} init\` again to resume.\n`));
   }
   debug.flushAndExit(0);
 });
@@ -128,7 +128,7 @@ async function showDebugBanner() {
 
 await showDebugBanner();
 
-if (command === 'setup' || command === 'supercharge') {
+if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
   // Clear viewport + scrollback so the welcome starts at the top of the
   // terminal, matching where every subsequent screen lands after each
@@ -204,7 +204,7 @@ if (command === 'setup' || command === 'supercharge') {
   if (welcomeKey === 'd' || welcomeKey === 'D') {
     console.log('');
     console.log(`  ${dim('Demo repo flow is coming soon. In the meantime, clone')}`);
-    console.log(`  ${dim(`https://github.com/restlessai/demo and run \`npx ${CLI_NAME} setup\` there.`)}`);
+    console.log(`  ${dim(`https://github.com/restlessai/demo and run \`npx ${CLI_NAME} init\` there.`)}`);
     console.log('');
     await debug.flushAndExit(0);
   }
@@ -286,7 +286,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log(`  ${green('3.')} ${bold('Nothing runs without your OK.')} You see every file change and command`);
     console.log(`     before it happens, and can bail at any point.`);
     console.log('');
-    console.log(`  Run ${cyan(`npx ${CLI_NAME} setup`)} again when you're ready.`);
+    console.log(`  Run ${cyan(`npx ${CLI_NAME} init`)} again when you're ready.`);
     console.log('');
     await debug.flushAndExit(0);
   }
@@ -297,7 +297,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('  Install it with:');
     console.log(cyan('    npm install -g @anthropic-ai/claude-code'));
     console.log('');
-    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} init`)}.\n`);
     await debug.flushAndExit(1);
   }
 
@@ -307,7 +307,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('  Install it with:');
     console.log(cyan('    npm install -g @openai/codex'));
     console.log('');
-    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} init`)}.\n`);
     await debug.flushAndExit(1);
   }
 
@@ -319,7 +319,7 @@ if (command === 'setup' || command === 'supercharge') {
     console.log('');
     console.log(`  ${dim(`Or set ${cyan('OPENAI_API_KEY')}${'\x1b[2m'} in your env.`)}`);
     console.log('');
-    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} setup`)}.\n`);
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} init`)}.\n`);
     await debug.flushAndExit(1);
   }
 
@@ -877,5 +877,5 @@ if (command === 'setup' || command === 'supercharge') {
 
 } else {
   console.log(`Unknown command: ${command}`);
-  console.log(`Usage: ${CLI_NAME} setup | clear | debug <request-id> | skill <docs-url>`);
+  console.log(`Usage: ${CLI_NAME} init | clear | debug <request-id> | skill <docs-url>`);
 }

@@ -31,7 +31,7 @@ describe('resolveProjectDirs', () => {
   });
 
   it('uses cwd as rootDir when cwd has its own package.json (monorepo subpackage)', () => {
-    // Simulates running `npx api setup` inside a monorepo subpackage:
+    // Simulates running `npx api init` inside a monorepo subpackage:
     // even though git root is the monorepo, `.restless/` should live next to
     // the subpackage's own package.json, not at the monorepo root.
     const monorepo = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
