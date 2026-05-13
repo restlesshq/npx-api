@@ -2,47 +2,141 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { projectIdLooksRisky, runChecks } from '../steps/final-checks.js';
+import { analyzeOwnerId, ownerIdLooksRisky, runChecks } from '../steps/final-checks.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 import { generate } from '../lib/sdk-writers/javascript.js';
 
-describe('projectIdLooksRisky', () => {
-  it('flags a raw key variable', () => {
-    expect(projectIdLooksRisky('key')).toBe(true);
+describe('analyzeOwnerId', () => {
+  describe('critical: raw secrets', () => {
+    it('flags a bare `key` variable', () => {
+      expect(analyzeOwnerId('key').severity).toBe('critical');
+    });
+    it('flags Authorization header reads', () => {
+      expect(analyzeOwnerId("req.headers['authorization']").severity).toBe('critical');
+      expect(analyzeOwnerId('req.headers.authorization').severity).toBe('critical');
+    });
+    it('flags X-API-Key / X-Auth-Token header reads', () => {
+      expect(analyzeOwnerId("req.headers['x-api-key']").severity).toBe('critical');
+      expect(analyzeOwnerId("req.headers['x-auth-token']").severity).toBe('critical');
+    });
+    it('flags variables named token / apiKey / secret / password', () => {
+      expect(analyzeOwnerId('token').severity).toBe('critical');
+      expect(analyzeOwnerId('apiKey').severity).toBe('critical');
+      expect(analyzeOwnerId('SECRET_VALUE').severity).toBe('critical');
+      expect(analyzeOwnerId('password').severity).toBe('critical');
+    });
   });
 
-  it('flags an Authorization header read', () => {
-    expect(projectIdLooksRisky("req.headers['authorization']")).toBe(true);
-    expect(projectIdLooksRisky('req.headers.authorization')).toBe(true);
+  describe('critical: user-controlled input', () => {
+    it('flags req.body reads', () => {
+      const r = analyzeOwnerId('req.body.tenantId');
+      expect(r.severity).toBe('critical');
+      expect(r.reason).toMatch(/request body/);
+    });
+    it('flags req.query reads', () => {
+      expect(analyzeOwnerId("req.query['workspace']").severity).toBe('critical');
+      expect(analyzeOwnerId('req.query.org').severity).toBe('critical');
+    });
+    it('flags cookie reads', () => {
+      expect(analyzeOwnerId('req.cookies.session').severity).toBe('critical');
+      expect(analyzeOwnerId('req.cookie.org').severity).toBe('critical');
+      expect(analyzeOwnerId('ctx.cookies.tenant').severity).toBe('critical');
+    });
   });
 
-  it('flags X-API-Key / X-Auth-Token header reads', () => {
-    expect(projectIdLooksRisky("req.headers['x-api-key']")).toBe(true);
-    expect(projectIdLooksRisky("req.headers['x-auth-token']")).toBe(true);
+  describe('critical: literal placeholder strings', () => {
+    it("flags 'anonymous'", () => {
+      const r = analyzeOwnerId("'anonymous'");
+      expect(r.severity).toBe('critical');
+      expect(r.reason).toMatch(/fake-groups/);
+    });
+    it('flags other dummy strings (none / unknown / guest / etc.)', () => {
+      expect(analyzeOwnerId("'none'").severity).toBe('critical');
+      expect(analyzeOwnerId('"unknown"').severity).toBe('critical');
+      expect(analyzeOwnerId("'guest'").severity).toBe('critical');
+      expect(analyzeOwnerId("'default'").severity).toBe('critical');
+      expect(analyzeOwnerId("'null'").severity).toBe('critical');
+    });
+    it('is case-insensitive', () => {
+      expect(analyzeOwnerId("'Anonymous'").severity).toBe('critical');
+      expect(analyzeOwnerId('"ANONYMOUS"').severity).toBe('critical');
+    });
+    it('still approves a real hardcoded id like a fixed company slug', () => {
+      // The placeholder check is whitelist-based; arbitrary strings are fine.
+      expect(analyzeOwnerId('"acme-corp"').severity).toBe('ok');
+      expect(analyzeOwnerId("'workspace-42'").severity).toBe('ok');
+    });
   });
 
-  it('flags variables named token / apiKey / secret / password', () => {
-    expect(projectIdLooksRisky('token')).toBe(true);
-    expect(projectIdLooksRisky('apiKey')).toBe(true);
-    expect(projectIdLooksRisky('SECRET_VALUE')).toBe(true);
-    expect(projectIdLooksRisky('password')).toBe(true);
+  describe('critical: sentinel placeholder', () => {
+    it("flags 'NEEDS_CONFIGURATION'", () => {
+      expect(analyzeOwnerId("'NEEDS_CONFIGURATION'").severity).toBe('critical');
+      expect(analyzeOwnerId('"NEEDS_CONFIGURATION"').severity).toBe('critical');
+      expect(analyzeOwnerId("  'NEEDS_CONFIGURATION'  ").severity).toBe('critical');
+    });
   });
 
-  it('approves restless.mask(key) — that is hashed, safe to send', () => {
-    expect(projectIdLooksRisky('restless.mask(key)')).toBe(false);
-    expect(projectIdLooksRisky('mask(extractApiKey(req))')).toBe(false);
+  describe('critical: nothing set', () => {
+    it('flags null / empty / undefined', () => {
+      expect(analyzeOwnerId(null).severity).toBe('critical');
+      expect(analyzeOwnerId('').severity).toBe('critical');
+      expect(analyzeOwnerId(undefined).severity).toBe('critical');
+    });
   });
 
-  it('approves stable internal ids', () => {
-    expect(projectIdLooksRisky('user.id')).toBe(false);
-    expect(projectIdLooksRisky('user.workspace.id')).toBe(false);
-    expect(projectIdLooksRisky('"fixed-org-slug"')).toBe(false);
+  describe('warning: raw header reads', () => {
+    it('flags non-auth-looking headers as spoofable', () => {
+      const r = analyzeOwnerId("req.headers['x-workspace-id']");
+      expect(r.severity).toBe('warning');
+      expect(r.reason).toMatch(/trusted proxy/);
+    });
+    it('flags ctx.headers and ctx.request.headers (Koa)', () => {
+      expect(analyzeOwnerId("ctx.headers['x-tenant-id']").severity).toBe('warning');
+      expect(analyzeOwnerId("ctx.request.headers['x-tenant-id']").severity).toBe('warning');
+    });
+    it('flags c.req.header() (Hono)', () => {
+      expect(analyzeOwnerId("c.req.header('x-tenant-id')").severity).toBe('warning');
+    });
   });
 
-  it('handles non-string / empty input safely', () => {
-    expect(projectIdLooksRisky(null)).toBe(false);
-    expect(projectIdLooksRisky('')).toBe(false);
-    expect(projectIdLooksRisky(undefined)).toBe(false);
+  describe('warning: mutable-looking field names', () => {
+    it('flags .email', () => {
+      const r = analyzeOwnerId('user.email');
+      expect(r.severity).toBe('warning');
+      expect(r.reason).toMatch(/\.email/);
+    });
+    it('flags .username / .name / .slug / .handle / .display_name', () => {
+      expect(analyzeOwnerId('user.username').severity).toBe('warning');
+      expect(analyzeOwnerId('user.name').severity).toBe('warning');
+      expect(analyzeOwnerId('workspace.slug').severity).toBe('warning');
+      expect(analyzeOwnerId('user.handle').severity).toBe('warning');
+      expect(analyzeOwnerId('user.display_name').severity).toBe('warning');
+    });
+  });
+
+  describe('ok', () => {
+    it('approves restless.mask(...), which is hashed and safe to send', () => {
+      expect(analyzeOwnerId('restless.mask(key)').severity).toBe('ok');
+      expect(analyzeOwnerId('mask(extractApiKey(req))').severity).toBe('ok');
+    });
+    it('approves stable internal id expressions', () => {
+      expect(analyzeOwnerId('user.id').severity).toBe('ok');
+      expect(analyzeOwnerId('user.workspaceId').severity).toBe('ok');
+      expect(analyzeOwnerId('req.user.workspace.id').severity).toBe('ok');
+      expect(analyzeOwnerId('"fixed-org-slug"').severity).toBe('ok');
+      expect(analyzeOwnerId('jwtClaims.sub').severity).toBe('ok');
+    });
+  });
+});
+
+describe('ownerIdLooksRisky (back-compat shim)', () => {
+  it('returns true for anything non-ok', () => {
+    expect(ownerIdLooksRisky('req.body.tenant')).toBe(true);
+    expect(ownerIdLooksRisky('user.email')).toBe(true);
+    expect(ownerIdLooksRisky("'NEEDS_CONFIGURATION'")).toBe(true);
+  });
+  it('returns false for ok', () => {
+    expect(ownerIdLooksRisky('user.id')).toBe(false);
   });
 });
 
@@ -105,33 +199,99 @@ describe('runChecks', () => {
     expect(initRow.fix).toBeFalsy();
   });
 
-  it('flags missing credential and missing project.id when callback is empty', () => {
+  it('flags missing credential and missing owner.id when callback is empty', () => {
     const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({})));\n`;
     writeSource(`const app = require('express')();\n${block}`);
     const rows = runChecks(ctxFor());
     expect(rows.find((r) => r.kind === 'credential').ok).toBe(false);
-    expect(rows.find((r) => r.kind === 'project-id').ok).toBe(false);
+    expect(rows.find((r) => r.kind === 'owner-id').ok).toBe(false);
   });
 
-  it('flags risky project.id (raw secret)', () => {
-    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  project: { id: req.headers.authorization },\n})));\n`;
+  it('returns only an old-api row when the file uses the OLD 2-arg setup', () => {
+    // Don't trust the rest of the checks against a broken block; surface
+    // the API shape problem first so the repair flow rewrites it before
+    // any downstream check runs.
+    const block = `import restless from '@restlessai/sdk';
+restless.setup(app, (req) => ({
+  apiKey: restless.mask(req.headers.authorization),
+  owner: { id: req.user.workspaceId },
+}));`;
+    writeSource(`const app = express();\n${block}`);
+    const rows = runChecks(ctxFor());
+    // The old-api row should be the ONLY row produced. Downstream checks
+    // would be reading from a broken block.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('old-api');
+    expect(rows[0].ok).toBe(false);
+    expect(rows[0].severity).toBe('critical');
+  });
+
+  it('flags risky owner.id (raw secret)', () => {
+    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  owner: { id: req.headers.authorization },\n})));\n`;
     writeSource(`const app = require('express')();\n${block}`);
     const rows = runChecks(ctxFor());
-    const idRow = rows.find((r) => r.kind === 'project-id');
+    const idRow = rows.find((r) => r.kind === 'owner-id');
     expect(idRow.ok).toBe(false);
+  });
+
+  it("flags the 'NEEDS_CONFIGURATION' placeholder so the repair flow fires", () => {
+    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  owner: { id: 'NEEDS_CONFIGURATION' },\n})));\n`;
+    writeSource(`const app = require('express')();\n${block}`);
+    const rows = runChecks(ctxFor());
+    const idRow = rows.find((r) => r.kind === 'owner-id');
+    expect(idRow.ok).toBe(false);
+  });
+
+  it("surfaces an 'unverified' severity when a CONFIRM marker precedes an otherwise-ok owner.id", () => {
+    const block = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  // RESTLESS_OWNER_ID_CONFIRM: JSON-key id; no formal schema to confirm.
+  owner: { id: user.id },
+})));
+`;
+    writeSource(`const app = require('express')();\n${block}`);
+    const rows = runChecks(ctxFor());
+    const idRow = rows.find((r) => r.kind === 'owner-id');
+    expect(idRow.severity).toBe('unverified');
+    expect(idRow.ok).toBe(false);
+    expect(idRow.detail).toMatch(/JSON-key id/);
+  });
+
+  it("lets static 'critical' beat the CONFIRM marker (security signal wins)", () => {
+    // If the AI somehow leaves both a marker AND a clearly unsafe value,
+    // the security signal should win.
+    const block = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  // RESTLESS_OWNER_ID_CONFIRM: not sure.
+  owner: { id: req.body.tenantId },
+})));
+`;
+    writeSource(`const app = require('express')();\n${block}`);
+    const rows = runChecks(ctxFor());
+    const idRow = rows.find((r) => r.kind === 'owner-id');
+    expect(idRow.severity).toBe('critical');
+  });
+
+  it('also reads legacy `project: { id }` so a pre-rename block does not regress', () => {
+    const block = `const sdk = require('@restlessai/sdk')();\napp.use(sdk.setup((req) => ({\n  apiKey: sdk.mask(auth),\n  project: { id: workspace.id },\n})));\n`;
+    writeSource(`const app = require('express')();\n${block}`);
+    const rows = runChecks(ctxFor());
+    expect(rows.find((r) => r.kind === 'owner-id').ok).toBe(true);
   });
 
   it('approves a sentinel block with sane fields', () => {
     const ctx = ctxFor({ keyDelivery: 'manual' });
     const block = generate(ctx, {
       module: 'cjs', framework: 'express', appVar: 'app',
-      credentialExpr: "req.headers['x-api-key']", projectIdExpr: 'workspace.id',
+      credentialExpr: "req.headers['x-api-key']", ownerIdExpr: 'workspace.id',
     });
     writeSource(`const app = require('express')();\n${block}`);
     const rows = runChecks(ctx);
     expect(rows.find((r) => r.kind === 'init-form').ok).toBe(true);
     expect(rows.find((r) => r.kind === 'credential').ok).toBe(true);
-    expect(rows.find((r) => r.kind === 'project-id').ok).toBe(true);
+    expect(rows.find((r) => r.kind === 'owner-id').ok).toBe(true);
   });
 
   it('flags missing .gitignore coverage and exposes a fix when we created .env', () => {

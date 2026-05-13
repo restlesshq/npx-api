@@ -6,7 +6,10 @@ import { bold, dim, green, red, cyan, yellow, ask, terminalPrompt, waitForKey } 
 import { startStep } from '../lib/step-template.js';
 import { CLI_NAME } from '../lib/config.js';
 import { safeWriteFileSync } from '../lib/pathGuard.js';
+import { fatalError } from '../lib/errors.js';
+import * as debug from '../lib/debug.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
+import { findSdkReferences } from '../lib/grep-sdk.js';
 
 /**
  * Pick the language-specific SDK writer for this run. Today we only
@@ -19,32 +22,76 @@ function getSdkWriter(language) {
 }
 
 /**
- * Walk the install dir for the source file the AI just wired into.
- * Today this is the same grep `isSdkWired` uses; we pick the first
- * match (typical single-entry projects). Returns absolute path or null.
+ * Walk the install dir for source files referencing `@restlessai/sdk`.
+ * Returns the list of relative paths inside `installDir`, in grep
+ * output order. Empty array when nothing matches.
+ *
+ * This is the raw signal - callers like `isSdkWired` and
+ * `findWiredSourceFile` layer additional checks (writer.parse) on top
+ * so we don't treat a stray comment or stale partial reference as
+ * "wired in."
+ *
+ * Uses the shared `findSdkReferences` helper so the grep excludes
+ * `node_modules` (and other heavy dirs) at the recursion level, not
+ * after. Past incident: scanning node_modules synchronously froze the
+ * UI for tens of seconds between Generate API key and Configure SDK.
  */
-function findWiredSourceFile(installDir) {
-  try {
-    const out = execSync(
-      `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l . 2>/dev/null || true`,
-      { cwd: installDir, encoding: 'utf8' },
-    );
-    const files = out.trim().split('\n').filter((f) => f && !f.includes('node_modules'));
-    return files.length ? path.join(installDir, files[0].replace(/^\.\//, '')) : null;
-  } catch {
-    return null;
+function findSdkCandidateFiles(installDir) {
+  return findSdkReferences(installDir);
+}
+
+/**
+ * Find a real wired source file - not just a stray reference.
+ * Returns absolute path of the first file that contains a parseable
+ * SDK block, or null if none.
+ *
+ * Two-layer check: grep finds candidates fast, then writer.parse()
+ * verifies the file actually imports/requires `@restlessai/sdk` in
+ * the canonical form. A file that mentions the package only in a
+ * comment or string literal is rejected.
+ */
+function findWiredSourceFile(installDir, language = 'javascript') {
+  const writer = getSdkWriter(language);
+  const candidates = findSdkCandidateFiles(installDir);
+  for (const rel of candidates) {
+    const abs = path.join(installDir, rel);
+    try {
+      const content = fs.readFileSync(abs, 'utf8');
+      // Use `hasInit()`, NOT `parse()`. parse() matches any quoted
+      // mention of the package - a comment, a test fixture, a config
+      // string would all qualify. hasInit() requires an actual
+      // `require('@restlessai/sdk')` or `from '@restlessai/sdk'`
+      // statement, which is the only thing that actually plumbs the
+      // SDK into the user's code.
+      if (writer.hasInit(content)) {
+        debug.log('install-sdk.wired-file', { rel, candidates: candidates.length });
+        return abs;
+      }
+    } catch {
+      // Unreadable file - skip and continue. A common case is a
+      // grep match in a generated file that's mid-rewrite.
+    }
   }
+  if (candidates.length > 0) {
+    // Grep matched something but none of the candidates have a real
+    // init/import. Surface this in the debug log so the disagreement
+    // between "grep finds it" and "no actual wiring" is visible -
+    // most often this is a leftover comment, JSDoc, or test fixture
+    // from a prior CLI run.
+    debug.log('install-sdk.stale-references', { candidates });
+  }
+  return null;
 }
 
 /**
  * After the AI wires in the SDK, the CLI takes ownership of the init
  * line: rewrites the init arg to match `getSdkLineSpec(ctx)` (literal /
- * env-ref / no-arg). Auth extraction and project.id (the AI's
+ * env-ref / no-arg). Auth extraction and owner.id (the AI's
  * domain-specific work) are preserved.
  */
 function canonicalizeSdkBlock(ctx) {
   const writer = getSdkWriter(ctx.language);
-  const file = findWiredSourceFile(ctx.installDir);
+  const file = findWiredSourceFile(ctx.installDir, ctx.language);
   if (!file) return { mode: 'no-source', file: null };
   const content = fs.readFileSync(file, 'utf8');
   const next = writer.canonicalizeInitArg(content, ctx);
@@ -76,39 +123,62 @@ const installCommands = {
 };
 
 /**
- * Check whether `@restlessai/sdk` is already imported anywhere in the user's
- * source. Used to skip the setup AI pass when someone's re-running the CLI.
+ * Check whether `@restlessai/sdk` is actually wired into the user's
+ * source. Used to skip the setup AI pass when someone's re-running the
+ * CLI - but only when there's a REAL wired block, not just a comment
+ * or stale partial reference left over from an earlier run. Goes
+ * through `findWiredSourceFile` so the grep + writer.parse() check
+ * matches the one canonicalize and final-checks use.
+ *
+ * Past bug: a raw grep here returned true on stray references and
+ * skipped the AI wiring pass entirely, leaving the user with an
+ * unwired SDK and the CLI marking the step as done.
  */
-function isSdkWired(packageDir) {
-  try {
-    const out = execSync(
-      `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l . 2>/dev/null || true`,
-      { cwd: packageDir, encoding: 'utf8' },
-    );
-    return out.trim().split('\n').filter((f) => f && !f.includes('node_modules')).length > 0;
-  } catch {
-    return false;
+function isSdkWired(packageDir, language = 'javascript') {
+  return findWiredSourceFile(packageDir, language) !== null;
+}
+
+/**
+ * Walk from `packageDir` toward the filesystem root, checking each
+ * directory's `node_modules` for the hoisted SDK package. Returns the
+ * absolute path of the package.json that resolves the SDK, or null.
+ *
+ * Workspaces matter here: in npm / pnpm / yarn workspaces, running
+ * `npm install <pkg>` inside `packages/<workspace>/` typically hoists
+ * the dependency up to the repo root's `node_modules/`, not into the
+ * workspace's own. Checking only `packageDir/node_modules` produced
+ * a false "install failed" verdict for every monorepo user, after
+ * which the rest of the flow ran with bogus state.
+ *
+ * We also defend against broken symlinks (a leftover `npm link` that
+ * points nowhere) by requiring the package.json to be readable, not
+ * just present on disk.
+ */
+function resolveInstalledSdk(packageDir) {
+  const names = [
+    ['@restlessai', 'sdk'],
+    ['restlessai'],
+  ];
+  let dir = path.resolve(packageDir);
+  // Cap at 8 levels up. Any monorepo deeper than that is exotic; we
+  // wouldn't be confident the result belongs to the same project anyway.
+  for (let depth = 0; depth < 8; depth++) {
+    for (const name of names) {
+      const pkgJson = path.join(dir, 'node_modules', ...name, 'package.json');
+      try {
+        fs.accessSync(pkgJson, fs.constants.R_OK);
+        return pkgJson;
+      } catch {}
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
+  return null;
 }
 
 function isSdkInstalled(packageDir) {
-  // Check for a readable package.json - not just that the directory exists.
-  // A bare existsSync would return true for a broken symlink (e.g. left
-  // behind after a local link was renamed), making the install step skip
-  // without ever replacing the dangling link, and then `require()`
-  // explodes at runtime.
-  const candidates = [
-    path.join(packageDir, 'node_modules', '@restlessai', 'sdk', 'package.json'),
-    path.join(packageDir, 'node_modules', 'restlessai', 'package.json'),
-  ];
-  return candidates.some((p) => {
-    try {
-      fs.accessSync(p, fs.constants.R_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+  return resolveInstalledSdk(packageDir) !== null;
 }
 
 /**
@@ -156,11 +226,7 @@ export function resolveInstallDir(packageDir, apiRootDir) {
 export function inlineKeyIntoSource(installDir, apiKey) {
   let touched = [];
   try {
-    const out = execSync(
-      `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l . 2>/dev/null || true`,
-      { cwd: installDir, encoding: 'utf8' },
-    );
-    const files = out.trim().split('\n').filter((f) => f && !f.includes('node_modules'));
+    const files = findSdkReferences(installDir);
     const literal = JSON.stringify(apiKey);
     const TODO = '// TODO: move this out of the codebase before committing';
 
@@ -306,10 +372,21 @@ export default async function installSdk({
       // a genuine failure.
     }
     if (!isSdkInstalled(installDir)) {
-      update({ activeSub: 0, message: [
-        `  ${red('✗')} Install didn't complete - ${bold('@restlessai/sdk')} isn't in ${bold((installDirRel === '.' ? '' : installDirRel + '/') + 'node_modules')}.`,
-        dim(`  Try running the command yourself, then re-run \`npx ${CLI_NAME} setup\`.`),
-      ]});
+      // Halt loudly. Earlier versions returned a `{ installed: false }`
+      // sentinel and trusted the caller to check it - but bin/api.js
+      // didn't, so finalChecks ran with `prevSubs: { 0:'done', 1:'done',
+      // 2:'done' }` and painted phantom green checkmarks over a step
+      // that genuinely failed. Never silently push past a failed install.
+      debug.log('install-sdk.install-failed', { installDir, cmd });
+      fatalError(
+        `Install didn't complete - ${bold('@restlessai/sdk')} isn't reachable from ${bold(installDirRel)}.`,
+        [
+          `Tried to find it walking up from ${installDir} - nothing readable in any node_modules.`,
+          `Try running the command yourself, then re-run \`npx ${CLI_NAME} setup\`:`,
+          `  ${cmd}`,
+        ],
+      );
+      // Unreachable: fatalError throws FatalExit.
       return { detectedLanguage, detectedFramework, guideLanguage, installed: false, wired: false };
     }
     update({ sub: { 0: 'done' }, activeSub: 1, message: [
@@ -324,73 +401,201 @@ export default async function installSdk({
   }
 
   // ── Sub 2: Configure SDK ─────────────────────────────────────────────────
-  const wasAlreadyWired = isSdkWired(installDir);
+  //
+  // Repaint the message slot immediately so the user sees the new sub-step
+  // becoming active. The synchronous prep below (grep for existing wiring,
+  // read guide files, build the prompt) runs on the event loop - if any of
+  // it ever blocks for more than a moment, the previous sub's message would
+  // otherwise stay frozen on screen and look like a hang. Past incident:
+  // recursive grep over a populated node_modules took 30s+ on first install,
+  // and the UI sat showing the "Added RESTLESS_KEY to .env" message the
+  // whole time with no spinner.
+  update({ activeSub: 2, message: [
+    `  Configuring ${bold('@restlessai/sdk')} in your ${bold(detectedFramework || detectedLanguage)} code…`,
+  ]});
+  // We deliberately do NOT short-circuit the AI even when the SDK looks
+  // wired in already. Three real failure modes from the "already wired"
+  // shortcut bit us in a row:
+  //   1. Raw grep matched on stray comments / test fixtures - skipped a
+  //      legitimately-needed wiring pass.
+  //   2. Hoisted package in monorepo workspaces produced a false
+  //      "installed=false" verdict; downstream was off by one.
+  //   3. A partial / corrupted wiring (init present, callback missing)
+  //      can satisfy hasInit() but still be unusable.
+  //
+  // Cost: ~30-60s of AI time on re-runs that genuinely had nothing to
+  // do. The AI is told to no-op if it finds a real wiring already in
+  // place, so the bill is just turn-budget, not duplicate code.
+  // `preExistingWiring` is purely informational - feeds the prompt so
+  // the AI knows what it's looking at - and shapes the success message
+  // at the end.
+  const preExistingWiring = isSdkWired(installDir, detectedLanguage);
   const inlineMode = ctx.keyDelivery === 'inline';
+  debug.log('install-sdk.pre-existing-wiring', { preExistingWiring, installDir });
 
-  if (!wasAlreadyWired) {
+  // Load the setup-sdk prompt once; retries re-use the base and append an
+  // escalating coda telling the AI it must actually call Edit/Write.
+  const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
+  const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
+  const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
+  const basePrompt = loadPrompt('setup-sdk', {
+    language: detectedLanguage,
+    framework: detectedFramework || detectedLanguage,
+    guide: setupSection,
+  });
+
+  // The AI's job is to wire the SDK into the right entry file with
+  // sentinel-bracketed comments and `process.env.RESTLESS_KEY` as a
+  // placeholder. The CLI takes ownership of the init line afterwards
+  // (canonicalizeSdkBlock below) so the AI never has to reason about
+  // env loaders or key delivery modes.
+  //
+  // `attemptNum` 1 = first pass (base prompt). 2 = blind retry with a
+  // "you didn't write — you MUST call Edit" coda. 3 = retry with a
+  // user-supplied entry file path baked in.
+  async function runSetupAi(attemptNum, userHint = null) {
+    let prompt = basePrompt;
+    if (attemptNum > 1) {
+      prompt += `\n\n## Retry context (READ THIS)\n\n` +
+        `Your previous attempt produced commentary but did not modify any files. ` +
+        `Source files in this project still contain no \`@restlessai/sdk\` import. ` +
+        `You MUST use the Edit (or Write) tool to add the SDK middleware to the user's ` +
+        `server entry file. Producing text describing the change is not enough — apply it.`;
+      if (userHint) {
+        prompt += `\n\nThe user has told us the server entry file is at: \`${userHint}\`. ` +
+          `Open that file with Read first, then use Edit to wire the SDK in there.`;
+      } else {
+        prompt += `\n\nIf you couldn't find the entry file before, search again. Try these names ` +
+          `at the project root and one level deep: \`server.{js,ts,mjs,cjs}\`, \`index.{js,ts,mjs,cjs}\`, ` +
+          `\`app.{js,ts,mjs,cjs}\`, \`main.{js,ts,mjs,cjs}\`, plus the same inside \`src/\`. ` +
+          `If \`package.json\` has a "main" or "start" script pointing at a file, use that one.`;
+      }
+    }
+    debug.log('install-sdk.ai-attempt', { attempt: attemptNum, hint: userHint || null });
+    try {
+      await runAI(prompt, installDir, { setSpinner });
+    } catch (err) {
+      // Don't bail on a per-attempt error — the retry loop is the recovery
+      // path. The final `fatalError` below covers the case where every
+      // attempt either errored or produced no write.
+      debug.log('install-sdk.ai-error', { attempt: attemptNum, message: err.message });
+    }
+  }
+
+  // Always run the AI - no "looks wired, skip" shortcut. The AI is
+  // told (in the prompt) to leave an existing complete wiring alone.
+  // The retry loop below catches "AI didn't write" cases regardless of
+  // whether wiring pre-existed.
+  if (preExistingWiring) {
+    update({ activeSub: 2, message: [
+      `  Re-checking the ${bold('@restlessai/sdk')} wiring in your ${bold(detectedFramework || detectedLanguage)} code.`,
+      dim(`  ${cyan(aiTool)} is looking at what's there and adding anything missing.`),
+    ]});
+  } else {
     update({ activeSub: 2, message: [
       `  Wiring ${bold('@restlessai/sdk')} into your ${bold(detectedFramework || detectedLanguage)} code.`,
       dim(`  ${cyan(aiTool)} is reading your server file and registering the middleware before routes.`),
     ]});
+  }
 
-    const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
-    const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
-    const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
+  await runSetupAi(1);
 
-    // The AI's job is to wire the SDK into the right entry file with
-    // sentinel-bracketed comments and `process.env.RESTLESS_KEY` as a
-    // placeholder. The CLI takes ownership of the init line afterwards
-    // (canonicalizeSdkBlock below) so the AI never has to reason about
-    // env loaders or key delivery modes.
-    const prompt = loadPrompt('setup-sdk', {
-      language: detectedLanguage,
-      framework: detectedFramework || detectedLanguage,
-      guide: setupSection,
-    });
+  // Retry loop: if the first pass produced no write AND the SDK isn't
+  // wired in (i.e. the AI didn't either fix it OR confirm a pre-
+  // existing wiring), escalate. Attempt 2 is a blind retry with a
+  // stronger prompt; attempt 3 asks the user for the entry-file path
+  // and bakes it in. After that, we give up and bail.
+  {
+    let attempt = 1;
+    while (!isSdkWired(installDir, detectedLanguage) && attempt < 3) {
+      attempt++;
+      if (attempt === 2) {
+        update({ activeSub: 2, message: [
+          `  ${yellow('⚠')} ${cyan(aiTool)} finished without writing to any source file. Trying again.`,
+          dim('  Giving it an explicit instruction to use the Edit tool this time.'),
+        ]});
+        await runSetupAi(2);
+      } else {
+        // Attempt 3: ask the user where the entry file lives.
+        update({ activeSub: 2, message: [
+          `  ${yellow('⚠')} Two passes done and the SDK still isn't wired in.`,
+          dim("  Sometimes the AI can't locate the right entry file."),
+          dim('  Point us at it and we\'ll try once more.'),
+          '',
+          dim('  e.g. src/server.ts, index.js, app.js'),
+          dim('  Press Enter to skip and let us try blind one more time.'),
+        ]});
+        const raw = (await ask('  Entry file path: ')).trim();
 
-    try {
-      await runAI(prompt, installDir, { setSpinner });
-    } catch (err) {
-      update({ activeSub: 2, message: [
-        `  ${red('✗')} Configuration failed: ${err.message}`,
-        dim(`  See ${bold('docs/sdks/' + guideLanguage + '.md')} and wire it up by hand.`),
-        dim('  Press Enter to continue.'),
-      ]});
-      await ask('');
+        // Light sanity check. If the user typed a path that doesn't exist,
+        // mention it and continue without the hint — better than passing
+        // a bogus path to the AI.
+        let validatedHint = null;
+        if (raw) {
+          const abs = path.isAbsolute(raw) ? raw : path.join(installDir, raw);
+          if (fs.existsSync(abs)) {
+            validatedHint = path.relative(installDir, abs) || raw;
+          } else {
+            update({ activeSub: 2, message: [
+              `  ${yellow('⚠')} ${cyan(raw)} doesn't exist under ${bold(installDirRel)}. Trying without the hint.`,
+            ]});
+          }
+        }
+
+        update({ activeSub: 2, message: [
+          validatedHint
+            ? `  Retrying with hint: ${cyan(validatedHint)}`
+            : `  Retrying one more time.`,
+        ]});
+        await runSetupAi(3, validatedHint);
+      }
     }
   }
 
-  const nowWired = isSdkWired(installDir);
+  const nowWired = isSdkWired(installDir, detectedLanguage);
+  debug.log('install-sdk.now-wired', { nowWired, installDir });
+
+  if (!nowWired) {
+    // Hard stop. Every downstream step (test-setup, redaction, setup-account)
+    // assumes the SDK is wired in. Bail loudly instead of pushing the user
+    // into a test step that can never succeed.
+    debug.log('install-sdk.gave-up', { installDir, language: detectedLanguage });
+    fatalError(
+      "We couldn't wire the SDK into your code automatically.",
+      [
+        `${aiTool} read your project but never modified a source file, even after retries.`,
+        `Install the SDK by hand following docs/sdks/${guideLanguage}.md,`,
+        `then re-run \`npx ${CLI_NAME} setup\`.`,
+        '',
+        'Re-running with --debug helps us see exactly what the AI did.',
+      ],
+    );
+    // Unreachable: fatalError throws FatalExit.
+    return { detectedLanguage, detectedFramework, guideLanguage, installed: true, wired: false };
+  }
 
   // CLI takes over: canonicalize the init line based on ctx.sdkLineSpec.
   // Runs every time (fresh install AND re-runs) so a previous broken
   // state can be repaired without another AI call.
-  const canon = nowWired ? canonicalizeSdkBlock(ctx) : { mode: 'no-source', file: null };
-  ctx.sdkBlockPresent = nowWired;
+  const canon = canonicalizeSdkBlock(ctx);
+  ctx.sdkBlockPresent = true;
   ctx.entryFile = canon.file;
 
-  if (!nowWired) {
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: [
-      `  ${yellow('⚠')} Package installed, but we couldn't verify the middleware wired in.`,
-      dim(`  Check your server file and add ${bold('restless.setup(...)')} by hand if needed.`),
-    ]});
-  } else {
-    const headerLine = wasAlreadyWired
-      ? `  ${green('✓')} SDK is already wired into your source - leaving it alone.`
-      : `  ${green('✓')} SDK installed and configured.`;
-    const baseMsg = [headerLine];
-    if (inlineMode && canon.mode === 'canonicalized') {
-      baseMsg.push(dim(`  Inlined the API key in ${bold(canon.file)} - testing only, don't commit.`));
-    }
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: baseMsg });
+  const headerLine = preExistingWiring
+    ? `  ${green('✓')} SDK wiring confirmed - left existing setup alone.`
+    : `  ${green('✓')} SDK installed and configured.`;
+  const baseMsg = [headerLine];
+  if (inlineMode && canon.mode === 'canonicalized') {
+    baseMsg.push(dim(`  Inlined the API key in ${bold(canon.file)} - testing only, don't commit.`));
   }
+  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: baseMsg });
 
   return {
     detectedLanguage,
     detectedFramework,
     guideLanguage,
     installed: true,
-    wired: isSdkWired(installDir),
+    wired: isSdkWired(installDir, detectedLanguage),
     installDir,
     // Surface whatever the caller's prepareAccountStep produced so api.js
     // can use the apiKey / projectId / setupKey downstream (testSetup,

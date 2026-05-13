@@ -157,6 +157,11 @@ export default {
 
   async run(prompt, cwd, { onStatus } = {}) {
     let result = '';
+    // Counts so the debug log answers "did the AI actually write?" in a
+    // single line. Useful post-mortem when install-sdk later finds nothing
+    // wired and we need to know whether the AI tried to edit or just
+    // produced commentary.
+    const toolCounts = { Read: 0, Glob: 0, Grep: 0, Bash: 0, Edit: 0, Write: 0, other: 0 };
     const gitRoot = getGitRoot();
     debug.log('ai.run.start', {
       provider: 'claude',
@@ -185,11 +190,20 @@ export default {
           } else if (block.type === 'tool_use') {
             onStatus?.(describeToolUse(block.name, block.input));
             debug.log('ai.tool_use', { tool: block.name, input: truncatedToolInput(block.input) });
+            if (block.name in toolCounts) toolCounts[block.name]++;
+            else toolCounts.other++;
           }
         }
       }
     }
-    debug.log('ai.run.end', { provider: 'claude', resultChars: result.length });
+    debug.log('ai.run.end', {
+      provider: 'claude',
+      resultChars: result.length,
+      toolCounts,
+      // Surface the "did it write" answer at the top level so a quick
+      // grep of the debug log doesn't have to parse the per-tool list.
+      mutations: toolCounts.Edit + toolCounts.Write,
+    });
     return result;
   },
 };

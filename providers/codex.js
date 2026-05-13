@@ -44,6 +44,12 @@ export default {
 
   async run(prompt, cwd, { onStatus } = {}) {
     let result = '';
+    // Mirrors the claude.js mutation counter so debug logs from either
+    // provider answer "did the AI actually write?" the same way. Codex
+    // batches edits per `patch_apply_begin`; we count files touched, not
+    // patch events, so a single patch over 3 files counts as 3.
+    let mutations = 0;
+    let execs = 0;
     debug.log('ai.run.start', {
       provider: 'codex',
       cwd,
@@ -105,7 +111,13 @@ export default {
       });
 
       child.on('close', (code) => {
-        debug.log('ai.run.end', { provider: 'codex', resultChars: result.length, exitCode: code });
+        debug.log('ai.run.end', {
+          provider: 'codex',
+          resultChars: result.length,
+          exitCode: code,
+          mutations,
+          execs,
+        });
         if (code !== 0) {
           const stderrTail = stderrBuffer.split('\n').slice(-8).join('\n').trim();
           // Auth is the most common first-run failure. Surface a concrete next
@@ -141,14 +153,17 @@ export default {
             onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
             break;
           case 'exec_command_begin': {
+            execs++;
             onStatus?.(describeExec(data.command));
             const cmdStr = Array.isArray(data.command) ? data.command.join(' ') : data.command;
             debug.log('ai.tool_use', { tool: 'Bash', input: { command: truncate(cmdStr, MAX_TOOL_INPUT_FIELD) } });
             break;
           }
           case 'patch_apply_begin': {
+            const paths = Object.keys(data.changes || {});
+            mutations += paths.length;
             onStatus?.(describePatch(data.changes));
-            debug.log('ai.tool_use', { tool: 'Patch', input: { paths: Object.keys(data.changes || {}) } });
+            debug.log('ai.tool_use', { tool: 'Patch', input: { paths } });
             break;
           }
           case 'mcp_tool_call_begin':

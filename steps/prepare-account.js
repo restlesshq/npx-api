@@ -150,6 +150,19 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
 
   // Reusing a key that's already in .env - nothing more to do.
   if (existingKey) {
+    // Write back to ctx BEFORE returning. Earlier versions only set ctx
+    // fields on the picker path below, which meant a re-run with an
+    // existing .env left ctx.apiKey / projectId / setupKey at null and
+    // every downstream step (install-sdk, test-setup, setup-account)
+    // operated on a half-populated context. Easy bug to miss; very
+    // visible downstream.
+    ctx.apiKey = apiKey;
+    ctx.projectId = projectId;
+    ctx.setupKey = setupKey;
+    ctx.envFile = envFile;
+    ctx.envRelative = envRelative;
+    ctx.keyDelivery = 'env';
+    ctx.createdEnvFile = false;
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
       `  ${green('✓')} Using the ${bold('RESTLESS_KEY')} already in ${bold(envRelative)}.`,
     ]});

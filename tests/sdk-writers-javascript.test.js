@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  generate, parse, readBlockFields, canonicalizeInitArg, setProjectId,
+  generate, parse, readBlockFields, canonicalizeInitArg, setOwnerId, stripOwnerIdConfirm,
+  hasInit, findOldApiSetup,
 } from '../lib/sdk-writers/javascript.js';
 
 function ctxWith(overrides = {}) {
@@ -16,7 +17,7 @@ describe('generate', () => {
   it('emits a no-arg CJS init when no env loader is present, with no sentinel comments', () => {
     const out = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app',
-      credentialExpr: 'req.headers.authorization', projectIdExpr: null,
+      credentialExpr: 'req.headers.authorization', ownerIdExpr: null,
     });
     expect(out).toContain("const sdk = require('@restlessai/sdk')();");
     expect(out).toContain('app.use(sdk.setup(');
@@ -58,18 +59,21 @@ describe('generate', () => {
     expect(out).toContain('fastify.register(sdk.setup(');
   });
 
-  it('includes project.id when an expression is provided', () => {
+  it('includes owner.id when an expression is provided', () => {
     const out = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
-      projectIdExpr: 'user.workspaceId',
+      ownerIdExpr: 'user.workspaceId',
     });
-    expect(out).toContain('project: { id: user.workspaceId }');
+    expect(out).toContain('owner: { id: user.workspaceId }');
   });
 
-  it('omits the project block when no projectIdExpr is provided', () => {
+  it('omits the owner block when no ownerIdExpr is provided', () => {
     const out = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
+    expect(out).not.toContain('owner: {');
+    // Sanity check: no stale `project: {` either - the legacy shape is read,
+    // not written.
     expect(out).not.toContain('project: {');
   });
 });
@@ -112,35 +116,123 @@ describe('readBlockFields', () => {
     expect(r.initArgForm).toBe('no-arg');
   });
 
-  it('extracts the credential expression and project.id expression', () => {
+  it('extracts the credential expression and owner.id expression', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(req.headers['x-api-key']),
+  owner: { id: workspace.id },
+})));`;
+    const r = readBlockFields(content);
+    expect(r.credentialExpr).toBe("req.headers['x-api-key']");
+    expect(r.ownerIdExpr).toBe('workspace.id');
+  });
+
+  it('returns ownerIdConfirmReason when the CONFIRM marker is present', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  // RESTLESS_OWNER_ID_CONFIRM: user.id is a JSON file key that looks like a Mongo ObjectId; no schema to confirm.
+  owner: { id: user.id },
+})));`;
+    const r = readBlockFields(content);
+    expect(r.ownerIdExpr).toBe('user.id');
+    expect(r.ownerIdConfirmReason).toMatch(/JSON file key/);
+  });
+
+  it('returns null ownerIdConfirmReason when the marker is missing', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  owner: { id: user.id },
+})));`;
+    expect(readBlockFields(content).ownerIdConfirmReason).toBeNull();
+  });
+
+  it('also picks up CONFIRM markers preceding legacy `project: { id }`', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  // RESTLESS_OWNER_ID_CONFIRM: legacy block.
+  project: { id: user.id },
+})));`;
+    expect(readBlockFields(content).ownerIdConfirmReason).toBe('legacy block.');
+  });
+
+  it("extracts owner.id from a ternary `owner: user ? { id: ... } : { id: ... }` (test-api pattern)", () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => {
+  const user = lookup(req);
+  return {
+    apiKey: sdk.mask(key),
+    owner: user
+      ? { id: user.id, label: user.data.label, email: user.data.email }
+      : { id: 'anonymous' },
+  };
+}));`;
+    const r = readBlockFields(content);
+    // Picks the truthy-branch id (textually first).
+    expect(r.ownerIdExpr).toBe('user.id');
+  });
+
+  it('extracts owner.id from `owner: cond && { id: ... }`', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  owner: req.user && { id: req.user.workspaceId },
+})));`;
+    expect(readBlockFields(content).ownerIdExpr).toBe('req.user.workspaceId');
+  });
+
+  it('reads owner.id from a multi-line block with extra fields between owner and id', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  owner: {
+    label: 'something',
+    id: workspace.id,
+    email: 'x@y.com',
+  },
+})));`;
+    expect(readBlockFields(content).ownerIdExpr).toBe('workspace.id');
+  });
+
+  it('returns null ownerIdExpr when owner is a bare function call (no static id)', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  owner: buildOwner(req),
+})));`;
+    expect(readBlockFields(content).ownerIdExpr).toBeNull();
+  });
+
+  it('falls back to legacy `project: { id }` when `owner` is absent', () => {
     const content = `const sdk = require('@restlessai/sdk')();
 app.use(sdk.setup((req) => ({
   apiKey: sdk.mask(req.headers['x-api-key']),
   project: { id: workspace.id },
 })));`;
     const r = readBlockFields(content);
-    expect(r.credentialExpr).toBe("req.headers['x-api-key']");
-    expect(r.projectIdExpr).toBe('workspace.id');
+    expect(r.ownerIdExpr).toBe('workspace.id');
   });
 });
 
 describe('canonicalizeInitArg', () => {
   // The AI wrote a placeholder; the CLI must replace it deterministically
   // based on ctx.sdkLineSpec. This is the bug-class fix: CLI authoritatively
-  // owns the init line, AI's auth/project work in the callback is preserved.
+  // owns the init line, AI's auth/owner work in the callback is preserved.
   const placeholderBlock = `const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 app.use(sdk.setup((req) => ({
   apiKey: sdk.mask(req.headers['x-api-key']),
-  project: { id: workspace.id },
+  owner: { id: workspace.id },
 })));`;
 
   it('swaps placeholder for the literal key in inline mode', () => {
     const out = canonicalizeInitArg(placeholderBlock, ctxWith({ keyDelivery: 'inline', apiKey: 'rdme_abc' }));
     expect(out).toContain("require('@restlessai/sdk')(\"rdme_abc\")");
     expect(out).toContain('TODO: move this out of the codebase before committing');
-    // Auth + project preserved.
+    // Auth + owner preserved.
     expect(out).toContain("sdk.mask(req.headers['x-api-key'])");
-    expect(out).toContain('project: { id: workspace.id }');
+    expect(out).toContain('owner: { id: workspace.id }');
   });
 
   it('swaps placeholder for no-arg form when no env loader and not inline', () => {
@@ -185,27 +277,159 @@ app.use(sdk.setup((req) => ({ apiKey: sdk.mask(req.headers.authorization) })));`
   });
 });
 
-describe('setProjectId', () => {
-  it('inserts project.id after apiKey when the block has none', () => {
+describe('hasInit', () => {
+  it('accepts CJS immediate-call form', () => {
+    expect(hasInit(`const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);`)).toBe(true);
+    expect(hasInit(`const sdk = require('@restlessai/sdk')();`)).toBe(true);
+  });
+
+  it('accepts CJS named form with a later factory call', () => {
+    const content = `const restless = require('@restlessai/sdk');
+const sdk = restless(process.env.RESTLESS_KEY);
+sdk.setup(...);`;
+    expect(hasInit(content)).toBe(true);
+  });
+
+  it('accepts ESM with a later factory call', () => {
+    const content = `import restless from '@restlessai/sdk';
+const sdk = restless(process.env.RESTLESS_KEY);`;
+    expect(hasInit(content)).toBe(true);
+  });
+
+  it("rejects ESM import without a factory call (the OLD-API trap)", () => {
+    // `import restless from '@restlessai/sdk'; restless.setup(app, cb);`
+    // is what install-sdk used to treat as "wired" - but `restless` is the
+    // factory in the new SDK, so `restless.setup` is undefined at runtime.
+    // hasInit must say "not wired" so the install pass rewrites it.
+    const content = `import restless from '@restlessai/sdk';
+restless.setup(app, (req) => ({ apiKey: restless.mask(req.headers.authorization) }));`;
+    expect(hasInit(content)).toBe(false);
+  });
+
+  it('rejects CJS named import without a factory call', () => {
+    const content = `const restless = require('@restlessai/sdk');
+restless.setup(app, (req) => ({}));`;
+    expect(hasInit(content)).toBe(false);
+  });
+
+  it("doesn't false-positive on property access calls (`restless.mask(x)` is not a factory call)", () => {
+    const content = `import restless from '@restlessai/sdk';
+const masked = restless.mask(req.headers.authorization);`;
+    expect(hasInit(content)).toBe(false);
+  });
+
+  it('returns false for empty input or a bare quoted mention', () => {
+    expect(hasInit('')).toBe(false);
+    expect(hasInit(null)).toBe(false);
+    expect(hasInit(`// see '@restlessai/sdk' docs`)).toBe(false);
+  });
+});
+
+describe('findOldApiSetup', () => {
+  it('finds a 2-arg setup(app, cb) call', () => {
+    const content = `import restless from '@restlessai/sdk';
+restless.setup(app, (req) => ({ apiKey: restless.mask(req.headers.authorization) }));`;
+    expect(findOldApiSetup(content)).toBeGreaterThan(0);
+  });
+
+  it('finds a 2-arg setup with multi-line callback', () => {
+    const content = `restless.setup(app, (req) => {
+  return { apiKey: restless.mask(req.headers.authorization) };
+});`;
+    expect(findOldApiSetup(content)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('returns null for a 1-arg setup(cb), the current API', () => {
+    const content = `app.use(sdk.setup((req) => ({ apiKey: sdk.mask(req.headers.authorization) })));`;
+    expect(findOldApiSetup(content)).toBeNull();
+  });
+
+  it('does not get tripped up by commas inside the callback signature', () => {
+    // Two-arg arrow function `(req, res) => ...` is still ONE argument
+    // to .setup() because the commas are inside parens at depth >= 2.
+    const content = `app.use(sdk.setup((req, res) => ({ apiKey: sdk.mask(req.headers.authorization) })));`;
+    expect(findOldApiSetup(content)).toBeNull();
+  });
+
+  it('does not get tripped up by commas inside the callback body', () => {
+    const content = `app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(req.headers.authorization),
+  owner: { id: req.user.id, label: req.user.name },
+})));`;
+    expect(findOldApiSetup(content)).toBeNull();
+  });
+
+  it('handles empty input safely', () => {
+    expect(findOldApiSetup('')).toBeNull();
+    expect(findOldApiSetup(null)).toBeNull();
+  });
+});
+
+describe('stripOwnerIdConfirm', () => {
+  it('removes the marker comment line, leaving the owner line untouched', () => {
+    const before = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  // RESTLESS_OWNER_ID_CONFIRM: a reason that spans this line.
+  owner: { id: user.id },
+})));`;
+    const after = stripOwnerIdConfirm(before);
+    expect(after).not.toContain('RESTLESS_OWNER_ID_CONFIRM');
+    expect(after).toContain('owner: { id: user.id }');
+    // Indentation of owner line preserved.
+    expect(after).toMatch(/^[ \t]+owner: \{ id: user\.id \},$/m);
+  });
+
+  it('is a no-op when the marker is absent', () => {
+    const before = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  owner: { id: user.id },
+})));`;
+    expect(stripOwnerIdConfirm(before)).toBe(before);
+  });
+
+  it('only strips markers that precede an owner/project line', () => {
+    // Stray marker elsewhere shouldn't be deleted by mistake.
+    const before = `// RESTLESS_OWNER_ID_CONFIRM: unrelated comment.
+const x = 1;`;
+    expect(stripOwnerIdConfirm(before)).toBe(before);
+  });
+});
+
+describe('setOwnerId', () => {
+  it('inserts owner.id after apiKey when the block has none', () => {
     const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
     const content = `const app = require('express')();\n${initial}`;
-    const next = setProjectId(content, 'user.workspaceId');
-    expect(next).toContain('project: { id: user.workspaceId },');
-    // apiKey line still present, no duplicate project lines.
+    const next = setOwnerId(content, 'user.workspaceId');
+    expect(next).toContain('owner: { id: user.workspaceId },');
+    // apiKey line still present, no duplicate owner lines.
     expect(next.match(/apiKey:\s*sdk\.mask/g)).toHaveLength(1);
-    expect(next.match(/project\s*:\s*\{\s*id:/g)).toHaveLength(1);
+    expect(next.match(/owner\s*:\s*\{\s*id:/g)).toHaveLength(1);
   });
 
-  it('replaces an existing risky project.id in place', () => {
+  it('replaces an existing risky owner.id in place', () => {
     const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app',
-      credentialExpr: 'auth', projectIdExpr: 'req.headers.authorization',
+      credentialExpr: 'auth', ownerIdExpr: 'req.headers.authorization',
     });
     const content = `const app = require('express')();\n${initial}`;
-    const next = setProjectId(content, 'user.id');
-    expect(next).toContain('project: { id: user.id }');
+    const next = setOwnerId(content, 'user.id');
+    expect(next).toContain('owner: { id: user.id }');
+    expect(next).not.toContain('req.headers.authorization');
+  });
+
+  it('upgrades a legacy `project: { id }` to `owner: { id }`', () => {
+    const content = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(auth),
+  project: { id: req.headers.authorization },
+})));`;
+    const next = setOwnerId(content, 'user.id');
+    expect(next).toContain('owner: { id: user.id }');
+    expect(next).not.toContain('project: {');
     expect(next).not.toContain('req.headers.authorization');
   });
 
@@ -213,24 +437,39 @@ describe('setProjectId', () => {
     const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
-    const next = setProjectId(initial, 'user.id');
-    // The new project line should share the same leading whitespace as apiKey.
+    const next = setOwnerId(initial, 'user.id');
+    // The new owner line should share the same leading whitespace as apiKey.
     const apiKeyIndent = next.match(/^([ \t]*)apiKey\s*:/m)[1];
-    const projectIndent = next.match(/^([ \t]*)project\s*:/m)[1];
-    expect(projectIndent).toBe(apiKeyIndent);
+    const ownerIndent = next.match(/^([ \t]*)owner\s*:/m)[1];
+    expect(ownerIndent).toBe(apiKeyIndent);
   });
 
   it('returns content unchanged when there is no managed block', () => {
     const content = `const x = 1;\n`;
-    expect(setProjectId(content, 'user.id')).toBe(content);
+    expect(setOwnerId(content, 'user.id')).toBe(content);
+  });
+
+  it('bails when owner is a ternary or other non-`{` expression (would create duplicate keys)', () => {
+    const ternary = `const sdk = require('@restlessai/sdk')();
+app.use(sdk.setup((req) => ({
+  apiKey: sdk.mask(key),
+  owner: user ? { id: user.id } : { id: 'anonymous' },
+})));`;
+    // The repair flow runs setOwnerId, but with a ternary already in place
+    // inserting another owner: line would produce two owner properties in
+    // the same object literal (syntax error). Safer to leave alone.
+    const next = setOwnerId(ternary, 'workspace.id');
+    expect(next).toBe(ternary);
+    // No new owner line.
+    expect((next.match(/\bowner\s*:/g) || []).length).toBe(1);
   });
 
   it('returns content unchanged when the expression is empty or whitespace', () => {
     const initial = generate(ctxWith({ keyDelivery: 'manual' }), {
       module: 'cjs', framework: 'express', appVar: 'app', credentialExpr: 'auth',
     });
-    expect(setProjectId(initial, '')).toBe(initial);
-    expect(setProjectId(initial, '   ')).toBe(initial);
+    expect(setOwnerId(initial, '')).toBe(initial);
+    expect(setOwnerId(initial, '   ')).toBe(initial);
   });
 });
 

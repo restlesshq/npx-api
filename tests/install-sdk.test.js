@@ -26,7 +26,7 @@ describe('inlineKeyIntoSource', () => {
     const file = path.join(dir, 'index.js');
     fs.writeFileSync(file, "const restless = require('@restlessai/sdk')(process.env.RESTLESS_KEY);\n");
     const touched = inlineKeyIntoSource(dir, 'rdme_abc');
-    expect(touched).toEqual(['./index.js']);
+    expect(touched).toEqual(['index.js']);
     expect(fs.readFileSync(file, 'utf8')).toBe(
       `// TODO: move this out of the codebase before committing\nconst restless = require('@restlessai/sdk')("rdme_abc");\n`,
     );
@@ -60,7 +60,7 @@ describe('inlineKeyIntoSource', () => {
     const file = path.join(dir, 'server.mjs');
     fs.writeFileSync(file, "import restless from '@restlessai/sdk';\nconst r = restless(process.env.RESTLESS_KEY);\n");
     const touched = inlineKeyIntoSource(dir, 'rdme_xyz');
-    expect(touched).toEqual(['./server.mjs']);
+    expect(touched).toEqual(['server.mjs']);
     expect(fs.readFileSync(file, 'utf8')).toContain('restless("rdme_xyz")');
   });
 
@@ -79,7 +79,7 @@ describe('inlineKeyIntoSource', () => {
     fs.writeFileSync(sdkFile, "require('@restlessai/sdk')(process.env.RESTLESS_KEY);\n");
     fs.writeFileSync(otherFile, 'const x = process.env.RESTLESS_KEY;\n');
     const touched = inlineKeyIntoSource(dir, 'rdme_abc');
-    expect(touched).toEqual(['./index.js']);
+    expect(touched).toEqual(['index.js']);
     // unrelated file should be untouched.
     expect(fs.readFileSync(otherFile, 'utf8')).toBe('const x = process.env.RESTLESS_KEY;\n');
   });
@@ -112,7 +112,7 @@ describe('inlineKeyIntoSource', () => {
     const file = path.join(dir, 'index.js');
     fs.writeFileSync(file, 'const restless = require("@restlessai/sdk")();\n');
     const touched = inlineKeyIntoSource(dir, 'rdme_abc');
-    expect(touched).toEqual(['./index.js']);
+    expect(touched).toEqual(['index.js']);
     const out = fs.readFileSync(file, 'utf8');
     expect(out).toContain('// TODO: move this out of the codebase before committing\n');
     expect(out).toContain('const restless = require("@restlessai/sdk")("rdme_abc");');
@@ -122,7 +122,7 @@ describe('inlineKeyIntoSource', () => {
     const file = path.join(dir, 'server.mjs');
     fs.writeFileSync(file, "import restless from '@restlessai/sdk';\nconst r = restless();\n");
     const touched = inlineKeyIntoSource(dir, 'rdme_xyz');
-    expect(touched).toEqual(['./server.mjs']);
+    expect(touched).toEqual(['server.mjs']);
     expect(fs.readFileSync(file, 'utf8')).toContain('const r = restless("rdme_xyz");');
   });
 
@@ -130,7 +130,7 @@ describe('inlineKeyIntoSource', () => {
     const file = path.join(dir, 'index.js');
     fs.writeFileSync(file, "const factory = require('@restlessai/sdk');\nconst r = factory();\n");
     const touched = inlineKeyIntoSource(dir, 'rdme_abc');
-    expect(touched).toEqual(['./index.js']);
+    expect(touched).toEqual(['index.js']);
     expect(fs.readFileSync(file, 'utf8')).toContain('const r = factory("rdme_abc");');
   });
 
@@ -153,7 +153,7 @@ describe('inlineKeyIntoSource', () => {
     fs.writeFileSync(a, "require('@restlessai/sdk')(process.env.RESTLESS_KEY);\n");
     fs.writeFileSync(b, "import restless from '@restlessai/sdk';\nrestless(process.env.RESTLESS_KEY);\n");
     const touched = inlineKeyIntoSource(dir, 'rdme_abc');
-    expect(touched.sort()).toEqual(['./index.js', './src/app.ts'].sort());
+    expect(touched.sort()).toEqual(['index.js', 'src/app.ts'].sort());
     expect(fs.readFileSync(a, 'utf8')).toContain('"rdme_abc"');
     expect(fs.readFileSync(b, 'utf8')).toContain('"rdme_abc"');
   });

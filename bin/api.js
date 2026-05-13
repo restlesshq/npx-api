@@ -13,6 +13,7 @@ import generateOas from '../steps/generate-oas.js';
 import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
 import installSdk, { resolveInstallDir } from '../steps/install-sdk.js';
 import { createSetupContext, redactSetupContext, getSdkLineSpec } from '../lib/setup-context.js';
+import verifyOwnerId from '../steps/verify-owner-id.js';
 import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
@@ -423,17 +424,27 @@ if (command === 'setup' || command === 'supercharge') {
     domain: projectApi?.baseUrl || oasResult.domain || null,
   });
 
-  // Step 2 sub 3: Run final checks. Verifies the install is correct and
+  // Step 2 sub 3: Semantic verification of owner.id. Runs an AI pass that
+  // re-reads the wired file, traces the data flow, and confirms the chosen
+  // id is server-verified and immutable. Catches what the static heuristic
+  // in final-checks can't: tenant ids pulled from req.body in a codebase
+  // where the static check sees `req.user.tenantId` but the user object
+  // was attached from unsigned input upstream.
+  const verifyUpdate = plan.makeUpdater(1);
+  verifyUpdate({ activeSub: 3, sub: { 0: 'done', 1: 'done', 2: 'done' } });
+  await verifyOwnerId({ ctx, update: (msg) => verifyUpdate({ ...msg, activeSub: 3 }), setSpinner });
+
+  // Step 2 sub 4: Run final checks. Verifies the install is correct and
   // surfaces issues for the user to opt into fixing - it never edits the
   // SDK init line itself (that's the CLI's responsibility, not the AI's).
   await finalChecks({
     ctx,
     update: plan.makeUpdater(1),
     setSpinner,
-    subIndex: 3,
-    prevSubs: { 0: 'done', 1: 'done', 2: 'done' },
+    subIndex: 4,
+    prevSubs: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' },
   });
-  plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' } });
+  plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done', 4: 'done' } });
 
   // Step 3: Test your setup (with live log polling)
   await testSetup({
