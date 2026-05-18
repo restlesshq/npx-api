@@ -20,6 +20,7 @@ import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { loadSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
+import { findSdkReferences } from '../lib/grep-sdk.js';
 import * as debug from '../lib/debug.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
@@ -471,6 +472,146 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
 
   setupInProgress = false;
 
+} else if (command === 'reset') {
+  const cwd = process.cwd();
+  const { rootDir: resetRoot } = resolveProjectDirs(cwd);
+
+  console.log('');
+  console.log(`  ${bold(yellow('This will reset Restless from this project.'))}`);
+  console.log('');
+  console.log(`  About to:`);
+  console.log(`    ${dim('•')} Remove the ${cyan('.restless/')} directory`);
+  console.log(`    ${dim('•')} Uninstall ${cyan('@restlessai/sdk')} from every ${cyan('package.json')} found`);
+  console.log(`    ${dim('•')} Ask AI to strip SDK setup code from your source files`);
+  console.log(`    ${dim('•')} Remove ${cyan('RESTLESS_KEY')} from any ${cyan('.env*')} files`);
+  console.log('');
+  process.stdout.write(`  Continue? ${dim('[y/N] ')}`);
+  const confirmed = await askYesNo('', { defaultValue: false });
+  if (!confirmed) {
+    console.log(dim('\n  Cancelled.\n'));
+    await debug.flushAndExit(0);
+  }
+
+  console.log('');
+
+  // a. Remove .restless/
+  const restlessDir = path.join(resetRoot, '.restless');
+  if (fs.existsSync(restlessDir)) {
+    fs.rmSync(restlessDir, { recursive: true, force: true });
+    console.log(green('  ✓ Removed .restless/'));
+  } else {
+    console.log(dim('  • No .restless/ directory found.'));
+  }
+
+  // b. Uninstall @restlessai/sdk from every package.json in the tree
+  // (excluding node_modules and other obvious skip dirs). Walks via `find`
+  // so we don't have to roll our own recursive scanner.
+  function findPackageJsons(root) {
+    try {
+      const out = execSync(
+        "find . -name package.json -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.restless/*' -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/.next/*'",
+        { cwd: root, encoding: 'utf8' },
+      );
+      return out.trim().split('\n').filter(Boolean).map((f) => path.resolve(root, f));
+    } catch {
+      return [];
+    }
+  }
+
+  const pkgFiles = findPackageJsons(resetRoot);
+  let uninstalledCount = 0;
+  for (const pkgPath of pkgFiles) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const inDeps = pkg.dependencies && '@restlessai/sdk' in pkg.dependencies;
+      const inDev = pkg.devDependencies && '@restlessai/sdk' in pkg.devDependencies;
+      if (!inDeps && !inDev) continue;
+      const pkgDir = path.dirname(pkgPath);
+      const rel = path.relative(resetRoot, pkgPath) || 'package.json';
+      try {
+        execSync('npm uninstall @restlessai/sdk', { cwd: pkgDir, stdio: 'pipe' });
+        console.log(green(`  ✓ Uninstalled @restlessai/sdk in ${rel}`));
+        uninstalledCount++;
+      } catch {
+        console.log(yellow(`  ! Could not run npm uninstall in ${rel} - remove manually.`));
+      }
+    } catch {}
+  }
+  if (uninstalledCount === 0) {
+    console.log(dim('  • @restlessai/sdk not listed in any package.json.'));
+  }
+
+  // d. Strip RESTLESS_KEY from .env files (no AI - we never let the model
+  // read secret files). Plain regex on every .env* we can find.
+  function findEnvFiles(root) {
+    try {
+      const out = execSync(
+        "find . -type f -name '.env*' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.restless/*'",
+        { cwd: root, encoding: 'utf8' },
+      );
+      return out.trim().split('\n').filter(Boolean).map((f) => path.resolve(root, f));
+    } catch {
+      return [];
+    }
+  }
+
+  const envFiles = findEnvFiles(resetRoot);
+  let envStripped = 0;
+  for (const envPath of envFiles) {
+    try {
+      const original = fs.readFileSync(envPath, 'utf8');
+      const next = original
+        .split('\n')
+        .filter((line) => !/^\s*(export\s+)?RESTLESS_KEY\s*=/.test(line))
+        .join('\n');
+      if (next !== original) {
+        fs.writeFileSync(envPath, next);
+        const rel = path.relative(resetRoot, envPath);
+        console.log(green(`  ✓ Removed RESTLESS_KEY from ${rel}`));
+        envStripped++;
+      }
+    } catch {}
+  }
+  if (envStripped === 0) {
+    console.log(dim('  • No RESTLESS_KEY entries found in .env files.'));
+  }
+
+  // c. Ask AI to remove SDK setup code from source files. Run last so
+  // the model sees a project that's already half-cleaned (no .restless,
+  // no package dep) - lower chance it tries to "fix" what we just
+  // removed. We never tell it about the .env step; the prompt forbids
+  // reading those anyway.
+  const sdkFiles = findSdkReferences(resetRoot);
+  if (sdkFiles.length === 0) {
+    console.log(dim('  • No @restlessai/sdk references in source files.'));
+  } else {
+    const claudeOk = hasClaude();
+    const codexOk = hasCodex() && hasCodexAuth();
+    if (!claudeOk && !codexOk) {
+      console.log(yellow('  ! No AI tool available - skipped source cleanup. References remain in:'));
+      for (const f of sdkFiles) console.log(dim(`      ${f}`));
+    } else {
+      setProvider(claudeOk ? 'claude' : 'codex');
+      console.log('');
+      console.log(`  ${dim('Asking')} ${cyan(claudeOk ? 'Claude' : 'Codex')} ${dim('to strip SDK setup code from your source...')}`);
+      try {
+        const prompt = loadPrompt('remove-sdk', {
+          files: sdkFiles.map((f) => `- ${f}`).join('\n'),
+        });
+        await runAI(prompt, resetRoot);
+        console.log(green('  ✓ Source cleanup complete.'));
+      } catch (err) {
+        console.log(yellow(`  ! AI cleanup failed: ${err.message}`));
+        console.log(dim('    References that may remain:'));
+        for (const f of sdkFiles) console.log(dim(`      ${f}`));
+      }
+    }
+  }
+
+  console.log('');
+  console.log(green('  ✓ Reset complete.'));
+  console.log('');
+  await debug.flushAndExit(0);
 } else if (command === 'clear') {
   const cwd = process.cwd();
   const { rootDir: clearRoot } = resolveProjectDirs(cwd);

@@ -1,0 +1,39 @@
+You need to **completely remove the Restless SDK** from this project's source code. The package (`@restlessai/sdk`) has already been uninstalled from `package.json`, and the `.restless/` settings directory has been deleted - your job is to strip every reference out of the source so nothing is left dangling.
+
+## Files that reference `@restlessai/sdk`
+
+{{files}}
+
+## What to remove
+
+For each file above (and anywhere else you find SDK code), remove:
+
+1. **Imports / requires** of `@restlessai/sdk`:
+   - `import restless from '@restlessai/sdk'`
+   - `import { ... } from '@restlessai/sdk'`
+   - `const restless = require('@restlessai/sdk')`
+   - `const sdk = require('@restlessai/sdk')(...)` (CJS factory-call form)
+
+2. **Factory calls** that bind the SDK client (these may live a few lines below the import):
+   - `const sdk = restless(...)` / `const sdk = restless(process.env.RESTLESS_KEY)` / etc.
+
+3. **Middleware registration**:
+   - `app.use(sdk.setup(...))`, `app.use(restless.setup(...))`
+   - `fastify.register(sdk.setup(...))`, `await fastify.register(sdk.setup(...))`
+   - Any other `.setup(...)` call wired into the framework
+
+4. **Any other call sites** of SDK methods: `sdk.mask(...)`, `restless.mask(...)`, `sdk.upsertUser(...)`, etc. If a helper variable was defined purely to feed the SDK callback (e.g. `function getApiKey(req) { ... }` only used inside `sdk.setup(req => ({ apiKey: sdk.mask(getApiKey(req)) }))`), remove that helper too.
+
+5. **Comments** that mention Restless, ReadMe, `@restlessai/sdk`, `RESTLESS_KEY`, or the install steps left behind by `npx api init`.
+
+## Rules
+
+- **NEVER read, open, grep, or list `.env`, `.env.*`, or any environment / secret file.** The CLI cleans those up separately. Do not touch them under any circumstances.
+- **NEVER read or scan files inside `node_modules/`.**
+- Use the **Edit** tool to remove SDK code, one file at a time. Preserve surrounding code style, indentation, and formatting exactly.
+- **Only remove SDK-related lines.** Do not refactor, rename, or "improve" surrounding code while you're in there.
+- If removing the SDK leaves a now-unused import for an unrelated module (e.g. a `path` import that was only used to construct a Restless config path), remove that too. But do not remove imports that still have other valid uses.
+- If a file's only purpose was SDK setup and removing the SDK code leaves it effectively empty, leave a minimal valid file in place (e.g. an empty `export {}` for ESM, or just an empty file). Do not delete the file from disk.
+- If you encounter a reference that's already broken or commented out, remove it anyway - we want a clean slate.
+
+When you're done, print one short sentence summarizing which files you edited. No long explanation, no diff dump.
