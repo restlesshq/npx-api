@@ -141,6 +141,45 @@ export default async function setupAccount({
     }
   }
 
+  // Upload the FULL `.restless/settings.json`. We send the whole
+  // file (not just this api's entry) so the server has the full
+  // workspace context - other apis in the file, top-level
+  // version/config, etc. The UI cherry-picks the entry matching
+  // this projectId (by its `id` in the apis[] array - though for
+  // request-id-prefix display, the matching apiEntry suffices).
+  // Non-fatal on failure: the project still claims, just without
+  // the settings blob attached. We log + warn rather than abort.
+  if (settings && Array.isArray(settings.apis) && settings.apis.length) {
+    setSpinner?.('Uploading project settings');
+    try {
+      const settingsRes = await fetch(
+        `${SITE_URL}/api/projects/${projectId}/settings`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            setup_key: setupKey,
+            settings,
+          }),
+          signal: AbortSignal.timeout(10000),
+        },
+      );
+      setSpinner?.('');
+      if (!settingsRes.ok) {
+        const errText = await settingsRes.text().catch(() => '');
+        update({ message: [
+          `  ${dim('!')} Settings upload skipped (HTTP ${settingsRes.status}).`,
+          errText ? dim(`    ${errText.slice(0, 200)}`) : null,
+        ].filter(Boolean) });
+      }
+    } catch (err) {
+      setSpinner?.('');
+      update({ message: [
+        `  ${dim('!')} Settings upload skipped: ${err.message}`,
+      ]});
+    }
+  }
+
   // ── Sub 1: Log in to claim the project ──────────────────────────
   // Hand the project + setupKey to the server up front, keyed by an
   // opaque token. The login URL we display only needs that token, so
