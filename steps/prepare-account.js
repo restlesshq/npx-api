@@ -87,7 +87,7 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   // Idempotency: if a pre-existing .env already has a RESTLESS_KEY, reuse it
   // and re-register with the backend using the same hash.
   const existingKey = existingEnvFile ? existingRestlessKey(envFile) : null;
-  const apiKey = existingKey || 'rdme_' + crypto.randomBytes(32).toString('hex');
+  const apiKey = existingKey || 'rstlss_' + crypto.randomBytes(32).toString('hex');
   const writeKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
 
   update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
