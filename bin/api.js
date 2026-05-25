@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -18,7 +19,7 @@ import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
-import { loadSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
+import { loadSettings, saveSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
 import * as debug from '../lib/debug.js';
@@ -83,6 +84,150 @@ function hasClaude() {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Build the prompt sent to Claude (either via the local SDK on "yes" or
+ * printed for the user to paste elsewhere on "no"). The prompt is the
+ * same in both cases so what the user sees if they pick "give me a
+ * prompt" matches what they'd have gotten from the SDK run.
+ */
+function buildFixPrompt(log) {
+  const har = log.har || {};
+  const req = har.request || {};
+  const res = har.response || {};
+  const reqHeaders = Array.isArray(req.headers)
+    ? req.headers.map((h) => `${h.name}: ${h.value}`).join('\n')
+    : '';
+  const resHeaders = Array.isArray(res.headers)
+    ? res.headers.map((h) => `${h.name}: ${h.value}`).join('\n')
+    : '';
+  const reqBody = req.postData?.text || '(empty)';
+  const resBody = res.content?.text || '(empty)';
+  return [
+    'A developer just got an HTTP error from their API and is asking for help fixing it.',
+    '',
+    '--- ERROR DETAILS ---',
+    `Method: ${log.method || req.method || '?'}`,
+    `URL: ${log.url || req.url || '?'}`,
+    `Status: ${log.status || res.status || '?'}${res.statusText ? ' ' + res.statusText : ''}`,
+    '',
+    'Request headers:',
+    reqHeaders || '(none captured)',
+    '',
+    'Request body:',
+    reqBody,
+    '',
+    'Response headers:',
+    resHeaders || '(none captured)',
+    '',
+    'Response body:',
+    resBody,
+    '--- END ---',
+    '',
+    'Your task:',
+    '1. Find the code in this project that handles this endpoint or makes this call.',
+    '2. Diagnose what went wrong, using the error code, response body, and any validation messages.',
+    '3. Apply a minimal fix. Edit files in place; show the diff via your normal tools.',
+    '',
+    'If the failing endpoint is a third-party / upstream API (not in this repo), explain what the caller in THIS repo should change instead (different params, headers, payload shape, etc.).',
+    '',
+    'Keep the change tightly scoped to this error. Do not refactor surrounding code.',
+  ].join('\n');
+}
+
+/**
+ * Fire-and-forget telemetry. Sends an event name + tiny structured
+ * context (method/status/fingerprint) so we can count auto-fix usage
+ * without ever seeing the user's code, prompts, or bodies. Failures
+ * are swallowed so a tracking outage never breaks the debug flow.
+ */
+async function trackDebugEvent(requestId, event, { log, source = 'cli' } = {}) {
+  try {
+    const payload = { event, source };
+    if (log) {
+      if (typeof log.method === 'string') payload.method = log.method;
+      if (typeof log.status === 'number') payload.status = log.status;
+      const fp = log.errorFingerprint?.key;
+      if (typeof fp === 'string') payload.fingerprintKey = fp;
+    }
+    await fetch(`${SITE_URL}/api/logs/${requestId}/track`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      // Don't block the user on slow telemetry.
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => {});
+  } catch {
+    /* swallow */
+  }
+}
+
+/**
+ * 3-way edit-permission picker. Only reached after the user has
+ * already opted into "Fix it for me" at the top level — so by this
+ * point they want help; the question is just whether they want the
+ * Claude SDK to apply the edit, or they prefer to copy a prompt.
+ *
+ * Yes  -> run Claude Agent SDK in the user's repo (their tokens, their
+ *         machine; the prompt is the only thing that leaves).
+ * No   -> print the same prompt the SDK would have used so the dev
+ *         can paste it into the AI of their choice.
+ * Maybe-> explain the trust model, then re-prompt.
+ */
+async function offerFix({ log, requestId, cwd, p, CLI_NAME, displayId }) {
+  const prompt = buildFixPrompt(log);
+
+  while (true) {
+    const choice = await singleSelect(
+      [
+        { label: 'Yes, use Claude SDK to edit', hint: 'Run Claude on your machine to find and fix the bug.' },
+        { label: 'No, give me a prompt to fix it', hint: 'Print a prompt you can paste into any AI.' },
+        { label: 'Maybe, tell me more first', hint: 'See exactly what happens before deciding.' },
+      ],
+      { message: 'Can I edit code directly?', defaultIndex: 0 },
+    );
+
+    if (choice === 0) {
+      console.log('');
+      void trackDebugEvent(requestId, 'fix.start', { log });
+      try {
+        await runAI(prompt, cwd);
+        console.log('');
+        console.log(`  ${p.green('✓')} Done. Review the changes with ${p.cyan('git diff')} before keeping them.`);
+        console.log('');
+        void trackDebugEvent(requestId, 'fix.complete', { log });
+      } catch (err) {
+        console.log(`\n  ${p.red('✗')} The fix run failed: ${err?.message || err}\n`);
+        void trackDebugEvent(requestId, 'fix.failed', { log });
+      }
+      return;
+    }
+
+    if (choice === 1) {
+      console.log('');
+      console.log(`  ${p.bold('Paste this into your AI of choice:')}`);
+      console.log(p.dim('  ' + '─'.repeat(60)));
+      for (const line of prompt.split('\n')) console.log('  ' + line);
+      console.log(p.dim('  ' + '─'.repeat(60)));
+      console.log('');
+      console.log(`  ${p.dim('Or re-run with:')} npx ${CLI_NAME} debug ${displayId}`);
+      console.log('');
+      void trackDebugEvent(requestId, 'fix.prompt_only', { log });
+      return;
+    }
+
+    // Maybe: explain and loop back to the menu.
+    console.log('');
+    console.log(`  ${p.bold('Here\'s what "Yes" actually does:')}`);
+    console.log(`    • Runs your locally-installed ${p.cyan('claude')} CLI in this repo (${cwd}).`);
+    console.log(`    • Uses ${p.cyan('your')} Anthropic tokens. The request goes to ${p.cyan('api.anthropic.com')} and nowhere else.`);
+    console.log(`    • Does not contact Restless servers, third parties, or upload anything.`);
+    console.log(`    • File edits are confined to this git repo (path guard rejects writes outside it).`);
+    console.log(`    • You can review every change with ${p.cyan('git diff')} before keeping it.`);
+    console.log('');
+    void trackDebugEvent(requestId, 'fix.explained', { log });
   }
 }
 
@@ -692,33 +837,69 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // Fetch log by request ID (UUID) - no projectId needed, the server searches all projects
   const logUrl = `${SITE_URL}/api/logs/${requestId}/public`;
   let log;
-  try {
-    const res = await fetch(logUrl);
-    if (res.ok) {
-      log = await res.json();
-    }
-  } catch {}
+  let expired = null;
+  // The server's 404 response also carries a `dashboardUrl` (resolved
+  // against the matching project's verified custom domain when found,
+  // primary host otherwise). Keep the most-recent one so we can hand
+  // the visitor a branded URL even when we never saw the log itself.
+  let notFoundDashboardUrl = null;
+  async function fetchOnce() {
+    try {
+      const res = await fetch(logUrl);
+      if (res.ok) return { log: await res.json() };
+      if (res.status === 410) {
+        const body = await res.json().catch(() => ({}));
+        return { expired: body };
+      }
+      if (res.status === 404) {
+        const body = await res.json().catch(() => ({}));
+        if (body?.dashboardUrl) notFoundDashboardUrl = body.dashboardUrl;
+      }
+    } catch {}
+    return null;
+  }
 
-  // If not found, wait for the SDK to flush and retry
-  if (!log) {
+  const first = await fetchOnce();
+  if (first?.log) log = first.log;
+  else if (first?.expired) expired = first.expired;
+
+  // If not found AND not expired, wait for the SDK to flush and retry
+  if (!log && !expired) {
     process.stdout.write(p.dim('\n  Waiting for log to be ingested...'));
     for (let attempt = 0; attempt < 10; attempt++) {
       await new Promise(r => setTimeout(r, 1000));
-      try {
-        const res = await fetch(logUrl);
-        if (res.ok) {
-          log = await res.json();
-          break;
-        }
-      } catch {}
+      const got = await fetchOnce();
+      if (got?.log) { log = got.log; break; }
+      if (got?.expired) { expired = got.expired; break; }
       process.stdout.write('.');
     }
     console.log('');
   }
 
-  if (!log) {
-    console.log(p.red(`\n  ✗ Log not found for request ID: ${requestId}\n`));
-    console.log(p.dim('  Make sure the API server is running and the SDK is configured.\n'));
+  if (expired || !log) {
+    const dashboardUrl =
+      (expired && expired.dashboardUrl) ||
+      notFoundDashboardUrl ||
+      `${SITE_URL}/logs/${requestId}`;
+    console.log('');
+    if (expired) {
+      console.log(`  ${p.bold('This request is older than 5 minutes.')}`);
+    } else {
+      console.log(`  ${p.bold("Couldn't load that request from here.")}`);
+    }
+    console.log('');
+    console.log(`  ${p.dim('For security, `npx api debug` only works for the first 5 minutes')}`);
+    console.log(`  ${p.dim('after a request. After that, the log is only viewable when')}`);
+    console.log(`  ${p.dim("you're signed in.")}`);
+    console.log('');
+    console.log(`  ${p.bold('Open it on the dashboard:')}`);
+    console.log(`  ${p.cyan(dashboardUrl)}`);
+    if (!expired) {
+      console.log('');
+      console.log(p.dim('  (If this is a brand-new request, also confirm your API server is'));
+      console.log(p.dim('  running and the SDK is wired up.)'));
+    }
+    console.log('');
     await debug.flushAndExit(1);
   }
 
@@ -784,8 +965,11 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     }
   }
 
-  // Footer
-  console.log(`\n  ${p.dim('View in browser:')} ${SITE_URL}/logs/${requestId}`);
+  // Footer. Prefer the server-resolved dashboardUrl (built against the
+  // owning project's verified custom domain when set, primary host
+  // otherwise) so the URL we print matches the customer's brand.
+  const viewUrl = log.dashboardUrl || `${SITE_URL}/logs/${requestId}`;
+  console.log(`\n  ${p.dim('View in browser:')} ${viewUrl}`);
   if (isPlain && !inlineQuestion) {
     console.log(`\n  ${p.bold('Ask AI about this request')} - ask a question in plain English about this log:`);
     console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "why did this fail?"`);
@@ -793,6 +977,40 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     console.log(`  npx ${CLI_NAME} debug ${displayId} --ask "show me a working curl command"`);
   }
   console.log('');
+
+  // ── Top-level "what next?" picker ──
+  // After showing the error, give the user a clean fork: take an
+  // active fix path (which then drills into the edit-permission
+  // sub-menu) or chat about the log. The edit machinery is hidden
+  // until the user actually opts into fixing, so people who just
+  // want to read the log or ask a quick question never see it.
+  //
+  // Gated on: error log, interactive TTY, and the `claude` CLI being
+  // on PATH locally (no point offering an edit flow that depends on a
+  // tool the user doesn't have).
+  let skipChat = false;
+  if (isError && isTTY && hasClaude()) {
+    const action = await singleSelect(
+      [
+        { label: 'Fix it for me', hint: 'Use your local Claude SDK to find and apply a fix.' },
+        { label: 'Ask about it', hint: 'Open an interactive chat about this request.' },
+      ],
+      { message: 'What do you want to do?', defaultIndex: 0 },
+    );
+    if (action === 0) {
+      await offerFix({
+        log,
+        requestId,
+        cwd: debugRootDir || process.cwd(),
+        p,
+        CLI_NAME,
+        displayId,
+      });
+      skipChat = true;
+    }
+    // action === 1 ("Ask about it") falls through to the chat block
+    // below; nothing else to do here.
+  }
 
   // ── AI: ask via site server ──
   const askUrl = `${SITE_URL}/api/logs/${requestId}/ask`;
@@ -803,6 +1021,12 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question, source: 'cli' }),
     });
+    if (res.status === 410) {
+      const body = await res.json().catch(() => ({}));
+      const err = new Error('expired');
+      err.expired = body;
+      throw err;
+    }
     if (!res.ok) throw new Error(`Server error: ${res.status}`);
     const data = await res.json();
     return data.answer;
@@ -820,16 +1044,28 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
       console.log('');
       console.log(p.dim(`  Ask a follow-up: npx ${CLI_NAME} debug ${displayId} --ask "your question here"`));
       console.log('');
-    } catch {
-      console.log('  Could not generate a response.\n');
+    } catch (err) {
+      if (err && err.expired) {
+        const expBody = err.expired;
+        console.log(p.red(`\n  ✗ This request has expired (over 5 minutes old).\n`));
+        console.log(`  ${p.bold('Next:')} log in to ask about it on the dashboard:`);
+        console.log(`  ${p.cyan(expBody.dashboardUrl || `${SITE_URL}/logs/${requestId}`)}\n`);
+      } else {
+        console.log('  Could not generate a response.\n');
+      }
     }
-  } else if (isTTY) {
+  } else if (isTTY && !skipChat) {
     // ── Interactive chat mode ──
     const separator = dim('─'.repeat(72));
+    const claudeReady = hasClaude();
     console.log(separator);
     console.log(`  ${bold(cyan('Ask AI'))}  ${dim('Ask anything about this request in plain English')}`);
     console.log(`  ${dim('Examples: "why did this fail?" · "show me a working curl" · "what headers am I missing?"')}`);
-    console.log(`  ${dim('Type "exit" to quit.')}`);
+    if (claudeReady) {
+      console.log(`  ${dim('Type')} ${cyan('/fix')} ${dim('to have Claude apply a fix, or')} ${cyan('exit')} ${dim('to quit.')}`);
+    } else {
+      console.log(`  ${dim('Type "exit" to quit.')}`);
+    }
     console.log(separator);
     console.log('');
 
@@ -875,8 +1111,29 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     while (true) {
       const question = await chatAsk(`  ${bold(green('You ❯'))} `);
       if (!question || !question.trim()) continue;
-      if (question.trim().toLowerCase() === 'exit') {
+      const trimmedQ = question.trim();
+      const lowerQ = trimmedQ.toLowerCase();
+      if (lowerQ === 'exit') {
         console.log(`\n  ${dim('Goodbye!')}\n`);
+        break;
+      }
+      // Chat-mode shortcut: drop straight into the fix flow. Skips the
+      // need to exit, re-run, and re-pick "Fix it for me" from the top
+      // menu after the AI's answer has clarified what's wrong.
+      if (lowerQ === '/fix' || lowerQ === 'fix it') {
+        if (!claudeReady) {
+          console.log(`\n  ${red('✗')} ${dim('Claude CLI not installed; install it to use /fix.')}\n`);
+          continue;
+        }
+        console.log('');
+        await offerFix({
+          log,
+          requestId,
+          cwd: debugRootDir || process.cwd(),
+          p: { bold, dim, green, red, cyan },
+          CLI_NAME,
+          displayId,
+        });
         break;
       }
 
@@ -893,8 +1150,14 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
           console.log(`  ${cyan('✦')} ${line}`);
         }
         console.log('');
-      } catch {
+      } catch (err) {
         spinner.stop();
+        if (err && err.expired) {
+          const expBody = err.expired;
+          console.log(`\n  ${red('✗')} This request has expired (over 5 minutes old).`);
+          console.log(`  ${dim('Log in to keep going:')} ${cyan(expBody.dashboardUrl || `${SITE_URL}/logs/${requestId}`)}\n`);
+          break;
+        }
         console.log(`\n  ${red('✗')} Could not generate a response. Try again.\n`);
       }
     }
@@ -1016,7 +1279,386 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   console.log(`  details flow in on demand. To uninstall, just delete the file.`);
   console.log();
 
+} else if (command === 'update') {
+  // ── npx api update [projectId] ────────────────────────────────────
+  // Post-claim editor. Lets the user edit a handful of safe fields
+  // (name, base URL, visibility, request-id prefix) via the same
+  // input helpers the setup flow uses, then uploads the resulting
+  // `.restless/settings.json` blob to the site so the dashboard's
+  // "settings last synced" timestamp + any UI that reads from the
+  // blob stay current.
+  //
+  // The optional positional argument scopes the run to one project
+  // by its `projectId` so multi-API repos can skip the picker.
+  //
+  // Auth: hashes RESTLESS_KEY from .env and sends the digest to
+  // `POST /api/projects/<projectId>/sync`. First sync per project
+  // stamps `Project.writeKeyHash`; every later sync must match.
+  const cwd = process.cwd();
+  const { rootDir: updateRoot } = resolveProjectDirs(cwd);
+  const updateSettings = loadSettings(updateRoot);
+
+  if (!updateSettings.apis || updateSettings.apis.length === 0) {
+    console.log('');
+    console.log(red(`  ✗ No Restless project found in this directory.`));
+    console.log(dim(`  Looking in: ${updateRoot}/.restless/settings.json`));
+    console.log('');
+    console.log(`  Run ${cyan(`npx ${CLI_NAME} init`)} first to set one up.`);
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  // Optional positional arg: `npx api update <projectId>`. When
+  // present, we skip the picker - useful for multi-API repos where
+  // someone already knows which one they're editing (e.g. the
+  // dashboard's settings page deep-links a copy command with the
+  // project id baked in).
+  const requestedProjectId = process.argv[3];
+  let chosenApi;
+  if (requestedProjectId) {
+    chosenApi = updateSettings.apis.find((a) => a.projectId === requestedProjectId);
+    if (!chosenApi) {
+      console.log('');
+      console.log(red(`  ✗ No API with projectId ${cyan(requestedProjectId)} found in .restless/settings.json.`));
+      console.log('');
+      const known = updateSettings.apis
+        .filter((a) => a.projectId)
+        .map((a) => `    ${dim('•')} ${a.projectId} ${dim(`(${a.name || a.rootDir || a.id})`)}`);
+      if (known.length) {
+        console.log(dim('  Known project IDs in this workspace:'));
+        for (const line of known) console.log(line);
+        console.log('');
+      }
+      await debug.flushAndExit(1);
+    }
+  } else if (updateSettings.apis.length === 1) {
+    chosenApi = updateSettings.apis[0];
+  } else {
+    const labels = updateSettings.apis.map((a) => ({
+      label: a.name || a.rootDir || a.id || '(unnamed)',
+      hint: a.projectId ? dim(a.projectId) : '',
+    }));
+    const idx = await singleSelect(labels, {
+      message: 'Which API are you updating?',
+      defaultIndex: 0,
+    });
+    chosenApi = updateSettings.apis[idx];
+  }
+
+  if (!chosenApi?.projectId) {
+    console.log('');
+    console.log(red(`  ✗ That API has no projectId yet.`));
+    console.log(dim(`  Finish ${cyan(`npx ${CLI_NAME} init`)} first - the projectId is set during setup.`));
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  // Helper: clear the viewport + scrollback and reprint the logo +
+  // "Editing X / projectId" header. Called before every picker
+  // iteration so the screen doesn't accumulate stale renders from
+  // previous edits + sub-prompts. Same clear-home sequence the
+  // `init` flow uses between screens.
+  function repaintHeader() {
+    process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+    console.log('');
+    printLogo();
+    console.log('');
+    const projectName = chosenApi.name || chosenApi.rootDir || 'this project';
+    console.log(`  ${bold('Editing')} ${cyan(projectName)}`);
+    console.log(dim(`  ${chosenApi.projectId}`));
+    console.log('');
+  }
+
+  // ── Top-level menu ────────────────────────────────────────────────
+  // Two choices only - everything `update` does is either editing
+  // settings or refreshing the OAS. Ctrl-C bails at any prompt;
+  // there's no explicit "cancel" option.
+  repaintHeader();
+  const topChoice = await singleSelect(
+    [
+      { label: 'Update Settings', hint: 'Edit name, base URL, visibility, or request prefix' },
+      { label: 'Update OAS file', hint: 'Re-scan your routes (re-runs the setup OAS step)' },
+    ],
+    { message: 'What do you want to update?', defaultIndex: 0 },
+  );
+
+  if (topChoice === 1) {
+    console.log('');
+    console.log(`  ${yellow('!')} OpenAPI regeneration isn't wired into ${cyan('update')} yet.`);
+    console.log('');
+    console.log(`  For now, re-run ${cyan(`npx ${CLI_NAME} init`)} - it detects the existing`);
+    console.log(`  ${cyan('.restless/')} setup and walks the OAS step again without touching`);
+    console.log(`  your code.`);
+    console.log('');
+    await debug.flushAndExit(0);
+  }
+
+  // ── Field-editor flow ─────────────────────────────────────────────
+  // The picker IS the values panel - each row shows `label  value`
+  // so the user navigates up/down across fields and hits Enter to
+  // edit the highlighted one. Last row is "Done!" which exits the
+  // loop and continues to the sync. No Cancel - Ctrl-C from any
+  // prompt is the bail.
+  const REQUEST_PREFIX_RE = /^[A-Z0-9]{1,7}$/;
+
+  // Re-find the entry inside `updateSettings` so mutations
+  // propagate back into the structure we'll save + upload.
+  const apiEntry = updateSettings.apis.find((a) => a.projectId === chosenApi.projectId);
+
+  function visibilityOf(entry) {
+    // generate-oas writes either `internal: true` (internal API)
+    // or `internal: false` / unset (external/customer-facing).
+    return entry.internal === true ? 'Internal' : 'External';
+  }
+
+  function displayValue(value) {
+    if (value === undefined || value === null || value === '') return dim('—');
+    return String(value);
+  }
+
+  // Pad the label column so values line up. singleSelect prepends
+  // `❯ N. ` to each label - the padding is purely between our
+  // logical "label" and "value" within one row.
+  const LABEL_WIDTH = 'Request prefix'.length;
+  function row(label, value) {
+    const pad = ' '.repeat(LABEL_WIDTH - label.length);
+    return `${dim(label)}${pad}   ${value}`;
+  }
+
+  let lastIndex = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // Clear + reprint logo/header at the top of every loop tick so
+    // each round of editing starts on a fresh screen. Without this,
+    // sub-prompts (Visibility selector, inline input) leave their
+    // output above the next picker render and the terminal fills up
+    // with stale state.
+    repaintHeader();
+    const fieldChoice = await singleSelect(
+      [
+        { label: row('Name',           displayValue(apiEntry.name)) },
+        { label: row('Base URL',       displayValue(apiEntry.baseUrl)) },
+        { label: row('Visibility',     visibilityOf(apiEntry)) },
+        { label: row('Request prefix', displayValue(apiEntry.requestIdPrefix)) },
+        { label: bold(green('Done!')), hint: 'Save & sync to the dashboard' },
+      ],
+      { message: 'Use ↑↓ to navigate, Enter to edit:', defaultIndex: lastIndex },
+    );
+    lastIndex = fieldChoice;
+
+    if (fieldChoice === 4) break;       // Done! - save & sync
+
+    if (fieldChoice === 0) {
+      const next = (await ask(`  ${bold('Name')}: `, { defaultValue: apiEntry.name || '' })).trim();
+      if (next && next !== apiEntry.name) apiEntry.name = next;
+    } else if (fieldChoice === 1) {
+      const next = (await ask(`  ${bold('Base URL')}: `, { defaultValue: apiEntry.baseUrl || '' })).trim();
+      if (next && !/^https?:\/\//i.test(next)) {
+        console.log(red(`  ✗ Base URL must start with http:// or https://`));
+      } else if (next && next !== apiEntry.baseUrl) {
+        apiEntry.baseUrl = next;
+      }
+    } else if (fieldChoice === 2) {
+      const visIdx = await singleSelect(
+        [
+          { label: 'External', hint: 'Customer-facing - appears on the public docs.' },
+          { label: 'Internal', hint: 'Admin-only - hidden from the public docs.' },
+        ],
+        {
+          message: 'Visibility',
+          defaultIndex: apiEntry.internal === true ? 1 : 0,
+        },
+      );
+      apiEntry.internal = visIdx === 1;
+    } else if (fieldChoice === 3) {
+      const next = (await ask(
+        `  ${bold('Request prefix')} ${dim('(1-7 letters/digits)')}: `,
+        { defaultValue: apiEntry.requestIdPrefix || '' },
+      )).trim().toUpperCase();
+      if (next && !REQUEST_PREFIX_RE.test(next)) {
+        console.log(red(`  ✗ Prefix must be 1-7 uppercase letters or digits (e.g. TST).`));
+      } else if (next && next !== apiEntry.requestIdPrefix) {
+        apiEntry.requestIdPrefix = next;
+      }
+    }
+
+    // Persist after every successful edit so a Ctrl-C mid-flow
+    // doesn't throw away changes the user already confirmed.
+    saveSettings(updateRoot, updateSettings);
+  }
+
+  // Reload from disk so we send whatever's on disk now. Saves in the
+  // loop above already mirrored each edit, but reloading is the
+  // belt-and-suspenders move.
+  const freshSettings = loadSettings(updateRoot);
+
+  const projectIdForSync = chosenApi.projectId;
+
+  // ── Device-auth token cache (~/.restless/projects/<id>.json) ───
+  // Tokens are valid for 24h after browser approval, so a developer
+  // running `npx api update` repeatedly during the day only sees the
+  // browser once. We cache `{ token, expiresAt }` under the user's
+  // home dir (not the repo) so credentials never travel with code.
+  const credsDir = path.join(os.homedir(), '.restless', 'projects');
+  const credsFile = path.join(credsDir, `${projectIdForSync}.json`);
+  // 60s buffer so we don't try to use a token that's about to
+  // expire mid-request.
+  const CACHE_BUFFER_MS = 60 * 1000;
+  function loadCachedToken() {
+    try {
+      const raw = fs.readFileSync(credsFile, 'utf8');
+      const parsed = JSON.parse(raw);
+      const expiresAt = parsed?.expiresAt ? Date.parse(parsed.expiresAt) : 0;
+      if (typeof parsed?.token === 'string' && expiresAt - CACHE_BUFFER_MS > Date.now()) {
+        return { token: parsed.token, expiresAt };
+      }
+    } catch {}
+    return null;
+  }
+  function saveCachedToken(token, expiresAt) {
+    try {
+      fs.mkdirSync(credsDir, { recursive: true });
+      fs.writeFileSync(
+        credsFile,
+        JSON.stringify({ token, projectId: projectIdForSync, expiresAt }, null, 2) + '\n',
+        { mode: 0o600 },
+      );
+    } catch (err) {
+      // Non-fatal - we'll just re-do the browser dance next time.
+      console.log(dim(`  ! Couldn't cache CLI token at ${credsFile}: ${err.message}`));
+    }
+  }
+
+  // ── Device-auth handshake ──────────────────────────────────────
+  // Skipped if we have a cached token that's still valid.
+  let cliToken = loadCachedToken()?.token || null;
+
+  if (!cliToken) {
+    cliToken = crypto.randomBytes(32).toString('hex');
+    setupInProgress = false;
+
+    // Step 1: register the token + projectId on the site.
+    try {
+      const startRes = await fetch(`${SITE_URL}/api/auth/cli/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: cliToken, projectId: projectIdForSync }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!startRes.ok) {
+        const text = await startRes.text().catch(() => '');
+        console.log('');
+        console.log(red(`  ✗ Couldn't start CLI auth (HTTP ${startRes.status}).`));
+        if (text) console.log(dim(`    ${text.slice(0, 200)}`));
+        console.log('');
+        await debug.flushAndExit(1);
+      }
+    } catch (err) {
+      console.log('');
+      console.log(red(`  ✗ Couldn't reach ${SITE_URL}: ${err.message}`));
+      console.log('');
+      await debug.flushAndExit(1);
+    }
+
+    // Step 2: open the browser to /api/auth/cli?token=... and ask
+    // the user to approve. Print the URL too in case the browser
+    // didn't open (SSH session, headless dev container, etc.).
+    const authUrl = `${SITE_URL}/api/auth/cli?token=${cliToken}`;
+    console.log('');
+    console.log(`  ${bold('Authorize this CLI session in your browser.')}`);
+    console.log('');
+    console.log(`    ${cyan(authUrl)}`);
+    console.log('');
+    console.log(dim('  The session is good for 24 hours after you approve.'));
+    console.log('');
+    try {
+      if (process.platform === 'darwin') execSync(`open "${authUrl}"`, { stdio: 'ignore' });
+      else if (process.platform === 'win32') execSync(`start "" "${authUrl}"`, { stdio: 'ignore' });
+      else execSync(`xdg-open "${authUrl}"`, { stdio: 'ignore' });
+    } catch {
+      // Browser open is best-effort - the URL is already printed.
+    }
+
+    // Step 3: poll until approved (or token expires).
+    const pollSpinner = startSpinner('Waiting for approval');
+    const POLL_INTERVAL_MS = 2000;
+    const POLL_DEADLINE = Date.now() + 10 * 60 * 1000; // matches the 10m pending TTL on the server
+    let approvedExpiresAt = null;
+    while (Date.now() < POLL_DEADLINE) {
+      try {
+        const checkRes = await fetch(
+          `${SITE_URL}/api/auth/cli/check?token=${cliToken}`,
+          { cache: 'no-store' },
+        );
+        if (checkRes.status === 410) {
+          pollSpinner.stop();
+          console.log(red(`  ✗ The auth token expired before you approved it.`));
+          console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)}.`));
+          console.log('');
+          await debug.flushAndExit(1);
+        }
+        if (checkRes.ok) {
+          const data = await checkRes.json();
+          if (data.status === 'authorized') {
+            approvedExpiresAt = Date.parse(data.expiresAt);
+            break;
+          }
+        }
+      } catch {
+        // Network blip - keep polling within the deadline.
+      }
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    pollSpinner.stop();
+
+    if (!approvedExpiresAt) {
+      console.log(red(`  ✗ Timed out waiting for browser approval.`));
+      console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)} when you're ready.`));
+      console.log('');
+      await debug.flushAndExit(1);
+    }
+
+    saveCachedToken(cliToken, new Date(approvedExpiresAt).toISOString());
+    console.log(green(`  ✓ CLI authorized.`));
+  }
+
+  // ── Upload ─────────────────────────────────────────────────────
+  console.log('');
+  console.log(dim(`  Uploading settings to ${SITE_URL}...`));
+  try {
+    const res = await fetch(`${SITE_URL}/api/projects/${projectIdForSync}/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cliToken, settings: freshSettings }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 401) {
+      // Cached token went stale (server-side expiry doesn't always
+      // line up with our cache, e.g. if the admin revoked rows).
+      // Wipe the cache so the next run re-authorizes from scratch.
+      try { fs.unlinkSync(credsFile); } catch {}
+      console.log(red(`  ✗ Authorization expired or was revoked.`));
+      console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)} to re-authorize.`));
+      console.log('');
+      await debug.flushAndExit(1);
+    }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.log(red(`  ✗ Sync failed (HTTP ${res.status}).`));
+      if (errText) console.log(dim(`    ${errText.slice(0, 200)}`));
+      console.log('');
+      await debug.flushAndExit(1);
+    }
+    console.log(green(`  ✓ Settings synced.`));
+    console.log('');
+  } catch (err) {
+    console.log(red(`  ✗ Sync failed: ${err.message}`));
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  await debug.flushAndExit(0);
 } else {
   console.log(`Unknown command: ${command}`);
-  console.log(`Usage: ${CLI_NAME} init | clear | debug <request-id> | skill <docs-url>`);
+  console.log(`Usage: ${CLI_NAME} init | update | clear | debug <request-id> | skill <docs-url>`);
 }
