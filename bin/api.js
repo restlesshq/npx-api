@@ -253,6 +253,29 @@ function hasCodexAuth() {
   }
 }
 
+// The Cursor *agent* is `cursor-agent`, NOT `cursor` (which is the IDE
+// launcher). We must check the agent binary specifically.
+function hasCursor() {
+  try {
+    execSync('which cursor-agent', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Cursor stores its login under ~/.cursor/ after `cursor-agent login`; we also
+// accept CURSOR_API_KEY. Same rationale as hasCodexAuth: check artifacts on
+// disk instead of spawning the CLI just to validate auth.
+function hasCursorAuth() {
+  if (process.env.CURSOR_API_KEY) return true;
+  try {
+    return fs.existsSync(path.join(os.homedir(), '.cursor', 'cli-config.json'));
+  } catch {
+    return false;
+  }
+}
+
 
 const command = process.argv[2];
 
@@ -385,7 +408,8 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   console.log('');
   const claudeInstalled = hasClaude();
   const codexInstalled = hasCodex();
-  console.log(`  We use your local AI tooling (Claude or Codex) to set up the project.`);
+  const cursorInstalled = hasCursor();
+  console.log(`  We use your local AI tooling (Claude, Codex, or Cursor) to set up the project.`);
   console.log(`  None of your code is ever seen by us. The AI runs on your machine and`);
   console.log(`  talks to our SDKs directly. We won't upload anything to our servers`);
   console.log(`  without checking with you first.`);
@@ -394,10 +418,12 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     ? `Claude ${dim('(Recommended)')}`
     : `${dim('Claude (Recommended)')}`;
   const codexLabel = codexInstalled ? 'Codex' : dim('Codex');
+  const cursorLabel = cursorInstalled ? 'Cursor' : dim('Cursor');
   const choice = await singleSelect(
     [
       { label: claudeLabel, hint: claudeInstalled ? 'Use Claude Code running locally on your machine.' : "Claude Code isn't installed - we'll show you how." },
       { label: codexLabel, hint: codexInstalled ? 'Use the Codex CLI running locally on your machine.' : "Codex isn't installed - we'll show you how." },
+      { label: cursorLabel, hint: cursorInstalled ? 'Use the Cursor agent (cursor-agent) running locally on your machine.' : "Cursor isn't installed - we'll show you how." },
       { label: 'Manual install', hint: "We'll book a quick call so we can pair on it together." },
       { label: 'Learn more', hint: "Read about how setup works and what we touch before deciding." },
     ],
@@ -407,7 +433,7 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // Clear the viewport so after-selection stuff starts clean at the top.
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
 
-  if (choice === 3) {
+  if (choice === 4) {
     // "Learn more" - explain how it works
     console.log('');
     console.log(`  ${bold('What this does')}`);
@@ -422,8 +448,8 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     console.log('');
     console.log(`  ${bold('How we keep it safe')}`);
     console.log('');
-    console.log(`  ${green('1.')} ${bold('Your code never leaves your machine.')} Scanning is done by Claude or`);
-    console.log(`     Codex running locally via the CLI you already have installed. We don't`);
+    console.log(`  ${green('1.')} ${bold('Your code never leaves your machine.')} Scanning is done by Claude,`);
+    console.log(`     Codex, or Cursor running locally via the CLI you already have installed. We don't`);
     console.log(`     proxy it, upload it, or see any of it.`);
     console.log('');
     console.log(`  ${green('2.')} ${bold('We handle the fiddly bits.')} Framework-specific middleware placement,`);
@@ -469,13 +495,36 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     await debug.flushAndExit(1);
   }
 
+  if (choice === 2 && !cursorInstalled) {
+    console.log('');
+    console.log(red('  ✗ Cursor is not installed.\n'));
+    console.log('  Install it with:');
+    console.log(cyan('    curl https://cursor.com/install -fsS | bash'));
+    console.log('');
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} init`)}.\n`);
+    await debug.flushAndExit(1);
+  }
+
+  if (choice === 2 && !hasCursorAuth()) {
+    console.log('');
+    console.log(red("  ✗ Cursor isn't logged in.\n"));
+    console.log('  Sign in with:');
+    console.log(cyan('    cursor-agent login'));
+    console.log('');
+    console.log(`  ${dim(`Or set ${cyan('CURSOR_API_KEY')}${'\x1b[2m'} in your env.`)}`);
+    console.log('');
+    console.log(`  Then rerun ${cyan(`npx ${CLI_NAME} init`)}.\n`);
+    await debug.flushAndExit(1);
+  }
+
   // Pick the AI provider before any step calls runAI(). Manual / Learn-more
   // never reach here.
   if (choice === 0) setProvider('claude');
   else if (choice === 1) setProvider('codex');
+  else if (choice === 2) setProvider('cursor');
 
   // Manual: not supported yet - punt to Calendly so they can talk to a human.
-  if (choice === 2) {
+  if (choice === 3) {
     const { execSync } = await import('child_process');
     console.log('');
     console.log(`  We don't support a manual setup currently, but book time with a`);
@@ -518,7 +567,7 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     rootDir,
     update: plan.makeUpdater(0),
     setSpinner,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+    aiTool: ['Claude Code', 'Codex', 'Cursor'][choice] || 'Claude Code',
     existingOas: hasOas,
   });
 
@@ -540,7 +589,7 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     apiDir: resolveApiDir(packageDir, oasResult.apiRootDir),
     language: oasResult.detectedLanguage,
     framework: oasResult.detectedFramework,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+    aiTool: ['Claude Code', 'Codex', 'Cursor'][choice] || 'Claude Code',
   });
   debug.log('setup-context', redactSetupContext(ctx));
 
@@ -732,13 +781,23 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   } else {
     const claudeOk = hasClaude();
     const codexOk = hasCodex() && hasCodexAuth();
-    if (!claudeOk && !codexOk) {
+    const cursorOk = hasCursor() && hasCursorAuth();
+    // Priority order: Claude, then Codex, then Cursor - pick the first one
+    // that's installed and authed.
+    const picked = claudeOk
+      ? { name: 'claude', label: 'Claude' }
+      : codexOk
+        ? { name: 'codex', label: 'Codex' }
+        : cursorOk
+          ? { name: 'cursor', label: 'Cursor' }
+          : null;
+    if (!picked) {
       console.log(yellow('  ! No AI tool available - skipped source cleanup. References remain in:'));
       for (const f of sdkFiles) console.log(dim(`      ${f}`));
     } else {
-      setProvider(claudeOk ? 'claude' : 'codex');
+      setProvider(picked.name);
       console.log('');
-      console.log(`  ${dim('Asking')} ${cyan(claudeOk ? 'Claude' : 'Codex')} ${dim('to strip SDK setup code from your source...')}`);
+      console.log(`  ${dim('Asking')} ${cyan(picked.label)} ${dim('to strip SDK setup code from your source...')}`);
       try {
         const prompt = loadPrompt('remove-sdk', {
           files: sdkFiles.map((f) => `- ${f}`).join('\n'),
