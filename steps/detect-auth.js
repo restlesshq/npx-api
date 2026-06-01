@@ -1,5 +1,6 @@
 import { runAI, loadPrompt } from '../lib/ai.js';
 import { loadSettings, saveSettings, upsertApi } from '../lib/settings.js';
+import { extractJson } from '../lib/extract-json.js';
 import { bold, dim, green } from '../lib/ui.js';
 
 /**
@@ -25,9 +26,8 @@ export default async function detectAuth({ packageDir, rootDir, apiId, apiName, 
   let detected = { headers: [], queryParams: [], bodyKeys: [] };
   try {
     const result = await runAI(prompt, packageDir, { setSpinner });
-    const jsonMatch = result.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[1]);
+    const parsed = extractJson(result, { requireKey: 'headers' });
+    if (parsed) {
       detected = {
         headers: Array.isArray(parsed.headers) ? parsed.headers : [],
         queryParams: Array.isArray(parsed.queryParams) ? parsed.queryParams : [],

@@ -11,10 +11,19 @@ function truncate(s, max) {
   return s.length > max ? s.slice(0, max) + `…(+${s.length - max} chars)` : s;
 }
 
+// Codex runs commands through a login shell, so `command` arrives as something
+// like `/bin/zsh -lc 'npm install foo'`. Peel off the wrapper so phase
+// detection (npm/curl/etc.) sees the real command, not the shell harness.
+function unwrapShell(cmd) {
+  const s = Array.isArray(cmd) ? cmd.join(' ') : String(cmd || '');
+  const m = s.match(/-l?c\s+'([\s\S]*)'\s*$/) || s.match(/-l?c\s+"([\s\S]*)"\s*$/);
+  return m ? m[1] : s;
+}
+
 // Match the phase taxonomy used by claude.js so the spinner reads the same
 // regardless of which agent is actually running underneath.
 function describeExec(rawCommand) {
-  const raw = (Array.isArray(rawCommand) ? rawCommand.join(' ') : String(rawCommand || ''))
+  const raw = unwrapShell(rawCommand)
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
@@ -30,12 +39,12 @@ function describeExec(rawCommand) {
   };
 }
 
-function describePatch(changes) {
-  const paths = Object.keys(changes || {});
-  const first = paths[0] || 'file';
+function describePatch(paths) {
+  const list = Array.isArray(paths) ? paths : [];
+  const first = list[0] || 'file';
   return {
     phase: 'Editing files',
-    detail: paths.length > 1 ? `Edit ${first} (+${paths.length - 1} more)` : `Edit ${first}`,
+    detail: list.length > 1 ? `Edit ${first} (+${list.length - 1} more)` : `Edit ${first}`,
   };
 }
 
@@ -43,13 +52,27 @@ export default {
   name: 'codex',
 
   async run(prompt, cwd, { onStatus } = {}) {
-    let result = '';
     // Mirrors the claude.js mutation counter so debug logs from either
     // provider answer "did the AI actually write?" the same way. Codex
-    // batches edits per `patch_apply_begin`; we count files touched, not
-    // patch events, so a single patch over 3 files counts as 3.
+    // reports each edited file as a `file_change` item; we count files
+    // touched, not change events, so a single patch over 3 files counts as 3.
     let mutations = 0;
     let execs = 0;
+
+    // New thread/turn/item protocol (codex-cli >= ~0.30): the assistant's
+    // text arrives as `agent_message` items, often several per run. Keep the
+    // latest text per item id (so a streamed item.updated -> item.completed
+    // pair doesn't double-count) and join in arrival order at the end.
+    const textById = new Map();
+    // Dedupe action items across their started+completed lifecycle so the
+    // exec / mutation counters fire exactly once per item.
+    const countedActions = new Set();
+    // Legacy fallback buffers for older codex builds that still emit the flat
+    // agent_message / exec_command_begin protocol. `legacyFinal` wins over the
+    // accumulated deltas so we never double up the same text.
+    let legacyDeltas = '';
+    let legacyFinal = '';
+
     debug.log('ai.run.start', {
       provider: 'codex',
       cwd,
@@ -59,11 +82,22 @@ export default {
 
     return new Promise((resolve, reject) => {
       // `codex exec --json` runs non-interactively and streams newline-delimited
-      // protocol events on stdout. `--full-auto` = workspace-write sandbox with
-      // on-failure approvals, the closest match to how we run Claude here. We
-      // pass the prompt through stdin so multi-line prompts (which most of
+      // protocol events on stdout. `--sandbox workspace-write` confines writes to
+      // the workspace (replaces the deprecated `--full-auto`, which now just warns
+      // and will eventually be removed). `--skip-git-repo-check` stops Codex from
+      // refusing to run in a directory it doesn't recognize as a trusted git repo.
+      // The prompt goes in via stdin (`-`) so multi-line prompts (which most of
       // ours are) don't get mangled by the shell.
-      const args = ['exec', '--json', '--full-auto', '-C', cwd, '-'];
+      const args = [
+        'exec',
+        '--json',
+        '--sandbox',
+        'workspace-write',
+        '--skip-git-repo-check',
+        '-C',
+        cwd,
+        '-',
+      ];
       let child;
       try {
         child = spawn('codex', args, {
@@ -111,6 +145,9 @@ export default {
       });
 
       child.on('close', (code) => {
+        // Assistant text from the new protocol, then the legacy fallback. Only
+        // one path is ever populated in a given run, so the concat is safe.
+        const result = ([...textById.values()].join('\n') + (legacyFinal || legacyDeltas)).trim();
         debug.log('ai.run.end', {
           provider: 'codex',
           resultChars: result.length,
@@ -132,20 +169,102 @@ export default {
         resolve(result);
       });
 
+      // Handle one `item` payload from an item.started / item.updated /
+      // item.completed event. Items carry their own `type`; we care about the
+      // assistant text and the two activity kinds (commands, file edits).
+      function handleItem(item) {
+        if (!item || typeof item !== 'object') return;
+        const id = item.id;
+        switch (item.type) {
+          case 'agent_message': {
+            if (typeof item.text === 'string') {
+              const key = id ?? `msg_${textById.size}`;
+              const isNew = !textById.has(key);
+              textById.set(key, item.text);
+              onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
+              // Log once per message so streamed updates don't spam the log.
+              if (isNew) debug.log('ai.text', { text: truncate(item.text, MAX_AI_TEXT) });
+            }
+            break;
+          }
+          case 'reasoning':
+            onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
+            break;
+          case 'command_execution': {
+            const key = id ?? `cmd_${execs}`;
+            if (!countedActions.has(key)) {
+              countedActions.add(key);
+              execs++;
+              onStatus?.(describeExec(item.command));
+              debug.log('ai.tool_use', {
+                tool: 'Bash',
+                input: { command: truncate(unwrapShell(item.command), MAX_TOOL_INPUT_FIELD) },
+              });
+            }
+            break;
+          }
+          case 'file_change': {
+            const key = id ?? `patch_${mutations}`;
+            if (!countedActions.has(key)) {
+              countedActions.add(key);
+              const paths = Array.isArray(item.changes) ? item.changes.map((c) => c.path) : [];
+              mutations += paths.length;
+              onStatus?.(describePatch(paths));
+              debug.log('ai.tool_use', { tool: 'Patch', input: { paths } });
+            }
+            break;
+          }
+          case 'mcp_tool_call':
+            onStatus?.({ phase: 'Working', detail: item.server || item.tool || 'Tool call' });
+            break;
+          default:
+            // Unrecognized item - log so we can extend the mapping if a new
+            // item type appears in a future Codex release.
+            debug.log('ai.item', { type: item.type });
+        }
+      }
+
       function handleEvent(evt) {
-        // Codex protocol events look like { id, msg: { type, ... } }. Older
-        // releases used a flatter shape, so accept either.
+        // Older codex releases used a flatter `{ msg: { type } }` shape; accept
+        // either so both protocol generations flow through one path.
         const type = evt.msg?.type ?? evt.type;
         const data = evt.msg ?? evt;
         if (!type) return;
 
+        // ── New thread/turn/item protocol ──────────────────────────────────
+        if (type === 'item.started' || type === 'item.updated' || type === 'item.completed') {
+          handleItem(data.item);
+          return;
+        }
+        if (type === 'thread.started' || type === 'turn.started') {
+          onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
+          return;
+        }
+        if (type === 'turn.completed' || type === 'thread.completed') return;
+        if (type === 'turn.failed' || type === 'thread.error') {
+          // Don't reject - the process exit code is the source of truth for
+          // whether the run actually failed.
+          debug.log('ai.error', { message: truncate(JSON.stringify(data), 500) });
+          return;
+        }
+
+        // ── Legacy flat protocol (older codex installs) ────────────────────
         switch (type) {
-          case 'agent_message_delta':
-          case 'agent_message': {
-            const text = data.delta ?? data.message ?? '';
-            if (text) result += text;
+          case 'agent_message_delta': {
+            const text = data.delta ?? '';
+            if (text) legacyDeltas += text;
             onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
-            if (text) debug.log('ai.text', { text: truncate(text, MAX_AI_TEXT) });
+            break;
+          }
+          case 'agent_message': {
+            // Terminal message carries the complete text; prefer it over the
+            // accumulated deltas rather than appending on top of them.
+            const text = data.message ?? '';
+            if (text) {
+              legacyFinal = text;
+              debug.log('ai.text', { text: truncate(text, MAX_AI_TEXT) });
+            }
+            onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
             break;
           }
           case 'agent_reasoning_delta':
@@ -162,7 +281,7 @@ export default {
           case 'patch_apply_begin': {
             const paths = Object.keys(data.changes || {});
             mutations += paths.length;
-            onStatus?.(describePatch(data.changes));
+            onStatus?.(describePatch(paths));
             debug.log('ai.tool_use', { tool: 'Patch', input: { paths } });
             break;
           }
@@ -170,8 +289,6 @@ export default {
             onStatus?.({ phase: 'Working', detail: data.tool || data.server || 'Tool call' });
             break;
           case 'error':
-            // Don't reject - Codex sometimes recovers within a turn. The
-            // process exit code will tell us if the run actually failed.
             debug.log('ai.error', { message: truncate(data.message || JSON.stringify(data), 500) });
             break;
           default:
