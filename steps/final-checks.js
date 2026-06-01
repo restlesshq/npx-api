@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { bold, dim, green, yellow, red, cyan, ask, askYesNo, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, yellow, red, cyan, orange, ask, askYesNo, waitForKey } from '../lib/ui.js';
 import { loadSettings } from '../lib/settings.js';
 import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
@@ -387,7 +387,7 @@ async function repairOldApi({ ctx, sourceFile, update, setSpinner, subIndex, pre
 
   update({ activeSub: subIndex, sub: prevSubs, message: [
     ...baseMessage,
-    `  Asking ${cyan(aiTool)} to rewrite the call site to the new factory API.`,
+    `  Asking ${orange(aiTool)} to rewrite the call site to the new factory API.`,
     dim('  It edits only the SDK setup block; the callback body is preserved.'),
   ]});
 
@@ -420,7 +420,7 @@ async function repairOwnerId({ ctx, sourceFile, writer, update, setSpinner, subI
 
   update({ activeSub: subIndex, sub: prevSubs, message: [
     ...baseMessage,
-    `  Asking ${cyan(aiTool)} to look again for a stable tenant or user id.`,
+    `  Asking ${orange(aiTool)} to look again for a stable tenant or user id.`,
     dim('  It re-scans your codebase and patches only the owner.id line.'),
   ]});
 

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { runAI, loadPrompt } from '../lib/ai.js';
-import { bold, dim, green, red, yellow, cyan, ask, singleSelect, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, orange, ask, singleSelect, waitForKey } from '../lib/ui.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/settings.js';
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
@@ -271,14 +271,14 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       {
         label: "What we'll do",
         body:
-          `Point ${cyan(aiTool)} (running locally on your machine) at\n` +
+          `Point ${orange(aiTool)} (running locally on your machine) at\n` +
           `your codebase, find your routes, and write an OAS file. It lands in a new\n` +
           `${bold('.restless/')} folder, commit that along with your code, it's meant to live there.`,
       },
       {
         label: 'Privacy',
         body:
-          `Scanning runs entirely on your machine via your own ${cyan(aiTool)}\n` +
+          `Scanning runs entirely on your machine via your own ${orange(aiTool)}\n` +
           `install. We don't see a single line of your code, and nothing gets sent to\n` +
           `our servers at this step.`,
       },

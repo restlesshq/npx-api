@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { runAI, loadPrompt } from '../lib/ai.js';
-import { bold, dim, green, yellow, cyan } from '../lib/ui.js';
+import { bold, dim, green, yellow, cyan, orange } from '../lib/ui.js';
 import * as debug from '../lib/debug.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
@@ -84,7 +84,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
 
   update({ message: [
     `  Verifying ${bold('owner.id')} is a stable, immutable identifier.`,
-    dim(`  ${cyan(aiTool)} is tracing the data flow and checking your schema. This is a security check.`),
+    dim(`  ${orange(aiTool)} is tracing the data flow and checking your schema. This is a security check.`),
   ]});
 
   const prompt = loadPrompt('verify-owner-id', {
@@ -97,7 +97,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
   } catch (err) {
     debug.log('verify-owner-id.ai-error', { message: err.message });
     update({ message: [
-      `  ${yellow('⚠')} ${cyan(aiTool)} couldn't complete the verification pass: ${err.message}`,
+      `  ${yellow('⚠')} ${orange(aiTool)} couldn't complete the verification pass: ${err.message}`,
       dim('  Continuing to final checks - the static check will still run.'),
     ]});
     return { ran: true, reason: 'ai-error' };
@@ -121,7 +121,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
     ]});
   } else if (downgraded) {
     update({ message: [
-      `  ${yellow('⚠')} ${cyan(aiTool)} couldn't confirm the previous ${bold('owner.id')} (${cyan(fields.ownerIdExpr || '(none)')}) is safe.`,
+      `  ${yellow('⚠')} ${orange(aiTool)} couldn't confirm the previous ${bold('owner.id')} (${cyan(fields.ownerIdExpr || '(none)')}) is safe.`,
       dim('  It rewrote the field to the configuration sentinel; final-checks will prompt you to pick one.'),
     ]});
   } else if (changed) {
