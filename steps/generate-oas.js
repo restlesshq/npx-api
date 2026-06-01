@@ -7,6 +7,7 @@ import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/se
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
 import { findEndpoints } from '../lib/find-endpoints.js';
+import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
 import { parseOas } from '../lib/oas-parse.js';
 import { loadOas } from '../lib/oas-auth.js';
@@ -128,12 +129,9 @@ async function pickTestCurl({ oasFullPath, baseUrl, packageDir, setSpinner }) {
       packageDir,
       { setSpinner },
     );
-    const jsonMatch = result.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[1]);
-      if (Number.isInteger(parsed.index) && parsed.index >= 0 && parsed.index < candidates.length) {
-        pick = parsed.index;
-      }
+    const parsed = extractJson(result, { requireKey: 'index' });
+    if (parsed && Number.isInteger(parsed.index) && parsed.index >= 0 && parsed.index < candidates.length) {
+      pick = parsed.index;
     }
   } catch {}
 
@@ -161,14 +159,8 @@ async function locateApis({ packageDir, setSpinner, hint = '' }) {
     : '';
   const prompt = loadPrompt('detect-endpoints', { findingsSection, hintSection });
   const result = await runAI(prompt, packageDir, { setSpinner });
-  try {
-    const jsonMatch = result.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[1]);
-      return parsed.apis || [];
-    }
-  } catch {}
-  return [];
+  const parsed = extractJson(result, { requireKey: 'apis' });
+  return parsed?.apis || [];
 }
 
 /**
