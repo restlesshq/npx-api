@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, orange, ask, askYesNo, startSpinner, singleSelect, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
@@ -291,31 +291,32 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // Swap `spinnerStyle` to try: arc, halfcircle, piefill, pulse, sparkle, concentric, braille
   const spinnerStyle = 'concentric';
 
-  await typeOut(`  Restless makes sure every `);
+  await typeOut(white(`  Restless makes sure every `));
   await inlineStatus({ code: '400 Bad Request', success: false, style: spinnerStyle });
-  await typeOut(` turns out `);
+  await typeOut(white(` turns out `));
   await inlineStatus({ code: '200 Okay', success: true, style: spinnerStyle });
-  await typeLine(`.`);
+  await typeLine(white(`.`));
   console.log('');
 
-  await typeLine(`  It's not just another observability platform (although you can use it`);
-  await typeLine(`  to see what your users are up to!).`);
+  await typeLine(muted(`  It's not just another observability platform (although you can use it`), { delay: 11 });
+  await typeLine(muted(`  to see what your users are up to!).`), { delay: 11 });
   console.log('');
-  await typeLine(`  Think of us more as an API success platform. We give humans, AI and`);
-  await typeLine(`  you the tools to quickly make successful calls.`);
+  await typeLine(muted(`  Think of us more as an API success platform. We give humans, AI and`), { delay: 11 });
+  await typeLine(muted(`  you the tools to quickly make successful calls.`), { delay: 11 });
   console.log('');
-  await typeLine(`  ${bold(yellow('Ready to supercharge your API?'))}`);
+  await typeLine(`  ${bold('Ready to supercharge your API?')}`);
   console.log('');
 
-  // Boxed CTA: the focal point of the welcome. The ▸ inside pulses while
+  // Boxed CTA: the focal point of the welcome. The trailing ⏎ pulses while
   // we wait for input, so we hide the native blinking cursor - one cue
-  // instead of two.
+  // instead of two. Box, label, and ⏎ all use the brand blue so the
+  // call to action ties back to the logo.
   const ctaText = 'Press ENTER to get started';
-  const boxBody = `  ▸  ${ctaText}  `;
+  const boxBody = `  ${ctaText}  ⏎  `;
   const w = boxBody.length;
-  console.log(`  ${dim('╭' + '─'.repeat(w) + '╮')}`);
-  console.log(`  ${dim('│')}  ${green('▸')}  ${green(ctaText)}  ${dim('│')}`);
-  console.log(`  ${dim('╰' + '─'.repeat(w) + '╯')}`);
+  console.log(`  ${brand('╭' + '─'.repeat(w) + '╮')}`);
+  console.log(`  ${brand('│')}  ${brand(ctaText)}  ${brand('⏎')}  ${brand('│')}`);
+  console.log(`  ${brand('╰' + '─'.repeat(w) + '╯')}`);
   console.log('');
   console.log(`  ${dim("We use AI for the setup, but we'll ask permission before we do anything.")}`);
   console.log(`  ${dim(`Press [${bold('d')}${'\x1b[2m'}] to try this on a demo repo · Press [${bold('h')}${'\x1b[2m'}] to set up time with a human`)}`);
@@ -323,14 +324,16 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   process.stdout.write('\x1b[?25l'); // hide terminal cursor while we own the screen
   process.stdout.write('\x1b7');     // save current row as the home position for the animation
 
-  // Pulse: dim → green → bold green → green, repeat. Cycles through ~1.1s.
-  // Arrow lives 5 rows above the saved cursor (3 box rows + blank + 2 dim
-  // copy rows), at column 6 inside the box.
-  const arrowFrames = [dim('▸'), green('▸'), bold(green('▸')), green('▸')];
-  let arrowFrame = 0;
+  // Pulse: dim → blue → bold blue → blue, repeat. Cycles through ~1.1s.
+  // The ⏎ lives 5 rows above the saved cursor (3 box rows + blank + 2 dim
+  // copy rows). Its column is the box content offset: 2 indent + 1 border +
+  // 2 pad + label + 2 pad = ctaText.length + 8.
+  const iconCol = ctaText.length + 8;
+  const enterFrames = [dim('⏎'), brand('⏎'), bold(brand('⏎')), brand('⏎')];
+  let enterFrame = 0;
   const arrowInterval = setInterval(() => {
-    arrowFrame = (arrowFrame + 1) % arrowFrames.length;
-    process.stdout.write('\x1b8\x1b[5A\x1b[6G' + arrowFrames[arrowFrame] + '\x1b8');
+    enterFrame = (enterFrame + 1) % enterFrames.length;
+    process.stdout.write(`\x1b8\x1b[5A\x1b[${iconCol}G` + enterFrames[enterFrame] + '\x1b8');
   }, 280);
 
   let welcomeKey;
@@ -1394,11 +1397,12 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   }
 
   // ── Field-editor flow ─────────────────────────────────────────────
-  // The picker IS the values panel - each row shows `label  value`
-  // so the user navigates up/down across fields and hits Enter to
-  // edit the highlighted one. Last row is "Done!" which exits the
-  // loop and continues to the sync. No Cancel - Ctrl-C from any
-  // prompt is the bail.
+  // Each picker row is a field with its current value; navigating to
+  // one and pressing Enter opens an inline editor. Submit (distinct
+  // from the field rows) ends the loop and continues to the sync.
+  // Chat lets the developer describe a change in plain English; we
+  // hand the message + current settings to the AI provider and apply
+  // whatever JSON patch comes back, after a y/n confirm.
   const REQUEST_PREFIX_RE = /^[A-Z0-9]{1,7}$/;
 
   // Re-find the entry inside `updateSettings` so mutations
@@ -1416,13 +1420,133 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     return String(value);
   }
 
-  // Pad the label column so values line up. singleSelect prepends
-  // `❯ N. ` to each label - the padding is purely between our
-  // logical "label" and "value" within one row.
-  const LABEL_WIDTH = 'Request prefix'.length;
-  function row(label, value) {
-    const pad = ' '.repeat(LABEL_WIDTH - label.length);
-    return `${dim(label)}${pad}   ${value}`;
+  // Best-effort extraction of a single JSON object from a model
+  // response. Tolerates ```json fences, leading prose, trailing prose.
+  function parseJsonBlock(text) {
+    if (typeof text !== 'string') return null;
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const raw = fenced ? fenced[1] : text;
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    try { return JSON.parse(raw.slice(start, end + 1)); } catch { return null; }
+  }
+
+  // Validate a single proposed field value. Returns an error string
+  // or null on success. Keeps validation co-located with the field
+  // list so the AI path and the manual path can't diverge.
+  function validateChange(key, value) {
+    if (key === 'name') {
+      if (typeof value !== 'string' || !value.trim()) return 'name must be a non-empty string';
+      return null;
+    }
+    if (key === 'baseUrl') {
+      if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return 'baseUrl must start with http:// or https://';
+      return null;
+    }
+    if (key === 'internal') {
+      if (typeof value !== 'boolean') return 'internal must be a boolean';
+      return null;
+    }
+    if (key === 'requestIdPrefix') {
+      if (typeof value !== 'string' || !REQUEST_PREFIX_RE.test(value)) return 'requestIdPrefix must be 1-7 uppercase letters or digits';
+      return null;
+    }
+    return `unknown field "${key}"`;
+  }
+
+  // AI-driven edit path. The user types a sentence; we ship the
+  // editable subset of settings + their message to the provider and
+  // expect a JSON patch back. The patch is validated, diffed, and
+  // only applied after an explicit y/n.
+  async function chatEdit() {
+    console.log('');
+    const msg = (await ask(
+      `  ${bold('What do you want to change?')} ${dim('(blank to cancel)')}\n  > `,
+    )).trim();
+    if (!msg) return;
+
+    const view = {
+      name: apiEntry.name ?? null,
+      baseUrl: apiEntry.baseUrl ?? null,
+      internal: apiEntry.internal === true,
+      requestIdPrefix: apiEntry.requestIdPrefix ?? null,
+    };
+    const prompt = loadPrompt('update-settings-chat', {
+      currentSettings: JSON.stringify(view, null, 2),
+      userMessage: msg,
+    });
+
+    let raw;
+    try {
+      raw = await runAI(prompt, updateRoot);
+    } catch (err) {
+      console.log('');
+      console.log(red(`  ✗ Couldn't reach the AI: ${err.message}`));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+
+    const parsed = parseJsonBlock(raw);
+    if (!parsed) {
+      console.log('');
+      console.log(red(`  ✗ The AI didn't return a JSON patch. Try rephrasing.`));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+    if (parsed.error) {
+      console.log('');
+      console.log(yellow(`  ! ${parsed.error}`));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+
+    const changes = parsed.changes && typeof parsed.changes === 'object' ? parsed.changes : {};
+    const violations = [];
+    for (const [k, v] of Object.entries(changes)) {
+      const err = validateChange(k, v);
+      if (err) violations.push(err);
+    }
+    if (violations.length) {
+      console.log('');
+      console.log(red(`  ✗ Proposed change is invalid:`));
+      for (const v of violations) console.log(red(`    · ${v}`));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+
+    const keys = Object.keys(changes);
+    if (keys.length === 0) {
+      console.log('');
+      console.log(yellow(`  ! No changes proposed. ${parsed.summary || ''}`));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+
+    console.log('');
+    if (parsed.summary) console.log(`  ${bold(parsed.summary)}`);
+    console.log('');
+    for (const k of keys) {
+      const before = displayValue(apiEntry[k]);
+      const after = displayValue(changes[k]);
+      console.log(`    ${dim(k.padEnd(16))} ${before}  ${green('→')}  ${green(after)}`);
+    }
+    console.log('');
+    const ok = await askYesNo(`  Apply these changes? ${dim('(Y/n) ')}`, { defaultValue: true });
+    if (!ok) {
+      console.log(dim('  Skipped.'));
+      console.log(dim('  Press any key to continue.'));
+      await waitForKey();
+      return;
+    }
+
+    for (const k of keys) apiEntry[k] = changes[k];
+    saveSettings(updateRoot, updateSettings);
   }
 
   let lastIndex = 0;
@@ -1434,19 +1558,36 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
     // output above the next picker render and the terminal fills up
     // with stale state.
     repaintHeader();
-    const fieldChoice = await singleSelect(
+    const result = await actionPicker(
       [
-        { label: row('Name',           displayValue(apiEntry.name)) },
-        { label: row('Base URL',       displayValue(apiEntry.baseUrl)) },
-        { label: row('Visibility',     visibilityOf(apiEntry)) },
-        { label: row('Request prefix', displayValue(apiEntry.requestIdPrefix)) },
-        { label: bold(green('Done!')), hint: 'Save & sync to the dashboard' },
+        { label: 'Name',           value: apiEntry.name },
+        { label: 'Base URL',       value: apiEntry.baseUrl },
+        { label: 'Visibility',     value: visibilityOf(apiEntry) },
+        { label: 'Request prefix', value: apiEntry.requestIdPrefix },
       ],
-      { message: 'Use ↑↓ to navigate, Enter to edit:', defaultIndex: lastIndex },
+      {
+        message: 'Use ↑↓ to navigate, Enter to edit:',
+        actions: [
+          { key: 'submit', label: 'Submit',          hint: 'Save & sync to the dashboard.', primary: true },
+          { key: 'chat',   label: 'Chat about this', afterthought: true },
+        ],
+        defaultIndex: lastIndex,
+      },
     );
-    lastIndex = fieldChoice;
 
-    if (fieldChoice === 4) break;       // Done! - save & sync
+    if (result.kind === 'action') {
+      if (result.key === 'submit') break;
+      if (result.key === 'chat') {
+        await chatEdit();
+        // Park the cursor on Chat for follow-up edits. Indices:
+        // 0-3 are fields, 4 is Submit, 5 is Chat.
+        lastIndex = 5;
+        continue;
+      }
+    }
+
+    lastIndex = result.index;
+    const fieldChoice = result.index;
 
     if (fieldChoice === 0) {
       const next = (await ask(`  ${bold('Name')}: `, { defaultValue: apiEntry.name || '' })).trim();
