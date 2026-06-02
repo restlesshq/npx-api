@@ -65,7 +65,15 @@ The exact comment marker `RESTLESS_OWNER_ID_TODO` and the literal placeholder `'
 
 ### `owner.enrich`
 
-`enrich` lives **inside `owner`** and runs once per id (the SDK caches by id). It receives the id as its only argument. Use it for any lookup expensive enough to skip on every request (DB query, JWT verification, external HTTP). Return fields flat:
+Resolving owner display info (`label`, `email`) is expected, not optional - a bare `owner.id` is an opaque identifier on the dashboard. Resolve it from the same owner entity you used for `id`, in this order:
+
+**1. Already on the request?** Set the fields inline - don't pay for a lookup you don't need:
+
+```js
+owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email }
+```
+
+**2. Needs a lookup?** Put `enrich` **inside `owner`**. It runs once per id (the SDK caches by id) and receives the id as its only argument. Reuse the project's own data-access pattern - read how the codebase queries that entity and mirror it, rather than inventing an ORM it doesn't use. Return fields flat:
 
 ```js
 owner: {
@@ -77,11 +85,9 @@ owner: {
 }
 ```
 
-If the lookup is cheap (in-memory map, header read, already on `req`), skip `enrich` and put the values inline:
+`enrich` failures are swallowed by the SDK and never break the request, so a best-effort real lookup is safe.
 
-```js
-owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email }
-```
+**3. No source for the metadata anywhere?** Then leave `enrich` off (`owner: { id }`) - don't invent a lookup against a store that doesn't exist.
 
 `email` is what powers dashboard access grants. Confirming any of those emails on Restless pins this owner to that human.
 

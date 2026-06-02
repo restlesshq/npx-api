@@ -78,7 +78,28 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 6. **Owner shape.** The returned object is `{ apiKey, owner: { id, enrich?, label?, email? } }`. `owner` is nested. There is no top-level `projectId`; there is no top-level `project`; there is no top-level `enrich`. If you write any of those at the top level, the SDK will ignore them.
 
-7. **Lazy enrichment (optional).** If resolving the customer info (email, label, plan tier) requires a DB lookup or external call, put `enrich` **inside `owner`**: `{ apiKey, owner: { id, enrich: async (id) => ({ label, email, ... }) } }`. The SDK calls `enrich` only on the first request from each id and caches by id. If the lookup is cheap (in-memory map, value already on `req`), skip `enrich` and set `owner.label` / `owner.email` inline instead.
+7. **Enrich the owner with display info. Do this - do not skip it.** A bare `owner.id` shows up on the dashboard as an opaque identifier. Adding a human-readable `label` (and `email` where available) is what makes logs legible and powers dashboard access grants. You have full read access to this codebase - use it. You already found the owner entity and its source of truth in step 5 (the model, the `req.user` / `req.workspace` shape, the JWT payload, the data store); resolve `label` and `email` from that same source. Follow in order:
+
+   a. **If the fields are already on the request object**, set them inline on `owner` - do NOT use `enrich` for data you already hold; that would just be a slower way to read it:
+   ```js
+   owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email },
+   ```
+
+   b. **If resolving them needs a lookup** (the id is on the request but the name / email live in a DB, ORM, or external service), implement `enrich` with a REAL lookup, reusing the exact data-access pattern this project already uses elsewhere. Read how the codebase queries that entity (Prisma `prisma.workspace.findUnique`, Mongoose `Workspace.findById`, a knex query, an in-memory `Map`, a JSON fixture) and mirror it - do not invent an ORM the project doesn't use:
+   ```js
+   owner: {
+     id: workspace.id,
+     enrich: async (id) => {
+       const ws = await prisma.workspace.findUnique({ where: { id } });
+       return { label: ws.name, email: ws.adminEmails };  // flat fields; email: string or string[]
+     },
+   },
+   ```
+   `enrich` runs only on the first request per id, then caches - so the lookup cost is amortized, not per-request. If it throws, the SDK swallows the error and never breaks the request, so a best-effort real lookup is safe; you do not need defensive guards beyond what the surrounding code normally uses.
+
+   c. **Only if you genuinely cannot find any source for owner metadata** in the codebase, leave `enrich` off (just `owner: { id }`) rather than inventing a lookup against a store that doesn't exist.
+
+   Return **flat fields** from `enrich` (`{ label, email }`), never a nested object. Put `enrich` **inside `owner`**, never at the top level.
 
 ## Rules
 
