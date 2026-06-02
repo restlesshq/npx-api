@@ -30,9 +30,11 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 5. **Pick `owner.id` carefully. It is the permanent, immutable identifier the dashboard pins this customer's entire log history to.** Once a customer has produced any logs under one id, changing it fragments their history. This is the single most important thing to get right.
 
+   **First, understand what an "owner" is - it is NOT necessarily a user.** The owner is the entity that *owns the API key* in this project's data model: whoever the traffic is attributed to and grouped under on the dashboard. Sometimes that's a user, but just as often it's a **workspace, project, team, organization, account, tenant, or service** - whatever this codebase's model says a key belongs to. Do not assume "user." Determine it from the data model: what does the credential actually map back to? The foreign key on the api-keys / tokens table, the `sub` of the JWT, the record an API-key row points at. **That record is the owner**, and its immutable primary key is `owner.id`. Represent the project's real ownership model - if keys belong to projects, the owner is the project, not the user who happened to create it.
+
    **Decision procedure (follow in order, do NOT skip steps):**
 
-   a. **Look at the auth flow first.** Read the file that handles authentication. Identify the entity that gets attached to the request (`req.user`, `req.workspace`, `ctx.state.user`, etc.). Find that entity's source of truth in this codebase: a database model, a TypeScript interface, a JSON fixture file, an in-memory `Map`, a JWT payload shape, an external auth provider's user shape, whatever this project uses. Some codebases have a formal schema; some don't. Both are fine.
+   a. **Trace the credential to the entity that owns it.** Read the file that handles authentication and follow the key/token to the record it resolves to - not just the entity attached to the request (`req.user`, `req.workspace`, `req.account`, `ctx.state.*`, a JWT claim), but the thing that *owns the key*. If a key belongs to a project or org that a user is merely a member of, the owner is that project/org. Find that entity's source of truth in this codebase: a database model, a TypeScript interface, a JSON fixture file, an in-memory `Map`, a JWT payload shape, an external auth provider's shape, whatever this project uses. Some codebases have a formal schema; some don't. Both are fine.
 
    b. **Verify the candidate is immutable.** Any one of these is enough evidence:
       - The field is named like an id: `id`, `_id`, `uuid`, `<entity>Id`, `pk`, or `sub` (JWT subject).
@@ -46,10 +48,11 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
       Lack of a formal Mongoose / Prisma model is NOT grounds to reject a candidate. A JSON-key id, a Map key, or a UUID literal are all valid.
 
-   c. **Match the right entity to the API shape:**
+   c. **Match the right entity to the API shape** (the owner is the entity the key belongs to, which differs by app):
       - **Multi-tenant SaaS** (workspaces / orgs / teams / accounts table; a `companyId` JWT claim; an `X-Workspace-Id` header): use the tenant's stable internal id. Multiple users on the same key all roll up under one owner.
+      - **Key owned by a project / group / service** (the api-keys table has a `projectId` / `groupId` / `serviceId` foreign key; a user creates keys but they belong to the project): use the project/group/service id, NOT the user who created it.
       - **Per-user API** (one key per developer or end-user, no tenant): use the user record's stable internal id.
-      - **Multiple keys per tenant** (test/prod/CI keys): use the tenant id. The keys roll up under one owner.
+      - **Multiple keys per owner** (test/prod/CI keys for the same tenant or project): use the owning entity's id. The keys roll up under one owner.
 
    d. **If you genuinely cannot find a stable internal id**, do NOT invent one and do NOT fall back to the API key, the masked API key, an email, or a username. Wire the SDK with this exact placeholder and marker comment so the CLI can interactively prompt the user:
 
