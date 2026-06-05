@@ -274,7 +274,44 @@ async function showDebugBanner() {
 
 await showDebugBanner();
 
-if (command === 'init' || command === 'setup' || command === 'supercharge') {
+/**
+ * Default screen. Shown when the CLI is run with no command (`npx api`)
+ * or an explicit `help` / `--help` / `-h`. Leads with the logo + the
+ * one-liner pitch, then lists every command with a short hint, and ends
+ * by pointing first-timers at `init`. Mirrors the welcome copy so the
+ * brand voice is consistent whether you land here or in the setup flow.
+ */
+function printHelp() {
+  console.log('');
+  printLogo();
+  console.log('');
+  console.log(`  ${white('Restless makes sure every API call turns out')} ${green('200 Okay')}${white('.')}`);
+  console.log('');
+  console.log(`  ${bold('Usage')}`);
+  console.log(`    ${cyan(`npx ${CLI_NAME}`)} ${dim('<command>')}`);
+  console.log('');
+  console.log(`  ${bold('Commands')}`);
+  const rows = [
+    ['init', 'Set up Restless here: scan your code, install the SDK, wire it in'],
+    ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
+    ['update [projectId]', 'Edit project settings and sync them to the dashboard'],
+    ['skill <docs-url>', 'Install an API skill into Claude Code'],
+    ['reset', 'Remove Restless from this project'],
+    ['help', 'Show this help'],
+  ];
+  const width = Math.max(...rows.map(([name]) => name.length));
+  for (const [name, hint] of rows) {
+    console.log(`    ${cyan(name.padEnd(width))}  ${dim(hint)}`);
+  }
+  console.log('');
+  console.log(`  ${dim('New here? Run')} ${cyan(`npx ${CLI_NAME} init`)} ${dim('to get started.')}`);
+  console.log('');
+}
+
+if (!command || command === 'help' || command === '--help' || command === '-h') {
+  printHelp();
+  await debug.flushAndExit(0);
+} else if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
   // Clear viewport + scrollback so the welcome starts at the top of the
   // terminal, matching where every subsequent screen lands after each
@@ -1799,7 +1836,36 @@ if (command === 'init' || command === 'setup' || command === 'supercharge') {
   }
 
   await debug.flushAndExit(0);
+} else if (command === 'submit-debug') {
+  // Hidden command (intentionally absent from `printHelp`). Every run
+  // writes a local debug log to ~/.restless/debug/; this uploads the
+  // most recent one to the Restless team so support can ask for it
+  // after the fact instead of asking the user to reproduce with
+  // --debug. An explicit file path can be passed to send a specific log.
+  const explicitPath = process.argv[3];
+  const file = explicitPath || debug.findLatestLocalLog();
+  if (!file) {
+    console.log('');
+    console.log(`  ${dim('No local debug logs found.')}`);
+    console.log(`  ${dim(`Run \`npx ${CLI_NAME} init\` first, then re-run this to send the log.`)}`);
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+  console.log('');
+  console.log(`  ${dim(`Submitting ${file}`)}`);
+  const res = await debug.submitLocalLog(file);
+  console.log('');
+  if (res.ok) {
+    console.log(`  ${green('✓')} Debug log sent. Thanks - this helps us debug your setup.`);
+  } else {
+    console.log(`  ${red('✗')} Couldn't send the debug log. Check your connection and try again.`);
+  }
+  console.log('');
+  await debug.flushAndExit(res.ok ? 0 : 1);
 } else {
-  console.log(`Unknown command: ${command}`);
-  console.log(`Usage: ${CLI_NAME} init | update | clear | debug <request-id> | skill <docs-url>`);
+  console.log('');
+  console.log(`  ${red(`Unknown command: ${command}`)}`);
+  console.log('');
+  printHelp();
+  await debug.flushAndExit(1);
 }
