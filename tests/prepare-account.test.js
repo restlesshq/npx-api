@@ -94,13 +94,49 @@ describe('findExistingEnvFile', () => {
     expect(findExistingEnvFile(dir)).toBeNull();
   });
 
-  it('does not look in parent directories', () => {
-    // .env exists in the parent, but the apiDir is a child without one.
+  it('does not look in parent directories with the default (single-dir) behavior', () => {
+    // .env exists in the parent, but with no rootDir we only check the child.
     const parentEnv = path.join(dir, '.env');
     fs.writeFileSync(parentEnv, 'RESTLESS_KEY=should-not-be-found\n');
     const child = path.join(dir, 'child');
     fs.mkdirSync(child);
     expect(findExistingEnvFile(child)).toBeNull();
+  });
+
+  it('walks up to rootDir and finds a root .env when the api dir has none (monorepo)', () => {
+    // dir = repo root with a .env; api code lives in packages/api with none.
+    const rootEnv = path.join(dir, '.env');
+    fs.writeFileSync(rootEnv, 'RESTLESS_KEY=from-root\n');
+    const apiDir = path.join(dir, 'packages', 'api');
+    fs.mkdirSync(apiDir, { recursive: true });
+    expect(findExistingEnvFile(apiDir, dir)).toBe(rootEnv);
+  });
+
+  it('returns the .env closest to the api dir when both api dir and root have one', () => {
+    // Mirrors the SDK runtime walk: the closer .env wins, so we write to it.
+    fs.writeFileSync(path.join(dir, '.env'), 'RESTLESS_KEY=from-root\n');
+    const apiDir = path.join(dir, 'packages', 'api');
+    fs.mkdirSync(apiDir, { recursive: true });
+    const apiEnv = path.join(apiDir, '.env');
+    fs.writeFileSync(apiEnv, 'OTHER=1\n');
+    expect(findExistingEnvFile(apiDir, dir)).toBe(apiEnv);
+  });
+
+  it('finds an intermediate .env between the api dir and the root', () => {
+    const apiDir = path.join(dir, 'packages', 'api');
+    fs.mkdirSync(apiDir, { recursive: true });
+    const midEnv = path.join(dir, 'packages', '.env');
+    fs.writeFileSync(midEnv, 'OTHER=1\n');
+    expect(findExistingEnvFile(apiDir, dir)).toBe(midEnv);
+  });
+
+  it('never looks above rootDir', () => {
+    // .env above the declared rootDir must stay invisible.
+    fs.writeFileSync(path.join(dir, '.env'), 'RESTLESS_KEY=above-root\n');
+    const root = path.join(dir, 'repo');
+    const apiDir = path.join(root, 'packages', 'api');
+    fs.mkdirSync(apiDir, { recursive: true });
+    expect(findExistingEnvFile(apiDir, root)).toBeNull();
   });
 });
 

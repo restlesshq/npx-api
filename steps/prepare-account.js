@@ -26,18 +26,36 @@ export function resolveApiDir(packageDir, apiRootDir) {
 }
 
 /**
- * Find a real `.env` (or `.env.local`) regular file inside `apiDir`.
+ * Find a real `.env` (or `.env.local`) regular file, searching from
+ * `apiDir` up to `rootDir` (the repo / git root) inclusive. In a monorepo
+ * the API code lives in e.g. `packages/api` but the `.env` is usually at
+ * the repo root, so we walk up to find it - but never above `rootDir`.
+ *
+ * Returns the FIRST match walking up (the one closest to the API code).
+ * This mirrors the SDK's own `findEnvFile` resolution at runtime (closest
+ * `.env` to the process wins), so the file we write to is the same file
+ * the SDK will load - avoiding a closer `.env` shadowing the one we chose.
+ *
  * `existsSync` alone matches symlinks and directories - we want a plain
- * file. Only checks `apiDir` itself, never escapes upward, so a `.env` in
- * a parent or grandparent directory is invisible to us.
+ * file. `rootDir` defaults to `apiDir`, preserving the single-dir behavior
+ * (check only `apiDir`) when no root is supplied.
  */
-export function findExistingEnvFile(apiDir) {
-  for (const name of ['.env', '.env.local']) {
-    const p = path.join(apiDir, name);
-    try {
-      const stat = fs.statSync(p);
-      if (stat.isFile()) return p;
-    } catch {}
+export function findExistingEnvFile(apiDir, rootDir = apiDir) {
+  const top = path.resolve(rootDir);
+  let dir = path.resolve(apiDir);
+  while (true) {
+    for (const name of ['.env', '.env.local']) {
+      const p = path.join(dir, name);
+      try {
+        if (fs.statSync(p).isFile()) return p;
+      } catch {}
+    }
+    if (dir === top) break;            // reached the repo-root bound
+    const parent = path.dirname(dir);
+    if (parent === dir) break;         // filesystem-root safety
+    // Never step outside rootDir's subtree (handles apiDir not under rootDir).
+    if (!(parent === top || parent.startsWith(top + path.sep))) break;
+    dir = parent;
   }
   return null;
 }
@@ -77,10 +95,11 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   const { packageDir, rootDir, apiRootDir, apiDir } = ctx;
   const apiDirRel = path.relative(packageDir, apiDir) || '.';
 
-  // Only treat .env / .env.local as "existing" if it's a real regular file
-  // inside apiDir - never walk above. Avoids false positives from symlinks,
-  // directories, or env files in parent repos.
-  const existingEnvFile = findExistingEnvFile(apiDir);
+  // Look for an existing .env / .env.local from the API dir up to the repo
+  // root (a monorepo usually keeps its .env at the root, not in
+  // packages/<api>). Reuse it if found; otherwise create one next to the API
+  // code. Bounded at rootDir so we never touch env files outside the repo.
+  const existingEnvFile = findExistingEnvFile(apiDir, rootDir);
   let envFile = existingEnvFile || path.join(apiDir, '.env');
   let envRelative = path.relative(packageDir, envFile);
 
