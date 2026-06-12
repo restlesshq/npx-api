@@ -21,11 +21,15 @@ The setup callback returns one shape:
 }
 ```
 
-`apiKey` identifies the individual caller. `owner.id` identifies who they belong to (workspace / tenant / user record). Both go on every log; the dashboard groups by `owner.id`.
+`apiKey` identifies the individual caller. `owner.id` identifies who they belong to. Both go on every log; the dashboard groups by `owner.id`.
+
+### What the "owner" is
+
+The owner is the entity that **owns the API key** in your data model - whoever the traffic is attributed to. That is **not necessarily a user**: depending on the app it's a workspace, project, team, organization, account, tenant, service, or user. Determine it from what the key belongs to (the foreign key on the keys/tokens table, the JWT `sub`, the record a key row points at), and represent your real model - if keys belong to a project, the owner is the project, not the user who created it.
 
 ### `owner.id` is permanent and required
 
-`owner.id` is the **immutable identifier the dashboard pins a customer's entire log history to**. Once a customer has started producing logs under one id, changing it fragments their history. Pick something that cannot change for the same customer.
+`owner.id` is the **immutable identifier the dashboard pins a customer's entire log history to**. Once a customer has started producing logs under one id, changing it fragments their history. Pick something that cannot change for the same owner.
 
 **Valid ids:** database primary keys, workspace UUIDs, tenant ids, user record ids: anything the application treats as a permanent internal handle.
 
@@ -65,7 +69,15 @@ The exact comment marker `RESTLESS_OWNER_ID_TODO` and the literal placeholder `'
 
 ### `owner.enrich`
 
-`enrich` lives **inside `owner`** and runs once per id (the SDK caches by id). It receives the id as its only argument. Use it for any lookup expensive enough to skip on every request (DB query, JWT verification, external HTTP). Return fields flat:
+Resolving owner display info (`label`, `email`) is expected, not optional - a bare `owner.id` is an opaque identifier on the dashboard. Resolve it from the same owner entity you used for `id`, in this order:
+
+**1. Already on the request?** Set the fields inline - don't pay for a lookup you don't need:
+
+```js
+owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email }
+```
+
+**2. Needs a lookup?** Put `enrich` **inside `owner`**. It runs once per id (the SDK caches by id) and receives the id as its only argument. Reuse the project's own data-access pattern - read how the codebase queries that entity and mirror it, rather than inventing an ORM it doesn't use. Return fields flat:
 
 ```js
 owner: {
@@ -77,11 +89,9 @@ owner: {
 }
 ```
 
-If the lookup is cheap (in-memory map, header read, already on `req`), skip `enrich` and put the values inline:
+`enrich` failures are swallowed by the SDK and never break the request, so a best-effort real lookup is safe.
 
-```js
-owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email }
-```
+**3. No source for the metadata anywhere?** Then leave `enrich` off (`owner: { id }`) - don't invent a lookup against a store that doesn't exist.
 
 `email` is what powers dashboard access grants. Confirming any of those emails on Restless pins this owner to that human.
 

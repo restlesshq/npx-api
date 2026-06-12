@@ -1,10 +1,31 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { FATAL_EXIT, FatalExit, isFatalExit, fatalError, reportError } from '../lib/errors.js';
+
+// Every run now writes a local debug log on exit (uploads only with
+// --debug). fatalError calls debug.flushAndExit, so it writes a file -
+// point RESTLESS_DEBUG_DIR at a throwaway temp dir so the suite never
+// touches the real ~/.restless/debug/.
+let tmpDebugDir;
+let prevDebugDir;
+beforeAll(() => {
+  prevDebugDir = process.env.RESTLESS_DEBUG_DIR;
+  tmpDebugDir = fs.mkdtempSync(path.join(os.tmpdir(), 'restless-debug-test-'));
+  process.env.RESTLESS_DEBUG_DIR = tmpDebugDir;
+});
+afterAll(() => {
+  if (prevDebugDir === undefined) delete process.env.RESTLESS_DEBUG_DIR;
+  else process.env.RESTLESS_DEBUG_DIR = prevDebugDir;
+  try { fs.rmSync(tmpDebugDir, { recursive: true, force: true }); } catch {}
+});
 
 // Stub process.exit + console.log so the async flushAndExit kicked off by
 // fatalError can't actually kill the test runner or pollute stdout. The
-// flush itself returns immediately when --debug isn't on; only the
-// trailing process.exit needs neutralizing.
+// upload is skipped when --debug isn't on (the local write is harmless,
+// landing in the temp dir above); only the trailing process.exit needs
+// neutralizing.
 function patchExit() {
   const origExit = process.exit;
   const origLog = console.log;
