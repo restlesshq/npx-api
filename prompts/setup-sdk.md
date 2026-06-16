@@ -26,7 +26,7 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 3. **API key handling.** Always write `process.env.RESTLESS_KEY` as the argument in the SDK init line - the CLI replaces it with the canonical form (literal key, env-ref, or no-arg) after you finish, based on what the user picked. Don't reason about env loaders, don't install dotenv, don't modify package.json.
 
-4. **Wire up the end-user `apiKey`.** Look at how this API authenticates its callers (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. The returned object MUST include `apiKey: restless.mask(<credential>)` at the top level. Without it, every log shows up as "anonymous".
+4. **Wire up the end-user `apiKey`.** Look at how this API authenticates its callers (Authorization header, JWT, API key header, query param, etc.) and extract the credential inside the setup callback. The returned object MUST include `apiKey: sdk.mask(<credential>)` at the top level (`sdk` is the client - the factory's return value; `.mask` does not exist on the factory). Without it, every log shows up as "anonymous".
 
 5. **Pick `owner.id` carefully. It is the permanent, immutable identifier the dashboard pins this customer's entire log history to.** Once a customer has produced any logs under one id, changing it fragments their history. This is the single most important thing to get right.
 
@@ -44,7 +44,7 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
       Reject the candidate ONLY when the field is on the mutable list (`email`, `username`, `name`, `display_name`, `displayName`, `slug` when used as a renameable handle, `handle`, `nickname`, `tenant_name`, `login`), or when the schema marks the column as updatable, or when code paths mutate it.
 
-      If the entity has both an id and a mutable field (e.g. `user.id` and `user.email`): always pick `id`. Pass `email` to `enrich` instead.
+      If the entity has both an id and a mutable field (e.g. `user.id` and `user.email`): always pick `id`. Resolve `email` inside `enrich` instead.
 
       Lack of a formal Mongoose / Prisma model is NOT grounds to reject a candidate. A JSON-key id, a Map key, or a UUID literal are all valid.
 
@@ -74,21 +74,22 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
    // Correct: anonymous requests use undefined; the SDK groups them
    // properly on the dashboard's anonymous bucket.
    return {
-     apiKey: restless.mask(extractApiKey(req)),
-     owner: req.user ? { id: req.user.workspaceId } : undefined,
+     apiKey: sdk.mask(extractApiKey(req)),
+     owner: req.user
+       ? { id: req.user.workspaceId, enrich: async (id) => ({ label: req.user.workspaceName }) }
+       : undefined,
    };
    ```
 
-6. **Owner shape.** The returned object is `{ apiKey, owner: { id, enrich?, label?, email? } }`. `owner` is nested. There is no top-level `projectId`; there is no top-level `project`; there is no top-level `enrich`. If you write any of those at the top level, the SDK will ignore them.
+6. **Owner shape.** The returned object is `{ apiKey, owner: { id, enrich } }`. `owner` is nested and holds exactly two things: the immutable `id` and the required `enrich` function. There are NO inline `label` / `email` fields on `owner` anymore, and no arbitrary extra keys - all display info comes back from `enrich`. There is no top-level `projectId`, no top-level `project`, and no top-level `enrich`. If you write inline `label` / `email` on `owner`, or any of those fields at the top level, the SDK ignores them.
 
-7. **Enrich the owner with display info. Do this - do not skip it.** A bare `owner.id` shows up on the dashboard as an opaque identifier. Adding a human-readable `label` (and `email` where available) is what makes logs legible and powers dashboard access grants. You have full read access to this codebase - use it. You already found the owner entity and its source of truth in step 5 (the model, the `req.user` / `req.workspace` shape, the JWT payload, the data store); resolve `label` and `email` from that same source. Follow in order:
+7. **Always wire `owner.enrich`. It is required and it is the only channel for display info - do not skip it.** A bare `owner.id` shows up on the dashboard as an opaque identifier. `enrich` resolves the human-readable `label` AND `email`, which is what makes logs legible and powers dashboard access grants. You have full read access to this codebase - use it. You already found the owner entity and its source of truth in step 5 (the model, the `req.user` / `req.workspace` shape, the JWT payload, the data store); resolve `label` and `email` from that same source. `enrich` receives the owner `id` as its argument and can also read the request via closure.
 
-   a. **If the fields are already on the request object**, set them inline on `owner` - do NOT use `enrich` for data you already hold; that would just be a slower way to read it:
-   ```js
-   owner: { id: req.user.workspaceId, label: req.user.workspaceName, email: req.user.email },
-   ```
+   **Resolve `label` and `email` independently - they are per-field, not all-or-nothing.** "Available" does NOT mean "already sitting on the request object." A field is available if it is on the request **OR reachable with one more lookup** from the owner entity - following a reference (e.g. `project.owner` -> a User record that holds the email), populating a relation, or a second query against a table this codebase already queries. This is exactly why `enrich` is async and cached: the extra DB call is expected, it runs once per id, and its cost is amortized. So if `label` is right there on the request but `email` requires following a reference or a second query, do BOTH - read `label` off the request and do the lookup for `email`. Do not drop `email` just because it was not on the same object as `label`, and do not delete an ORM/db import you added because one field happened to be free. Only treat a field as genuinely unavailable after you have looked for a reachable source and found none.
 
-   b. **If resolving them needs a lookup** (the id is on the request but the name / email live in a DB, ORM, or external service), implement `enrich` with a REAL lookup, reusing the exact data-access pattern this project already uses elsewhere. Read how the codebase queries that entity (Prisma `prisma.workspace.findUnique`, Mongoose `Workspace.findById`, a knex query, an in-memory `Map`, a JSON fixture) and mirror it - do not invent an ORM the project doesn't use:
+   Follow in order:
+
+   a. **If resolving a field needs a lookup** (the id is on the request but the name / email live in a DB, ORM, or external service), implement `enrich` with a REAL lookup, reusing the exact data-access pattern this project already uses elsewhere. Read how the codebase queries that entity (Prisma `prisma.workspace.findUnique`, Mongoose `Workspace.findById`, a knex query, an in-memory `Map`, a JSON fixture) and mirror it - do not invent an ORM the project doesn't use:
    ```js
    owner: {
      id: workspace.id,
@@ -100,7 +101,27 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
    ```
    `enrich` runs only on the first request per id, then caches - so the lookup cost is amortized, not per-request. If it throws, the SDK swallows the error and never breaks the request, so a best-effort real lookup is safe; you do not need defensive guards beyond what the surrounding code normally uses.
 
-   c. **Only if you genuinely cannot find any source for owner metadata** in the codebase, leave `enrich` off (just `owner: { id }`) rather than inventing a lookup against a store that doesn't exist.
+   b. **If the display fields are already on the request object**, you still return them from `enrich` (it is the only channel now) - read them off the request via the callback closure rather than a lookup:
+   ```js
+   owner: {
+     id: req.user.workspaceId,
+     enrich: async () => ({ label: req.user.workspaceName, email: req.user.email }),
+   },
+   ```
+   Note `enrich` is cached per id, so it captures the first request's values - fine for stable display info like a name or contact email.
+
+   **Mixed case (common): some fields are on the request, others are not.** Read the ones that are off the request, and do a lookup for the rest - do not silently drop them. The frequent shape is a `label` that lives on the request (or owner entity) while the `email` hangs off a referenced record (`project.owner` -> User, an `account.billingContactId`, a members table). Resolve both:
+   ```js
+   owner: {
+     id: String(project._id),
+     enrich: async () => {
+       const user = await User.findById(project.owner);   // one more call for the email
+       return { label: project.name, email: user?.email };
+     },
+   },
+   ```
+
+   c. **Only if you genuinely cannot find ANY source for owner metadata** in the codebase, still include `enrich` but have it `return {}` - do NOT invent a lookup against a store that doesn't exist, and do NOT drop `enrich` entirely.
 
    Return **flat fields** from `enrich` (`{ label, email }`), never a nested object. Put `enrich` **inside `owner`**, never at the top level.
 
@@ -116,7 +137,7 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 - Use `require()` style imports if the project uses CommonJS (no `"type": "module"` in package.json). Use `import` style if the project uses ESM.
 - **`setup` takes EXACTLY ONE argument (the callback).** Never pass the framework instance as the first argument. `sdk.setup(app, cb)` is the OLD API and crashes at runtime. The new shape is `app.use(sdk.setup(cb))` / `fastify.register(sdk.setup(cb))` - the framework instance only appears in `app.use(...)` / `fastify.register(...)`, never inside `setup(...)`. This is true regardless of how surrounding code in the same file looks (e.g. `passport.use(app, ...)`, `sentryUtils.init(app)`); those are different libraries, do not mimic their shape.
 - **`restless` is the factory, not the client.** After `import restless from '@restlessai/sdk'` you MUST call the factory to get a client: `const sdk = restless(process.env.RESTLESS_KEY);`. The methods `.setup` and `.mask` exist on the client (`sdk`), NOT on the factory (`restless`). Writing `restless.setup(...)` or `restless.mask(...)` directly is the OLD API and will fail with `_sdk.default.setup is not a function`.
-- **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, `hooks.beforeSend`, top-level `projectId`, top-level `project`, or top-level `enrich`** - these are from the OLD SDK API. The new SDK will ignore them. Only `{ apiKey, owner: { id, enrich? } }` is valid.
+- **Do NOT pass `apiId`, `setupMode`, `hooks.getUser`, `hooks.beforeSend`, top-level `projectId`, top-level `project`, or top-level `enrich`** - these are from the OLD SDK API. The new SDK will ignore them. **Do NOT put inline `label` / `email` (or any extra keys) on `owner`** - those are gone too; resolve them inside `enrich`. Only `{ apiKey, owner: { id, enrich } }` is valid.
 - **Do NOT read `.restless/settings.json` manually.** The SDK reads it automatically at startup.
-- **Do NOT substitute `|| 'anonymous'` inside `restless.mask()`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it gracefully. Writing `restless.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.
+- **Do NOT substitute `|| 'anonymous'` inside `sdk.mask()`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it gracefully. Writing `sdk.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.
 - Keep changes minimal - just add the SDK setup, don't refactor anything else.
