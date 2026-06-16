@@ -104,7 +104,7 @@ export default async function setupAccount({
 
   update({ status: 'active', activeSub: 0, message: hasLocalOas
     ? [`  Uploading ${bold(oasFile)} to your account.`]
-    : [dim('  No local OpenAPI spec to upload - your framework serves it at runtime.')],
+    : [dim('  No local OpenAPI spec found to upload.')],
   });
 
   if (hasLocalOas) {

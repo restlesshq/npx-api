@@ -6,7 +6,7 @@ import { bold, dim, green, red, yellow, orange, ask, singleSelect, waitForKey } 
 import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/settings.js';
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
-import { findEndpoints } from '../lib/find-endpoints.js';
+import { scanCodebase } from '../lib/find-endpoints.js';
 import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
 import { parseOas } from '../lib/oas-parse.js';
@@ -57,7 +57,7 @@ async function validateAndFixOas({ oasFullPath, packageDir, setSpinner }) {
  * still fall back to letting the LLM explore - see the prompt.
  */
 function buildFindingsSection(packageDir) {
-  const endpointResult = findEndpoints(packageDir);
+  const endpointResult = scanCodebase(packageDir);
   const oasResult = findOasCandidates(packageDir);
 
   const lines = ['## Findings (from a deterministic pre-scan)'];
@@ -83,6 +83,27 @@ function buildFindingsSection(packageDir) {
     lines.push('Endpoints: none found by the pre-scan. The codebase may use a framework/language our regex does not cover - please explore.');
   }
   lines.push('');
+
+  // Per-package framework signals. The endpoint regex only catches inline
+  // string-literal routes, so a package can be a real API yet show zero
+  // endpoints above (Fastify route modules, `fastify.route({...})`,
+  // helper-registered routes with variable paths, etc.). These signals give
+  // the LLM the framework truth per package - a package with a framework dep
+  // but `0 inline routes matched` is the signature of a route style our regex
+  // missed, and should be explored rather than ignored.
+  if (endpointResult.frameworkSignals.length > 0) {
+    lines.push('Framework signals (per package.json, from deps + source markers):');
+    for (const s of endpointResult.frameworkSignals) {
+      const parts = [];
+      if (s.frameworkDeps.length) parts.push(`deps[${s.frameworkDeps.join(', ')}]`);
+      if (s.sourceMarkers.length) parts.push(`source uses ${s.sourceMarkers.join(', ')}`);
+      if (s.oasGenDeps.length) parts.push(`OAS-capable via ${s.oasGenDeps.join(', ')}`);
+      parts.push(`${s.endpointCount} inline route${s.endpointCount === 1 ? '' : 's'} matched`);
+      const label = s.name ? `${s.package} (${s.name})` : s.package;
+      lines.push(`- ${label}: ${parts.join(' · ')}`);
+    }
+    lines.push('');
+  }
 
   if (oasResult.length > 0) {
     lines.push('OAS/Swagger spec candidates (found by parsing every YAML/JSON for a top-level `openapi` or `swagger` field):');
@@ -392,11 +413,17 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   }
 
   // === Detection: can we skip OAS generation? ===
+  // We skip generation ONLY when the user already has an OAS file on disk -
+  // we point at theirs and don't overwrite it. A framework that CAN generate
+  // OAS natively (e.g. @fastify/swagger) is NOT a skip: we still produce a
+  // `.restless/openapi.json`, but the AI is told (via `frameworkNote`) to
+  // prefer the framework's own generation. "Skipping" on can-generate used to
+  // leave the project with no spec at all - nothing captured the runtime one,
+  // and the upload step had nothing to send.
   const existingOasPath = selectedApi.existingOasFile
     ? path.join(rootDir, selectedApi.existingOasFile)
     : null;
   const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
-  const frameworkGenerates = !!selectedApi.frameworkCanGenerateOas;
 
   const oasFile = '.restless/openapi.json';
   const placeholderDomain = 'https://example.com';
@@ -407,10 +434,6 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     // Point settings at their file - don't overwrite their work.
     finalOasFile = selectedApi.existingOasFile;
     skipReason = `found OAS at ${bold(selectedApi.existingOasFile)}`;
-  } else if (frameworkGenerates) {
-    // Framework serves OAS natively at runtime - mark and move on.
-    skipReason = `${bold(framework)} generates OAS natively`;
-    finalOasFile = null;
   }
 
   if (skipReason) {
@@ -523,8 +546,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   const domain = await ask(`\n  ${bold('Base URL:')} `);
 
   // Replace placeholder domain in the AI-generated OAS file only when we
-  // actually generated one (not when we're reusing a user's file or when
-  // the framework serves it at runtime).
+  // actually generated one (not when we're reusing a user's existing file).
   if (finalOasFile === oasFile && !skipReason) {
     const oasFullPath = path.join(rootDir, oasFile);
     try {
@@ -537,8 +559,6 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   // Sub 2: Pick a test endpoint now, while the OAS is fresh in our hands.
   // Step 3 ("Test your setup") just reads `testCurl` off the API entry,
   // skipping a whole AI round-trip when the user is sitting at the prompt.
-  // Frameworks that serve OAS at runtime have no on-disk file to read, so
-  // skip the picker - step 3 will fall back to a generic curl.
   // Picking a test endpoint is rolled into the Generate OAS file sub-step
   // since it's a small post-generation pick. We surface it via the spinner
   // so it doesn't disappear, but it's not a top-level sub.
@@ -569,7 +589,6 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     name: selectedApi.name,
     rootDir: selectedApi.rootDir || '.',
     ...(finalOasFile && { oasFile: finalOasFile }),
-    ...(frameworkGenerates && !hasExistingOas && { frameworkGeneratesOas: true }),
     framework: selectedApi.framework,
     language: selectedApi.language?.toLowerCase(),
     baseUrl: domain || null,
@@ -601,9 +620,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   saveSettings(rootDir, settings);
 
   {
-    const doneMsg = finalOasFile
-      ? `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`
-      : `  ${green('✓')} ${bold(selectedApi.name)} registered - ${framework} will serve OAS at runtime${isInternal ? dim(' (internal)') : ''}.`;
+    const doneMsg = `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`;
     update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [doneMsg] });
   }
 

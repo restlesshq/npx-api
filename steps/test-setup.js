@@ -233,7 +233,7 @@ export default async function testSetup({
   // and saved to .restless/settings.json. Read it back and rewrite its base URL
   // to localhost so the user can hit their dev server without editing the
   // command. Falls back to a generic GET / if nothing was saved (e.g. the
-  // framework serves OAS at runtime).
+  // OAS had no safe GET endpoint to pick).
   const searchDir = apiRootDir && apiRootDir !== '.' ? path.resolve(packageDir, apiRootDir) : packageDir;
   const localPort = detectLocalPort(searchDir);
   const localBase = `http://localhost:${localPort}`;
