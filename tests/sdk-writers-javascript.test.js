@@ -127,6 +127,27 @@ app.use(sdk.setup((req) => ({
     expect(r.ownerIdExpr).toBe('workspace.id');
   });
 
+  // Regression: the credential reader used to hardcode the client name
+  // (`sdk` or `restless`). An AI install pass on an ESM project named the
+  // client `restlessSDK` to avoid shadowing the `import restless` factory,
+  // and a correctly-wired block got reported as "credential missing".
+  // The reader now accepts any identifier before `.mask(`.
+  it.each([
+    ['restlessSDK', 'restlessSDK.mask(apiKey)'],
+    ['client', 'client.mask(apiKey)'],
+    ['sdk', 'sdk.mask(apiKey)'],
+    ['restless', 'restless.mask(apiKey)'],
+    ['_sdk$', '_sdk$.mask(apiKey)'],
+  ])('reads the credential when the client binding is named %s', (clientName, maskCall) => {
+    const content = `import restless from '@restlessai/sdk';
+const ${clientName} = restless();
+fastify.register(${clientName}.setup((req) => ({
+  apiKey: ${maskCall},
+  owner: { id: String(project._id) },
+})));`;
+    expect(readBlockFields(content).credentialExpr).toBe('apiKey');
+  });
+
   it('returns ownerIdConfirmReason when the CONFIRM marker is present', () => {
     const content = `const sdk = require('@restlessai/sdk')();
 app.use(sdk.setup((req) => ({

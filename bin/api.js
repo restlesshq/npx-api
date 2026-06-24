@@ -4,8 +4,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
@@ -281,6 +282,22 @@ await showDebugBanner();
  * by pointing first-timers at `init`. Mirrors the welcome copy so the
  * brand voice is consistent whether you land here or in the setup flow.
  */
+/**
+ * Read the package version from this package's package.json. Resolved
+ * relative to this file (not cwd) so it reports the installed CLI's
+ * version no matter where the user ran it from. Falls back to a
+ * placeholder if the file can't be read - the version string is
+ * informational and should never be able to crash the CLI.
+ */
+function readVersion() {
+  try {
+    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 function printHelp() {
   console.log('');
   printLogo();
@@ -298,6 +315,7 @@ function printHelp() {
     ['skill <docs-url>', 'Install an API skill into Claude Code'],
     ['reset', 'Remove Restless from this project'],
     ['help', 'Show this help'],
+    ['--version', 'Print the installed CLI version'],
   ];
   const width = Math.max(...rows.map(([name]) => name.length));
   for (const [name, hint] of rows) {
@@ -308,7 +326,10 @@ function printHelp() {
   console.log('');
 }
 
-if (!command || command === 'help' || command === '--help' || command === '-h') {
+if (command === '--version' || command === '-v' || command === 'version') {
+  console.log(readVersion());
+  await debug.flushAndExit(0);
+} else if (!command || command === 'help' || command === '--help' || command === '-h') {
   printHelp();
   await debug.flushAndExit(0);
 } else if (command === 'init' || command === 'setup' || command === 'supercharge') {
@@ -318,6 +339,13 @@ if (!command || command === 'help' || command === '--help' || command === '-h') 
   // transition clears + homes the cursor.
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
   console.log('');
+  // Swallow keystrokes for the whole animated intro so they don't echo into
+  // the text being typed out (and don't queue up to skip the CTA). Restored
+  // in the `finally` right before we start listening for the real keypress.
+  const restoreInput = suppressInput();
+  let arrowInterval = null;
+  let welcomeKey;
+  try {
   await animateLogoIn();
   console.log('');
 
@@ -368,12 +396,15 @@ if (!command || command === 'help' || command === '--help' || command === '-h') 
   const iconCol = ctaText.length + 8;
   const enterFrames = [dim('⏎'), brand('⏎'), bold(brand('⏎')), brand('⏎')];
   let enterFrame = 0;
-  const arrowInterval = setInterval(() => {
+  arrowInterval = setInterval(() => {
     enterFrame = (enterFrame + 1) % enterFrames.length;
     process.stdout.write(`\x1b8\x1b[5A\x1b[${iconCol}G` + enterFrames[enterFrame] + '\x1b8');
   }, 280);
+  } finally {
+    // Hand stdin back the way waitForKey expects it (cooked, paused).
+    restoreInput();
+  }
 
-  let welcomeKey;
   while (true) {
     welcomeKey = await waitForKey();
     if (
@@ -547,9 +578,6 @@ if (!command || command === 'help' || command === '--help' || command === '-h') 
 
   const { setSpinner } = plan;
 
-  const settings = loadSettings(rootDir);
-  const hasOas = settings.apis.length > 0 && settings.apis.some(a => a.oasFile && fs.existsSync(path.join(rootDir, a.oasFile)));
-
   // Step 1: Generate OAS file - always run so the user sees the intro screen,
   // even on re-runs where an OAS already exists. generateOas decides internally
   // whether to re-scan or reuse.
@@ -559,7 +587,6 @@ if (!command || command === 'help' || command === '--help' || command === '-h') 
     update: plan.makeUpdater(0),
     setSpinner,
     aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
-    existingOas: hasOas,
   });
 
   debug.log('discovered', {

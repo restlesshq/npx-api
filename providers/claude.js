@@ -172,29 +172,61 @@ export default {
       // prompts/*.md + the variables, so don't send the whole thing.
       promptHead: typeof prompt === 'string' ? truncate(prompt, 400) : '',
     });
-    for await (const message of query({
-      prompt,
-      options: {
-        maxTurns: 30,
-        allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
-        cwd,
-        canUseTool: makeCanUseTool(gitRoot),
-      }
-    })) {
-      if (message.type === 'assistant') {
-        for (const block of message.message.content) {
-          if (block.type === 'text') {
-            result += block.text;
-            onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
-            debug.log('ai.text', { text: truncate(block.text, MAX_AI_TEXT) });
-          } else if (block.type === 'tool_use') {
-            onStatus?.(describeToolUse(block.name, block.input));
-            debug.log('ai.tool_use', { tool: block.name, input: truncatedToolInput(block.input) });
-            if (block.name in toolCounts) toolCounts[block.name]++;
-            else toolCounts.other++;
+    // The Agent SDK rejects its async iterator on terminal conditions -
+    // most commonly "Reached maximum number of turns", but also process
+    // exits and transport errors. A throw here used to escape runAI and,
+    // for any call site that didn't wrap it (e.g. generate-oas), bubble up
+    // to `uncaughtException` and kill the whole CLI mid-run. Swallow it
+    // instead: log the reason and return whatever partial text we already
+    // accumulated. Every step has its own retry / re-check logic (the
+    // install-sdk retry loop, generate-oas's validation, final-checks) and
+    // is built to handle an empty or partial AI result, so degrading is
+    // always better than crashing.
+    let runError = null;
+    try {
+      for await (const message of query({
+        prompt,
+        options: {
+          maxTurns: 30,
+          allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
+          cwd,
+          canUseTool: makeCanUseTool(gitRoot),
+        }
+      })) {
+        if (message.type === 'assistant') {
+          for (const block of message.message.content) {
+            if (block.type === 'text') {
+              result += block.text;
+              onStatus?.({ phase: 'Analyzing', detail: 'Thinking…' });
+              debug.log('ai.text', { text: truncate(block.text, MAX_AI_TEXT) });
+            } else if (block.type === 'tool_use') {
+              onStatus?.(describeToolUse(block.name, block.input));
+              debug.log('ai.tool_use', { tool: block.name, input: truncatedToolInput(block.input) });
+              if (block.name in toolCounts) toolCounts[block.name]++;
+              else toolCounts.other++;
+            }
           }
+        } else if (message.type === 'result' && message.is_error) {
+          // The SDK emits the terminal error result here just before it
+          // rejects the iterator; capture the reason for the log.
+          runError =
+            message.subtype === 'success'
+              ? message.result
+              : Array.isArray(message.errors)
+                ? message.errors.join('; ')
+                : message.subtype || 'error';
         }
       }
+    } catch (err) {
+      runError = runError || err?.message || String(err);
+    }
+
+    if (runError) {
+      debug.log('ai.run.error', {
+        provider: 'claude',
+        message: runError,
+        resultChars: result.length,
+      });
     }
     debug.log('ai.run.end', {
       provider: 'claude',
@@ -203,6 +235,8 @@ export default {
       // Surface the "did it write" answer at the top level so a quick
       // grep of the debug log doesn't have to parse the per-tool list.
       mutations: toolCounts.Edit + toolCounts.Write,
+      // Present only when the run ended on an SDK error (max turns, etc.).
+      error: runError || undefined,
     });
     return result;
   },
