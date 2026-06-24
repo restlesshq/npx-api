@@ -6,20 +6,34 @@ import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 
+// A bare host[:port] like `api.example.com` or `api.example.com:8080` -
+// a token with a dot before the first slash and no scheme. Used to catch
+// curls whose URL was emitted without an `http(s)://` prefix.
+const SCHEMELESS_HOST = /(?<![\w./-])([a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?)(?=[/\s'"`]|$)/gi;
+
 /**
  * Force every absolute URL in the saved curl to point at the local
- * dev server. The saved curl was built with the OAS `servers[0].url`
- * (often a production host); step 3 must always hit localhost so the
- * SDK middleware actually runs against the dev process.
+ * dev server. The saved curl is built against localhost already, but
+ * older/reused settings may carry a production base (from the OAS
+ * `servers[0].url`), and the user can edit the box - step 3 must always
+ * hit localhost so the SDK middleware runs against the dev process.
  *
  * We replace ALL `http(s)://host[:port]` occurrences (not just the
  * first) so an edge-case URL inside `--data` can't smuggle in a prod
- * call, and we trim trailing slashes to avoid a double-slash when the
- * curl path is itself absolute.
+ * call, then also rewrite any remaining schemeless `host[:port]` token
+ * (curl treats `api.example.com/x` as a real http request). Trailing
+ * slashes are trimmed to avoid a double-slash when the path is absolute.
  */
 function rewriteCurlBase(curl, localBase) {
   const clean = localBase.replace(/\/+$/, '');
-  return curl.replace(/https?:\/\/[^\s/'"`]+/g, clean);
+  return curl
+    .replace(/https?:\/\/[^\s/'"`]+/g, clean)
+    .replace(SCHEMELESS_HOST, (m) => (isLocalHost(m) ? m : clean.replace(/^https?:\/\//, '')));
+}
+
+function isLocalHost(host) {
+  const name = host.toLowerCase().split(':')[0];
+  return name === 'localhost' || name === '127.0.0.1' || name === '0.0.0.0' || name === '[::1]' || name === '::1';
 }
 
 /**
@@ -30,10 +44,14 @@ function rewriteCurlBase(curl, localBase) {
  * a request at production.
  */
 function curlTargetIsLocal(curl) {
-  const match = curl.match(/\bhttps?:\/\/([^\s/'"`]+)/);
-  if (!match) return true; // no absolute URL → curl will use a relative one, which means localhost only if the cwd makes it so. Treat as ok and let curl fail loudly.
-  const host = match[1].toLowerCase().split(':')[0];
-  return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || host === '::1';
+  const schemed = curl.match(/\bhttps?:\/\/([^\s/'"`]+)/);
+  if (schemed) return isLocalHost(schemed[1]);
+  // No schemed URL - look for a bare host[:port] token. curl resolves
+  // `api.example.com/x` as a real http request, so a non-local bare host
+  // is just as dangerous as a schemed one.
+  const bare = curl.match(SCHEMELESS_HOST);
+  if (bare) return bare.every(isLocalHost);
+  return true; // relative URL only → curl stays local; let it fail loudly if not.
 }
 
 /**

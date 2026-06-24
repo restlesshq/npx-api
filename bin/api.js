@@ -578,9 +578,6 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   const { setSpinner } = plan;
 
-  const settings = loadSettings(rootDir);
-  const hasOas = settings.apis.length > 0 && settings.apis.some(a => a.oasFile && fs.existsSync(path.join(rootDir, a.oasFile)));
-
   // Step 1: Generate OAS file - always run so the user sees the intro screen,
   // even on re-runs where an OAS already exists. generateOas decides internally
   // whether to re-scan or reuse.
@@ -590,7 +587,6 @@ if (command === '--version' || command === '-v' || command === 'version') {
     update: plan.makeUpdater(0),
     setSpinner,
     aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
-    existingOas: hasOas,
   });
 
   debug.log('discovered', {

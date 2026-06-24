@@ -16,6 +16,15 @@ import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
+// Where a generated/adopted spec lands, and the placeholder server URL the
+// generate-oas prompt writes (swapped for the real base URL in finalizeApi).
+const OAS_FILE = '.restless/openapi.json';
+const PLACEHOLDER_DOMAIN = 'https://example.com';
+
+// Where the locate-oas AI pass lists multiple matching specs when it can't
+// pick one unambiguously, so the CLI can ask the user which to use.
+const OAS_CANDIDATES_FILE = '.restless/.oas-candidates.json';
+
 // Read the file we just wrote and parse it the same way the server will. If
 // it doesn't parse, hand the error back to the LLM and ask it to fix the file
 // in place. Retries up to MAX_OAS_FIX_ATTEMPTS times.
@@ -185,127 +194,664 @@ async function locateApis({ packageDir, setSpinner, hint = '' }) {
 }
 
 /**
- * "User already has an OAS file" branch. Asks whether it's in the codebase
- * or at a URL, registers it in .restless/settings.json, copies the file into
- * .restless/ if it's outside the repo.
- *
- * If `selectedApi` is provided, reuses its name/framework/language instead
- * of prompting. If not, asks for a name.
+ * Map a deterministic framework signal (deps + source markers from
+ * scanCodebase) to a display label. Lets the "I already have a spec" branch
+ * hand install-sdk a real framework without an AI pass. Returns null when
+ * nothing recognizable matches.
  */
-async function adoptExistingOas({ rootDir, update, selectedApi = null, isInternal = null }) {
+function labelFromSignal(sig) {
+  const deps = sig.frameworkDeps || [];
+  const markers = sig.sourceMarkers || [];
+  const dep = (re) => deps.some((d) => re.test(d));
+  if (dep(/^@nestjs\//) || markers.includes('@Controller()')) return 'NestJS';
+  if (dep(/^(fastify|@fastify\/|fastify-)/) || markers.some((m) => m.startsWith('fastify') || m === 'FastifyInstance')) return 'Fastify';
+  if (deps.includes('next')) return 'Next.js';
+  if (deps.includes('hono') || markers.includes('new Hono()')) return 'Hono';
+  if (deps.includes('koa') || dep(/^@koa\//) || markers.includes('new Koa()')) return 'Koa';
+  if (deps.includes('express') || markers.includes('express()') || markers.includes('express.Router()')) return 'Express';
+  if (deps.includes('hapi') || dep(/^@hapi\//)) return 'hapi';
+  if (deps.includes('restify')) return 'Restify';
+  return null;
+}
+
+/**
+ * Decide which package the API lives in - the dir the SDK gets installed
+ * into. In a monorepo this is the part the AI detection flow used to pick;
+ * the "I already have a spec" branch has to recover it without that pass.
+ * Zero or one framework-bearing package -> infer silently. Several -> ask,
+ * since guessing wrong installs the SDK into the wrong workspace. Returns a
+ * path relative to packageDir, suitable as `apiRootDir`.
+ */
+async function chooseApiRootDir(signals) {
+  const candidates = signals.filter((s) => s.frameworkDeps.length || s.sourceMarkers.length);
+  if (candidates.length <= 1) {
+    const sig = candidates[0];
+    return sig && sig.package !== '.' ? sig.package : '.';
+  }
+  const ranked = [...candidates].sort((a, b) => (b.endpointCount || 0) - (a.endpointCount || 0));
+  const labels = ranked.map((s) => {
+    const loc = s.package === '.' ? './' : `./${s.package}`;
+    const fw = labelFromSignal(s) || s.frameworkDeps[0] || 'unknown';
+    return `${bold(s.name || loc)}\n${dim(`${fw}  ${loc}`)}`;
+  });
   console.log('');
-  const location = await singleSelect(
+  const idx = await singleSelect(labels, { message: 'Which package is this API in?', defaultIndex: 0 });
+  return ranked[idx].package || '.';
+}
+
+/**
+ * Cheap, AI-free guess of the framework + language for `apiRootDir`, used by
+ * the "I already have a spec" branch (which skips AI detection). Reuses the
+ * framework signals we already scanned. Both are best-effort: install-sdk
+ * defaults language to javascript and the AI re-derives the framework from
+ * the code, so a miss is harmless.
+ */
+function guessShape(signals, packageDir, apiRootDir) {
+  let framework = null;
+  const sig =
+    signals.find((s) => s.package === apiRootDir) ||
+    [...signals].sort((a, b) => (b.endpointCount || 0) - (a.endpointCount || 0))[0];
+  if (sig) framework = labelFromSignal(sig);
+
+  let language = 'javascript';
+  const apiDir = path.resolve(packageDir, apiRootDir);
+  try {
+    if (fs.existsSync(path.join(apiDir, 'tsconfig.json'))) {
+      language = 'typescript';
+    } else {
+      const pkg = JSON.parse(fs.readFileSync(path.join(apiDir, 'package.json'), 'utf8'));
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      if (deps.typescript) language = 'typescript';
+    }
+  } catch {}
+
+  return { framework, language };
+}
+
+/**
+ * Shared tail for both paths (generate-with-AI and adopt-existing): ask for
+ * visibility + base URL, optionally swap the placeholder domain in a freshly
+ * generated file, pick a demo curl, then write the API entry to
+ * .restless/settings.json. Keeps both paths producing the same settings shape
+ * so downstream steps (upload, test) behave identically.
+ */
+async function finalizeApi({
+  rootDir,
+  packageDir,
+  update,
+  setSpinner,
+  name,
+  apiRootDir = '.',
+  framework = null,
+  language = null,
+  finalOasFile,
+  endpoints = [],
+  replacePlaceholderDomain = false,
+  oasSource = null,
+}) {
+  // Heuristic default for visibility - bias toward "internal" if the name,
+  // framework, or routes look service-y.
+  const nameLower = (name || '').toLowerCase();
+  const frameworkLower = (framework || '').toLowerCase();
+  const endpointsLower = (endpoints || []).map((e) => e.toLowerCase());
+  const allPaths = endpointsLower.join(' ');
+  const internalSignals = [
+    nameLower.includes('internal'),
+    nameLower.includes('admin'),
+    nameLower.includes('private'),
+    nameLower.includes('backoffice'),
+    nameLower.includes('back-office'),
+    nameLower.includes('service'),
+    nameLower.includes('worker'),
+    nameLower.includes('queue'),
+    nameLower.includes('consumer'),
+    nameLower.includes('processor'),
+    nameLower.includes('gateway') && !nameLower.includes('api gateway'),
+    allPaths.includes('/internal/'),
+    allPaths.includes('/admin/'),
+    allPaths.includes('/_/'),
+    allPaths.includes('/rpc/'),
+    allPaths.includes('/grpc'),
+    !allPaths.includes('/v1') && !allPaths.includes('/v2') && endpointsLower.length > 3,
+    frameworkLower.includes('grpc'),
+    frameworkLower.includes('trpc'),
+  ].filter(Boolean).length;
+  const looksInternal = internalSignals >= 2;
+
+  const firstEndpoint = endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    '  Two quick things before we wrap up the spec.',
+  ]});
+
+  const visibilityIndex = await singleSelect(
     [
-      { label: "It's in my codebase", hint: "We'll read it from a path you give us." },
-      { label: "It's at a URL", hint: "We'll fetch it once and copy it into .restless/." },
+      { label: 'External', hint: 'Public-facing, used by your API consumers.' },
+      { label: 'Internal', hint: 'Private, only your own services or staff hit it.' },
     ],
-    { message: 'Where is it?', defaultIndex: 0 },
+    {
+      message: `Is ${name} external or internal?`,
+      defaultIndex: looksInternal ? 1 : 0,
+    },
   );
+  const isInternal = visibilityIndex === 1;
+
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    '  And the base URL of your API in production:',
+    `  ${dim(`So we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
+  ]});
+  const domain = await ask(`\n  ${bold('Base URL:')} `);
+
+  // Replace placeholder domain in the AI-generated OAS file only when we
+  // actually generated one (not when we're reusing a user's existing file).
+  if (replacePlaceholderDomain && finalOasFile) {
+    const oasFullPath = path.join(rootDir, finalOasFile);
+    try {
+      const oasContent = fs.readFileSync(oasFullPath, 'utf8');
+      const updated = oasContent.replaceAll(PLACEHOLDER_DOMAIN, domain || 'http://localhost:3000');
+      safeWriteFileSync(oasFullPath, updated);
+    } catch {}
+  }
+
+  // Pick a test endpoint now, while the OAS is fresh in our hands. Step 3
+  // ("Test your setup") just reads `testCurl` off the API entry, skipping a
+  // whole AI round-trip when the user is sitting at the prompt.
+  let testCurl = null;
+  if (finalOasFile) {
+    update({ sub: { 0: 'done' }, activeSub: 1, message: [
+      `  Picking a safe ${bold('GET')} endpoint to use as a demo endpoint.`,
+    ]});
+    setSpinner({ phase: 'Picking a test endpoint', detail: `Reading ${finalOasFile}` });
+    try {
+      // Build the curl against localhost, not the prod `domain`. This curl is
+      // only ever used by step 3, which tests the SDK wiring against the local
+      // dev server - the test step swaps in the detected port at run time.
+      testCurl = await pickTestCurl({
+        oasFullPath: path.join(rootDir, finalOasFile),
+        baseUrl: 'http://localhost:3000',
+        packageDir,
+        setSpinner,
+      });
+    } catch {}
+    setSpinner('');
+  }
+
+  update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
+    dim('  Saving settings...'),
+  ]});
 
   const settings = loadSettings(rootDir);
-  let oasFile;
-  let oasUrl;
-
-  if (location === 0) {
-    console.log('');
-    const input = (await ask('  Path to the OAS file: ')).trim();
-    const absPath = path.isAbsolute(input) ? input : path.resolve(rootDir, input);
-    if (!fs.existsSync(absPath)) {
-      fatalError(`No file at ${absPath}`);
-    }
-
-    const rel = path.relative(rootDir, absPath);
-    if (rel.startsWith('..')) {
-      // Outside the repo - copy into .restless/ so it lives alongside the codebase.
-      const apiDir = path.join(rootDir, '.restless');
-      if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
-      const ext = path.extname(absPath) || '.yaml';
-      const dest = path.join(apiDir, `openapi${ext}`);
-      fs.copyFileSync(absPath, dest);
-      oasFile = path.relative(rootDir, dest);
-      console.log('');
-      console.log(`  ${green('✓')} Copied to ${bold(oasFile)} so it lives with your code.`);
-    } else {
-      oasFile = rel;
-      console.log('');
-      console.log(`  ${green('✓')} Using the file at ${bold(oasFile)}.`);
-    }
-  } else {
-    console.log('');
-    const url = (await ask('  OAS URL: ')).trim();
-    if (!/^https?:\/\//.test(url)) {
-      fatalError("That doesn't look like a valid URL.", [`Got: ${url || '(empty)'}`]);
-    }
-    oasUrl = url;
-    console.log('');
-    console.log(`  ${green('✓')} Registered ${bold(url)}.`);
-  }
-
-  // Use selectedApi's name/framework/language if available, else prompt.
-  let name;
-  if (selectedApi) {
-    name = selectedApi.name;
-  } else {
-    console.log('');
-    const rawName = (await ask('  What should we call this API? ')).trim();
-    name = rawName || 'My API';
-  }
-
   upsertApi(settings, {
     name,
-    rootDir: selectedApi?.rootDir || '.',
-    ...(oasFile && { oasFile }),
-    ...(oasUrl && { oasUrl }),
-    ...(selectedApi?.framework && { framework: selectedApi.framework }),
-    ...(selectedApi?.language && { language: selectedApi.language.toLowerCase() }),
-    ...(isInternal !== null && { internal: isInternal }),
+    rootDir: apiRootDir,
+    ...(finalOasFile && { oasFile: finalOasFile }),
+    ...(framework && { framework }),
+    ...(language && { language: language.toLowerCase() }),
+    baseUrl: domain || null,
+    internal: isInternal,
+    ...(testCurl && { testCurl }),
+    ...(oasSource && { oasSource }),
     lastSyncedAt: new Date().toISOString(),
-    requestIdPrefix: generatePrefix(name),
   });
+
+  // Generate a request ID prefix on the API entry (not top-level).
+  const apiEntry = settings.apis.find((a) => a.rootDir === apiRootDir);
+  if (apiEntry && !apiEntry.requestIdPrefix) {
+    if (settings.requestIdPrefix) {
+      apiEntry.requestIdPrefix = settings.requestIdPrefix;
+      delete settings.requestIdPrefix;
+    } else {
+      let projectName;
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+        projectName = pkg.name;
+      } catch {}
+      if (!projectName) projectName = path.basename(rootDir);
+      apiEntry.requestIdPrefix = generatePrefix(projectName);
+    }
+  }
+
   saveSettings(rootDir, settings);
 
   update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
-    `  ${green('✓')} ${bold(name)} registered. Ready for the next step.`,
+    `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`,
   ]});
 
   return {
-    detectedLanguage: selectedApi?.language || null,
-    detectedFramework: selectedApi?.framework || null,
-    domain: null,
+    detectedLanguage: language ? language.toLowerCase() : null,
+    detectedFramework: framework || null,
+    apiRootDir,
+    domain,
   };
 }
 
-export default async function generateOas({ packageDir, rootDir, update, setSpinner, aiTool = 'Claude Code', existingOas = false }) {
+/**
+ * Fetch a spec from a URL once, validate it parses (same parser the server
+ * uses), and save it under .restless/. Returns the repo-relative path, or
+ * null on any failure so the caller can re-prompt.
+ */
+async function fetchOasFromUrl({ url, rootDir, apiDir, setSpinner }) {
+  setSpinner({ phase: 'Fetching spec', detail: url });
+  let raw;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      setSpinner('');
+      console.log('');
+      console.log(`  ${red('✗')} ${url} returned ${res.status}.`);
+      return null;
+    }
+    raw = await res.text();
+  } catch (err) {
+    setSpinner('');
+    console.log('');
+    console.log(`  ${red('✗')} Couldn't fetch ${url}: ${err.message}`);
+    return null;
+  }
+  setSpinner('');
+
+  // Detect JSON vs YAML so we save with the right extension (validateAndFixOas
+  // and the server both key off it). Try strict JSON first, then YAML.
+  let format = 'json';
+  let parsed = parseOas(raw, 'json');
+  if (!parsed.ok || !isStrictJson(raw)) {
+    const asYaml = parseOas(raw, 'yaml');
+    if (asYaml.ok && !isStrictJson(raw)) {
+      parsed = asYaml;
+      format = 'yaml';
+    }
+  }
+  if (!parsed.ok) {
+    console.log('');
+    console.log(`  ${red('✗')} That URL didn't return a valid OpenAPI spec.`);
+    console.log(`  ${dim(parsed.error)}`);
+    return null;
+  }
+
+  if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
+  const dest = path.join(apiDir, format === 'yaml' ? 'openapi.yaml' : 'openapi.json');
+  safeWriteFileSync(dest, raw);
+  const rel = path.relative(rootDir, dest);
+  console.log('');
+  console.log(`  ${green('✓')} Downloaded to ${bold(rel)}.`);
+  return rel;
+}
+
+function isStrictJson(raw) {
+  try {
+    JSON.parse(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Adopt an OAS file already on disk. Copies it into .restless/ if it lives
+ * outside the repo (so it ships with the code), validates it parses, and
+ * returns the repo-relative path, or null if it doesn't parse.
+ */
+function adoptOasFile({ absPath, rootDir, apiDir }) {
+  const raw = (() => {
+    try { return fs.readFileSync(absPath, 'utf8'); } catch { return null; }
+  })();
+  if (raw === null) {
+    console.log('');
+    console.log(`  ${red('✗')} Couldn't read ${absPath}.`);
+    return null;
+  }
+  const format = absPath.endsWith('.json') ? 'json' : 'yaml';
+  const parsed = parseOas(raw, format);
+  if (!parsed.ok) {
+    console.log('');
+    console.log(`  ${red('✗')} ${path.relative(rootDir, absPath)} didn't parse as an OpenAPI spec.`);
+    console.log(`  ${dim(parsed.error)}`);
+    return null;
+  }
+
+  const rel = path.relative(rootDir, absPath);
+  if (rel.startsWith('..')) {
+    // Outside the repo - copy into .restless/ so it lives with the codebase.
+    if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
+    const ext = path.extname(absPath) || '.yaml';
+    const dest = path.join(apiDir, `openapi${ext}`);
+    fs.copyFileSync(absPath, dest);
+    const destRel = path.relative(rootDir, dest);
+    console.log('');
+    console.log(`  ${green('✓')} Copied to ${bold(destRel)} so it lives with your code.`);
+    return destRel;
+  }
+  console.log('');
+  console.log(`  ${green('✓')} Using the file at ${bold(rel)}.`);
+  return rel;
+}
+
+/**
+ * Hand the user's freeform description to the AI: it locates an existing spec
+ * in the repo or runs the project's own generation, landing a spec at the
+ * absolute oas path. Returns the repo-relative path if a valid spec shows up,
+ * else null so the caller can re-prompt.
+ */
+async function locateOasWithAi({ input, rootDir, oasFile, packageDir, setSpinner }) {
+  const oasFileAbsolute = path.resolve(rootDir, oasFile);
+  const apiDir = path.dirname(oasFileAbsolute);
+  const candidatesAbsolute = path.resolve(rootDir, OAS_CANDIDATES_FILE);
+  // Clear any stale outputs so a no-op AI run is detectable and a prior run's
+  // manifest can't leak into this one.
+  try { if (fs.existsSync(oasFileAbsolute)) fs.rmSync(oasFileAbsolute); } catch {}
+  try { if (fs.existsSync(candidatesAbsolute)) fs.rmSync(candidatesAbsolute); } catch {}
+
+  setSpinner({ phase: 'Looking for your spec', detail: input });
+  try {
+    await runAI(loadPrompt('locate-oas', {
+      userInstruction: input,
+      oasFile: oasFileAbsolute,
+      candidatesFile: candidatesAbsolute,
+    }), packageDir, { setSpinner });
+  } catch {}
+  setSpinner('');
+
+  // The AI reports what it did in the manifest: a one-line `summary` of the
+  // action it took, and `candidates` when it found several specs and left the
+  // choice to us. We record the summary as the spec's source - never the raw
+  // instruction the user typed, which isn't a faithful record of what happened.
+  const manifest = readOasManifest({ candidatesAbsolute, rootDir });
+  try { if (fs.existsSync(candidatesAbsolute)) fs.rmSync(candidatesAbsolute); } catch {}
+
+  // Single clear answer: the AI copied/generated the spec straight to the
+  // destination. Validate and use it.
+  if (fs.existsSync(oasFileAbsolute)) {
+    const validation = await validateAndFixOas({ oasFullPath: oasFileAbsolute, packageDir, setSpinner });
+    if (!validation.ok) {
+      console.log('');
+      console.log(`  ${yellow('•')} Found something, but it didn't parse as a valid spec.`);
+      return { finalOasFile: null };
+    }
+    console.log('');
+    console.log(`  ${green('✓')} Spec ready at ${bold(oasFile)}.`);
+    return { finalOasFile: oasFile, summary: manifest.summary || `located the spec at ${oasFile}` };
+  }
+
+  // Ambiguous: the AI found several matching specs and left the choice to us.
+  const candidates = manifest.candidates;
+  if (candidates.length === 0) {
+    console.log('');
+    console.log(`  ${yellow('•')} Couldn't find or generate a spec from that.`);
+    return { finalOasFile: null };
+  }
+
+  let chosen = candidates[0];
+  if (candidates.length > 1) {
+    console.log('');
+    const labels = candidates.map((c) => {
+      const title = c.title && c.title !== c.path ? c.title : null;
+      return title ? `${bold(title)}\n${dim(c.path)}` : bold(c.path);
+    });
+    const idx = await singleSelect(labels, {
+      message: `Found ${candidates.length} specs that match. Which API do you want to import to Restless?`,
+      defaultIndex: 0,
+    });
+    chosen = candidates[idx];
+  }
+
+  // Copy the chosen spec into .restless/ so it ships with the code, then
+  // validate the copy (never mutating the user's original).
+  if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
+  const ext = path.extname(chosen.absPath).toLowerCase() === '.json' ? '.json' : '.yaml';
+  const dest = path.join(apiDir, `openapi${ext}`);
+  try {
+    fs.copyFileSync(chosen.absPath, dest);
+  } catch (err) {
+    console.log('');
+    console.log(`  ${red('✗')} Couldn't read ${chosen.path}: ${err.message}`);
+    return { finalOasFile: null };
+  }
+  const validation = await validateAndFixOas({ oasFullPath: dest, packageDir, setSpinner });
+  if (!validation.ok) {
+    console.log('');
+    console.log(`  ${yellow('•')} ${chosen.path} didn't parse as a valid spec.`);
+    return { finalOasFile: null };
+  }
+  const destRel = path.relative(rootDir, dest);
+  console.log('');
+  console.log(`  ${green('✓')} Using ${bold(chosen.path)}, copied to ${bold(destRel)}.`);
+  const picked = candidates.length > 1
+    ? `used ${chosen.path} (chosen from ${candidates.length} matching specs)`
+    : `used the spec found at ${chosen.path}`;
+  // Keep the AI's account of how the specs are produced (e.g. the generation
+  // command) alongside which one we landed on.
+  const summary = manifest.summary ? `${manifest.summary}; ${picked}` : picked;
+  return { finalOasFile: destRel, summary };
+}
+
+/**
+ * Read the manifest the locate-oas AI pass writes. Returns `{ summary,
+ * candidates }`: `summary` is the AI's one-line account of what it did (or
+ * null), `candidates` is the list of matching spec files, filtered to ones
+ * that actually exist on disk (resolved relative to the repo root). Both
+ * degrade safely - a missing or malformed manifest yields an empty result.
+ */
+function readOasManifest({ candidatesAbsolute, rootDir }) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(candidatesAbsolute, 'utf8'));
+  } catch {
+    return { summary: null, candidates: [] };
+  }
+  const summary = typeof parsed?.summary === 'string' && parsed.summary.trim()
+    ? parsed.summary.trim()
+    : null;
+  const list = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+  const seen = new Set();
+  const candidates = [];
+  for (const c of list) {
+    const rel = typeof c?.path === 'string' ? c.path.trim() : '';
+    if (!rel) continue;
+    const absPath = path.resolve(rootDir, rel);
+    if (seen.has(absPath)) continue;
+    if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) continue;
+    seen.add(absPath);
+    candidates.push({ path: path.relative(rootDir, absPath), absPath, title: typeof c.title === 'string' ? c.title.trim() : '' });
+  }
+  return { summary, candidates };
+}
+
+/**
+ * Infer a name for an adopted spec instead of asking. The spec's own
+ * `info.title` is the most accurate source; fall back to the package name,
+ * then the repo folder. Skips generic titles like "API" / "OpenAPI".
+ */
+function inferApiName({ rootDir, finalOasFile }) {
+  try {
+    const oas = loadOas(path.join(rootDir, finalOasFile));
+    const title = oas?.info?.title?.trim();
+    if (title && !/^(api|openapi|swagger|title)$/i.test(title)) return { name: title, source: 'the spec' };
+  } catch {}
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+    if (pkg.name) return { name: pkg.name, source: 'package.json' };
+  } catch {}
+  return { name: path.basename(rootDir) || 'My API', source: 'the folder name' };
+}
+
+/**
+ * "User already has an OAS file" branch. One freeform prompt that accepts a
+ * file path, a URL, or a plain-English description; resolves it; then runs the
+ * shared finalize. If the user can't point us at a spec, returns
+ * { fallbackToGenerate: true } so the caller drops into the AI generate flow.
+ */
+async function adoptExistingOas({ rootDir, packageDir, update, setSpinner }) {
+  const apiDir = path.join(rootDir, '.restless');
+
+  while (true) {
+    console.log('');
+    console.log(`  ${dim('Paste a file path, a URL, or describe where your spec is. For example:')}`);
+    console.log(`  ${dim('• "docs/openapi.yaml"')}`);
+    console.log(`  ${dim('• "https://api.acme.com/openapi.json"')}`);
+    console.log(`  ${dim('• "it\'s served at /docs-json" or "run npm run openapi"')}`);
+    console.log('');
+    const input = (await ask('  Where is it? ')).trim();
+    if (!input) continue;
+
+    let finalOasFile = null;
+    let oasSource = null;
+    if (/^https?:\/\//i.test(input)) {
+      finalOasFile = await fetchOasFromUrl({ url: input, rootDir, apiDir, setSpinner });
+      oasSource = { kind: 'url', url: input };
+    } else {
+      const absPath = path.isAbsolute(input) ? input : path.resolve(rootDir, input);
+      if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+        finalOasFile = adoptOasFile({ absPath, rootDir, apiDir });
+        oasSource = { kind: 'file', input };
+      } else {
+        const located = await locateOasWithAi({ input, rootDir, oasFile: OAS_FILE, packageDir, setSpinner });
+        finalOasFile = located.finalOasFile;
+        // Record what was actually done to find the spec, not the freeform
+        // instruction the user typed.
+        oasSource = { kind: 'describe', summary: located.summary };
+      }
+    }
+
+    if (finalOasFile) {
+      // Recover where the API lives (which package to install the SDK into)
+      // and a best-effort framework/language, from one deterministic scan.
+      let signals = [];
+      try { signals = scanCodebase(packageDir).frameworkSignals; } catch {}
+      const apiRootDir = await chooseApiRootDir(signals);
+      const { framework, language } = guessShape(signals, packageDir, apiRootDir);
+
+      const { name, source } = inferApiName({ rootDir, finalOasFile });
+      console.log('');
+      console.log(`  ${green('✓')} Calling it ${bold(name)} ${dim(`(from ${source}).`)}`);
+      return await finalizeApi({
+        rootDir,
+        packageDir,
+        update,
+        setSpinner,
+        name,
+        apiRootDir,
+        framework,
+        language,
+        finalOasFile,
+        endpoints: [],
+        replacePlaceholderDomain: false,
+        oasSource,
+      });
+    }
+
+    // Couldn't resolve - re-prompt, with an escape hatch to full AI generation.
+    console.log('');
+    const next = await singleSelect(
+      [
+        { label: 'Try again', hint: 'Enter a different path, URL, or description.' },
+        { label: 'Generate it with AI instead', hint: "We'll scan your code and write the spec." },
+      ],
+      { message: "We couldn't get a spec from that. What now?", defaultIndex: 0 },
+    );
+    if (next === 1) return { fallbackToGenerate: true };
+  }
+}
+
+/**
+ * Human-readable summary of how a remembered spec was sourced, for the
+ * reuse-on-rerun note. Mirrors the `oasSource.kind` values written by the
+ * adopt + generate paths.
+ */
+function describeOasSource(src) {
+  switch (src?.kind) {
+    case 'ai': return 'generated with AI';
+    case 'url': return src.url ? `fetched from ${src.url}` : 'fetched from a URL';
+    case 'file': return src.input ? `from ${src.input}` : 'from a file you provided';
+    case 'describe': return src.summary || 'from the location you described';
+    default: return 'from your last setup';
+  }
+}
+
+/**
+ * If a prior run already recorded where this project's spec came from
+ * (`oasSource`) and that spec is still on disk, reuse it instead of asking
+ * again. Only fires when there's exactly one such remembered API, so a
+ * monorepo with several set-up APIs still goes through the picker. Returns the
+ * shape generateOas hands downstream, or null to fall through to the prompts.
+ */
+function reuseRememberedOas({ rootDir }) {
+  const settings = loadSettings(rootDir);
+  const remembered = (settings.apis || []).filter(
+    (a) => a.oasSource && a.oasFile && fs.existsSync(path.join(rootDir, a.oasFile)),
+  );
+  if (remembered.length !== 1) return null;
+  const api = remembered[0];
+  return {
+    detectedLanguage: api.language ? api.language.toLowerCase() : null,
+    detectedFramework: api.framework || null,
+    apiRootDir: api.rootDir || '.',
+    domain: api.baseUrl || null,
+    _reused: api,
+  };
+}
+
+export default async function generateOas({ packageDir, rootDir, update, setSpinner, aiTool = 'Claude Code' }) {
   await startStep({
     update,
     stepNum: 1,
     title: 'Map your API',
-    intro: "Alright, let's map out your API.",
+    intro: "Alright, let's get your API's OpenAPI spec.",
     sections: [
       {
         label: 'Why',
         body:
-          `An OAS file is the shape of your API, every endpoint, parameter,\n` +
+          `An OpenAPI spec is the shape of your API, every endpoint, parameter,\n` +
           `and response. Later steps use it to install the right adapter and wire up\n` +
           `the middleware exactly.`,
       },
       {
         label: "What we'll do",
         body:
-          `Point ${orange(aiTool)} (running locally on your machine) at\n` +
-          `your codebase, find your routes, and write an OAS file. It lands in a new\n` +
+          `If you already have an OpenAPI or Swagger spec, point us at it, a file, a\n` +
+          `URL, or just a description of where it is. If you don't, ${orange(aiTool)} (running\n` +
+          `locally) reads your routes and writes one. Either way it lands in a new\n` +
           `${bold('.restless/')} folder, commit that along with your code, it's meant to live there.`,
       },
       {
         label: 'Privacy',
         body:
-          `Scanning runs entirely on your machine via your own ${orange(aiTool)}\n` +
-          `install. We don't see a single line of your code, and nothing gets sent to\n` +
-          `our servers at this step.`,
+          `Anything we read or generate happens on your machine via your own\n` +
+          `${orange(aiTool)} install. We don't see a single line of your code, and nothing\n` +
+          `gets sent to our servers at this step.`,
       },
     ],
-    action: 'locate APIs',
+    action: 'map your API',
   });
+
+  // Re-run shortcut: if we already recorded where this project's spec came
+  // from and it's still on disk, reuse it without re-asking.
+  const reused = reuseRememberedOas({ rootDir });
+  if (reused) {
+    const api = reused._reused;
+    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
+      `  ${green('✓')} Reusing the spec from your last setup ${dim(`(${describeOasSource(api.oasSource)})`)}: ${bold(api.oasFile)}.`,
+    ]});
+    delete reused._reused;
+    return reused;
+  }
+
+  // Up front: does the user already have a spec? If so, take it directly
+  // (file, URL, or a description the AI resolves) and skip AI detection
+  // entirely. Only fall through to the scan-and-generate flow when they don't,
+  // or when adoptExistingOas couldn't get a spec and they chose to generate.
+  update({ status: 'active', activeSub: 0, message: [
+    `  Let's get the OpenAPI spec that describes your API.`,
+  ]});
+  const haveSpec = await singleSelect(
+    [
+      { label: 'Yes, I already have an OpenAPI spec', hint: 'Point us at a file, a URL, or describe where it is.' },
+      { label: 'No, generate one with AI', hint: "We'll scan your code and write the spec." },
+    ],
+    { message: 'Do you already have an OpenAPI / Swagger spec?', defaultIndex: 0 },
+  );
+  if (haveSpec === 0) {
+    const res = await adoptExistingOas({ rootDir, packageDir, update, setSpinner });
+    if (!res.fallbackToGenerate) return res;
+  }
 
   // Detect APIs in the repo and let the user pick one.
   //
@@ -425,8 +971,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     : null;
   const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
 
-  const oasFile = '.restless/openapi.json';
-  const placeholderDomain = 'https://example.com';
+  const oasFile = OAS_FILE;
   let skipReason = null;
   let finalOasFile = oasFile;
 
@@ -466,7 +1011,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     const oasFileAbsolute = path.resolve(rootDir, oasFile);
     const vars = {
       name: selectedApi.name,
-      domain: placeholderDomain,
+      domain: PLACEHOLDER_DOMAIN,
       oasFile: oasFileAbsolute,
       existingOasNote,
       frameworkNote,
@@ -489,146 +1034,20 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     }
   }
 
-  // Ask the user the two things we need to finalize the spec: visibility
-  // and the production base URL. Grouped so they answer them back to back
-  // instead of having visibility split off into its own pre-AI screen.
-
-  // Heuristic default for visibility - bias toward "internal" if the name,
-  // framework, or routes look service-y.
-  const nameLower = (selectedApi.name || '').toLowerCase();
-  const frameworkLower = (selectedApi.framework || '').toLowerCase();
-  const endpointsLower = (selectedApi.endpoints || []).map((e) => e.toLowerCase());
-  const allPaths = endpointsLower.join(' ');
-  const internalSignals = [
-    nameLower.includes('internal'),
-    nameLower.includes('admin'),
-    nameLower.includes('private'),
-    nameLower.includes('backoffice'),
-    nameLower.includes('back-office'),
-    nameLower.includes('service'),
-    nameLower.includes('worker'),
-    nameLower.includes('queue'),
-    nameLower.includes('consumer'),
-    nameLower.includes('processor'),
-    nameLower.includes('gateway') && !nameLower.includes('api gateway'),
-    allPaths.includes('/internal/'),
-    allPaths.includes('/admin/'),
-    allPaths.includes('/_/'),
-    allPaths.includes('/rpc/'),
-    allPaths.includes('/grpc'),
-    !allPaths.includes('/v1') && !allPaths.includes('/v2') && endpointsLower.length > 3,
-    frameworkLower.includes('grpc'),
-    frameworkLower.includes('trpc'),
-  ].filter(Boolean).length;
-  const looksInternal = internalSignals >= 2;
-
-  const firstEndpoint = selectedApi.endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    '  Two quick things before we wrap up the spec.',
-  ]});
-
-  const visibilityIndex = await singleSelect(
-    [
-      { label: 'External', hint: 'Public-facing, used by your API consumers.' },
-      { label: 'Internal', hint: 'Private, only your own services or staff hit it.' },
-    ],
-    {
-      message: `Is ${selectedApi.name} external or internal?`,
-      defaultIndex: looksInternal ? 1 : 0,
-    },
-  );
-  const isInternal = visibilityIndex === 1;
-
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    '  And the base URL of your API in production:',
-    `  ${dim(`So we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
-  ]});
-  const domain = await ask(`\n  ${bold('Base URL:')} `);
-
-  // Replace placeholder domain in the AI-generated OAS file only when we
-  // actually generated one (not when we're reusing a user's existing file).
-  if (finalOasFile === oasFile && !skipReason) {
-    const oasFullPath = path.join(rootDir, oasFile);
-    try {
-      const oasContent = fs.readFileSync(oasFullPath, 'utf8');
-      const updated = oasContent.replaceAll(placeholderDomain, domain || 'http://localhost:3000');
-      safeWriteFileSync(oasFullPath, updated);
-    } catch {}
-  }
-
-  // Sub 2: Pick a test endpoint now, while the OAS is fresh in our hands.
-  // Step 3 ("Test your setup") just reads `testCurl` off the API entry,
-  // skipping a whole AI round-trip when the user is sitting at the prompt.
-  // Picking a test endpoint is rolled into the Generate OAS file sub-step
-  // since it's a small post-generation pick. We surface it via the spinner
-  // so it doesn't disappear, but it's not a top-level sub.
-  let testCurl = null;
-  if (finalOasFile) {
-    update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  Picking a safe ${bold('GET')} endpoint to use as a demo endpoint.`,
-    ]});
-    setSpinner({ phase: 'Picking a test endpoint', detail: `Reading ${finalOasFile}` });
-    try {
-      testCurl = await pickTestCurl({
-        oasFullPath: path.join(rootDir, finalOasFile),
-        baseUrl: domain,
-        packageDir,
-        setSpinner,
-      });
-    } catch {}
-    setSpinner('');
-  }
-
-  // Sub 2: Write to .restless/
-  update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
-    dim('  Saving settings...'),
-  ]});
-
-  const settings = loadSettings(rootDir);
-  upsertApi(settings, {
+  // Visibility + base URL + demo curl + settings write. Shared with the
+  // adopt-existing-spec path so both produce the same settings shape.
+  return await finalizeApi({
+    rootDir,
+    packageDir,
+    update,
+    setSpinner,
     name: selectedApi.name,
-    rootDir: selectedApi.rootDir || '.',
-    ...(finalOasFile && { oasFile: finalOasFile }),
-    framework: selectedApi.framework,
-    language: selectedApi.language?.toLowerCase(),
-    baseUrl: domain || null,
-    internal: isInternal,
-    ...(testCurl && { testCurl }),
-    lastSyncedAt: new Date().toISOString(),
-  });
-
-  // Generate a request ID prefix on the API entry (not top-level)
-  const apiEntry = settings.apis.find(a => a.rootDir === (selectedApi.rootDir || '.'));
-  if (apiEntry && !apiEntry.requestIdPrefix) {
-    // Migrate from top-level if it exists
-    if (settings.requestIdPrefix) {
-      apiEntry.requestIdPrefix = settings.requestIdPrefix;
-      delete settings.requestIdPrefix;
-    } else {
-      let projectName;
-      try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
-        projectName = pkg.name;
-      } catch {}
-      if (!projectName) {
-        projectName = path.basename(rootDir);
-      }
-      apiEntry.requestIdPrefix = generatePrefix(projectName);
-    }
-  }
-
-  saveSettings(rootDir, settings);
-
-  {
-    const doneMsg = `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`;
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [doneMsg] });
-  }
-
-  return {
-    apis: [selectedApi],
-    detectedLanguage: selectedApi.language?.toLowerCase() || null,
-    detectedFramework: selectedApi.framework || null,
     apiRootDir: selectedApi.rootDir || '.',
-    domain,
-  };
+    framework: selectedApi.framework,
+    language: selectedApi.language,
+    finalOasFile,
+    endpoints: selectedApi.endpoints || [],
+    replacePlaceholderDomain: finalOasFile === oasFile && !skipReason,
+    oasSource: { kind: 'ai' },
+  });
 }
