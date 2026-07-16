@@ -215,9 +215,72 @@ app.use(sdk.setup((ctx) => ({
 })));
 ```
 
+## Setup - Next.js (App Router)
+
+Next.js is different from every framework above. There is **no `app.use(...)` and no middleware registration.** Import the dedicated adapter `@restlessai/sdk/next` and **wrap each route handler**. `client.setup(cb)` here returns a *handler-wrapper* `(handler) => handler`, not middleware.
+
+**Never wire the SDK into `middleware.ts` (or `proxy.ts` on Next 16).** Next middleware runs on the Edge runtime and is handed a request object whose `.request` getter throws a `PageSignatureError` (code E394) the moment the adapter inspects it - so capture never even runs. An `owner.enrich` DB lookup (Mongoose/Prisma) can't run on Edge either. The SDK belongs on your route handlers, which run on the Node runtime.
+
+Create one shared client module - put it next to your routes, e.g. `lib/restless.ts` or `app/lib/restless.ts`:
+
+```ts
+// lib/restless.ts
+import restless from '@restlessai/sdk/next';
+
+export const client = restless(process.env.RESTLESS_KEY);
+
+// setup() returns a wrapper you apply to each route handler.
+export const wrap = client.setup(async (req) => ({
+  apiKey: client.mask(req.headers.get('authorization')?.slice(7)),
+  owner: /* { id, enrich } - resolve exactly as described above */ undefined,
+}));
+```
+
+Then in each route file, wrap every exported HTTP method:
+
+```ts
+// app/pets/route.ts
+import { wrap } from '@/lib/restless';
+
+async function getPets(req: Request) {
+  return Response.json(await listPets());
+}
+async function createPet(req: Request) {
+  return Response.json(await addPet(await req.json()), { status: 201 });
+}
+
+export const GET = wrap(getPets);
+export const POST = wrap(createPet);
+```
+
+Notes:
+- `req` in the setup callback is the standard Web `Request` (App Router / Node runtime). Read the credential with `req.headers.get('authorization')` etc. - not Express's `req.headers.authorization`.
+- Wrap **all** exported handlers in a file (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, ...), not just one.
+- If the file already assigns handlers to consts, wrap the existing function: `export const GET = wrap(existingGetHandler);`. Don't rewrite the handler body.
+- Do NOT add a `middleware.ts` / `proxy.ts`, and do NOT edit an existing one.
+
+## Setup - Next.js (Pages Router)
+
+Pages Router API routes (`pages/api/**`) use `NextApiRequest` / `NextApiResponse` and a single default-exported handler. Wrap that default export with the same `@restlessai/sdk/next` adapter - still never touch middleware:
+
+```ts
+// pages/api/pets.ts
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { wrap } from '@/lib/restless';
+
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  res.json(await listPets());
+}
+
+export default wrap(handler);
+```
+
+Read the credential off `req.headers.authorization` (Pages Router hands you Node's `req`, not a Web `Request`).
+
 ## Rules (hard constraints for LLM installers)
 
 - **Placement:** the middleware/plugin MUST be registered BEFORE the route definitions.
+- **Next.js:** wrap route handlers with `@restlessai/sdk/next`; there is no `app.use`. NEVER wire the SDK into `middleware.ts` / `proxy.ts` - it crashes with `PageSignatureError` (E394) on the Edge runtime. If there are no route handlers to wrap, do not fall back to middleware.
 - **Shape:** the setup callback returns `{ apiKey, owner: { id, enrich } }`. `owner` is nested and holds only `id` plus the required `enrich`. There are no inline `label` / `email` fields on `owner`, no top-level `projectId`, no top-level `project`, and no top-level `enrich`. Anything else is wrong.
 - **`owner.id` must be immutable.** Read the schema or model for the field you pick. If it could be edited by the user (email, username, display name), it is invalid.
 - **Never use the API key, the masked API key, or any secret as `owner.id`.** If you cannot find a stable internal id, use the `'NEEDS_CONFIGURATION'` placeholder + `RESTLESS_OWNER_ID_TODO` marker comment shown above. The CLI handles it.
