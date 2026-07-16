@@ -123,6 +123,70 @@ describe('scanCodebase', () => {
     expect(findFrameworkSignals(dir)).toEqual([]);
   });
 
+  it('enumerates Next.js App Router routes from the file tree', () => {
+    write(dir, 'package.json', JSON.stringify({ name: 'web', dependencies: { next: '^14' } }));
+    // Static leaf route with two methods.
+    write(
+      dir,
+      'src/app/api/chat/route.ts',
+      `export async function GET() {}\nexport async function POST() {}\n`,
+    );
+    // Deeply-nested dynamic route - the tree the single-pass generator drops.
+    write(
+      dir,
+      'src/app/api/v1/projects/[slug]/route.ts',
+      `export async function GET() {}\nexport const PATCH = handler;\n`,
+    );
+    // Catch-all segment.
+    write(dir, 'src/app/api/mcp/[...path]/route.ts', `export function POST() {}\n`);
+
+    const { endpoints } = findEndpoints(dir);
+    const sigs = endpoints.map((e) => `${e.method} ${e.path}`).sort();
+    expect(sigs).toEqual([
+      'GET /api/chat',
+      'GET /api/v1/projects/{slug}',
+      'PATCH /api/v1/projects/{slug}',
+      'POST /api/chat',
+      'POST /api/mcp/{path}',
+    ]);
+    expect(endpoints.every((e) => e.style === 'file')).toBe(true);
+  });
+
+  it('drops route groups and parallel slots, keeps private folders out', () => {
+    write(dir, 'package.json', JSON.stringify({ name: 'web', dependencies: { next: '^14' } }));
+    // Route group `(marketing)` and parallel slot `@modal` don't affect the URL.
+    write(dir, 'app/(marketing)/api/leads/route.ts', `export function POST() {}\n`);
+    write(dir, 'app/@modal/api/preview/route.ts', `export function GET() {}\n`);
+    // Private `_internal` folder opts the whole route out of routing.
+    write(dir, 'app/_internal/api/secret/route.ts', `export function GET() {}\n`);
+
+    const { endpoints } = findEndpoints(dir);
+    const sigs = endpoints.map((e) => `${e.method} ${e.path}`).sort();
+    expect(sigs).toEqual(['GET /api/preview', 'POST /api/leads']);
+  });
+
+  it('enumerates Next.js Pages Router API routes', () => {
+    write(dir, 'package.json', JSON.stringify({ name: 'web', dependencies: { next: '^13' } }));
+    write(dir, 'pages/api/health.ts', `export default function handler() {}\n`);
+    write(dir, 'pages/api/users/index.ts', `export default function handler() {}\n`);
+    write(dir, 'pages/api/users/[id].ts', `export default function handler() {}\n`);
+    write(dir, 'pages/api/_middleware.ts', `export default function m() {}\n`); // not an endpoint
+
+    const { endpoints } = findEndpoints(dir);
+    const paths = endpoints.map((e) => e.path).sort();
+    expect(paths).toEqual(['/api/health', '/api/users', '/api/users/{id}']);
+  });
+
+  it('counts file-based routes toward the package framework signal', () => {
+    write(dir, 'package.json', JSON.stringify({ name: 'web', dependencies: { next: '^14' } }));
+    write(dir, 'src/app/api/a/route.ts', `export function GET() {}\n`);
+    write(dir, 'src/app/api/b/route.ts', `export function GET() {}\n`);
+    const { frameworkSignals } = scanCodebase(dir);
+    const root = frameworkSignals.find((s) => s.package === '.');
+    expect(root).toBeDefined();
+    expect(root.endpointCount).toBe(2);
+  });
+
   it('ignores node_modules', () => {
     write(dir, 'package.json', JSON.stringify({ name: 'app', dependencies: { express: '^4' } }));
     write(dir, 'src/server.js', `const app = express();\napp.get('/real', h);\n`);

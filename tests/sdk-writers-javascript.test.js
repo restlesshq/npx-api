@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   generate, parse, readBlockFields, canonicalizeInitArg, setOwnerId, stripOwnerIdConfirm,
-  hasInit, findOldApiSetup,
+  hasInit, hasSdkReference, findOldApiSetup,
 } from '../lib/sdk-writers/javascript.js';
 
 function ctxWith(overrides = {}) {
@@ -343,6 +343,46 @@ const masked = restless.mask(req.headers.authorization);`;
     expect(hasInit('')).toBe(false);
     expect(hasInit(null)).toBe(false);
     expect(hasInit(`// see '@restlessai/sdk' docs`)).toBe(false);
+  });
+});
+
+describe('@restlessai/sdk/next subpath (Next.js adapter)', () => {
+  // The Next.js adapter is imported from the `/next` subpath. Detection must
+  // treat it as a real wiring - otherwise a correct Next install is judged
+  // "not wired" and the CLI fatals / loops.
+  const nextClient = `import restless from '@restlessai/sdk/next';
+const client = restless(process.env.RESTLESS_KEY);
+export const wrap = client.setup(async (req) => ({ apiKey: client.mask(req.headers.get('authorization')) }));`;
+
+  it('hasInit recognizes the ESM /next factory call', () => {
+    expect(hasInit(nextClient)).toBe(true);
+  });
+
+  it('hasInit recognizes a CJS /next immediate-call', () => {
+    expect(hasInit(`const client = require('@restlessai/sdk/next')(process.env.RESTLESS_KEY);`)).toBe(true);
+  });
+
+  it('parse and hasSdkReference match the /next subpath', () => {
+    expect(parse(nextClient)).not.toBeNull();
+    expect(hasSdkReference(nextClient)).toBe(true);
+  });
+
+  it('canonicalizeInitArg rewrites the /next init arg to the env ref', () => {
+    const literal = `import restless from '@restlessai/sdk/next';
+const client = restless("rstlss_literalkey");
+export const wrap = client.setup(async () => ({}));`;
+    const out = canonicalizeInitArg(literal, {
+      keyDelivery: 'env',
+      envLoader: { mode: 'auto', evidence: 'next' },
+    });
+    expect(out).toContain('const client = restless(process.env.RESTLESS_KEY);');
+    expect(out).not.toContain('rstlss_literalkey');
+  });
+
+  it('still rejects a bare /next import with no factory call (OLD-API trap)', () => {
+    const content = `import restless from '@restlessai/sdk/next';
+restless.setup(handler);`;
+    expect(hasInit(content)).toBe(false);
   });
 });
 

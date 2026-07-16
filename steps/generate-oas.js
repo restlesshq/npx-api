@@ -16,6 +16,10 @@ import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
+// How many follow-up passes we'll make to add file-based routes the first
+// generation pass left out. See ensurePathCoverage for why this exists.
+const MAX_COVERAGE_ATTEMPTS = 2;
+
 // Where a generated/adopted spec lands, and the placeholder server URL the
 // generate-oas prompt writes (swapped for the real base URL in finalizeApi).
 const OAS_FILE = '.restless/openapi.json';
@@ -52,6 +56,127 @@ async function validateAndFixOas({ oasFullPath, packageDir, setSpinner }) {
     await runAI(fixPrompt, packageDir, { setSpinner });
   }
   return { ok: false, error: 'Exhausted fix attempts' };
+}
+
+// Collapse a path to a shape we can compare across sources: parameter names
+// don't matter for coverage (`/users/{id}` == `/users/{userId}` == `/users/:id`),
+// and a trailing slash is not a distinct route.
+function normalizeApiPath(p) {
+  const collapsed = p
+    .replace(/\{[^}]+\}/g, '{}') // {id} / {userId} -> {}
+    .replace(/:[^/]+/g, '{}') // :id -> {}
+    .replace(/\/+$/, ''); // drop trailing slash
+  return collapsed === '' ? '/' : collapsed;
+}
+
+/**
+ * Compare the file-based routes on disk against the paths the generated spec
+ * actually emitted, and return the ones the spec is missing (grouped by path,
+ * with the methods and a source file to read).
+ *
+ * Deliberately scoped to file-based routes (Next.js App/Pages Router), where
+ * the enumerated path IS the full, authoritative URL. Call-expression routes
+ * (Express/Fastify) are relative to a mount prefix we can't resolve
+ * deterministically, so enforcing coverage on them would produce false
+ * "missing" entries - we leave those to the single-pass generation.
+ */
+function missingFileRoutes(apiDir, oasFullPath) {
+  let scan;
+  try {
+    scan = scanCodebase(apiDir);
+  } catch {
+    return [];
+  }
+  const fileRoutes = scan.endpoints.filter((e) => e.style === 'file');
+  if (fileRoutes.length === 0) return [];
+
+  const oas = loadOas(oasFullPath);
+  const specPaths = new Set(Object.keys(oas?.paths || {}).map(normalizeApiPath));
+
+  const byPath = new Map();
+  for (const e of fileRoutes) {
+    if (!byPath.has(e.path)) byPath.set(e.path, { path: e.path, methods: new Set(), file: e.file });
+    byPath.get(e.path).methods.add(e.method);
+  }
+
+  const missing = [];
+  for (const info of byPath.values()) {
+    if (!specPaths.has(normalizeApiPath(info.path))) {
+      missing.push({ path: info.path, methods: [...info.methods], file: info.file });
+    }
+  }
+  return missing;
+}
+
+/**
+ * Build a checklist of the file-based routes on disk to hand the generator up
+ * front, so the first pass aims for full path coverage instead of discovering
+ * endpoints as it goes (which is where it runs out of room and drops trees).
+ * Empty string when there are no file routes - nothing authoritative to list,
+ * and the generator's own exploration is fine for call-expression frameworks.
+ */
+function buildEndpointChecklist(apiDir) {
+  let scan;
+  try {
+    scan = scanCodebase(apiDir);
+  } catch {
+    return '';
+  }
+  const fileRoutes = scan.endpoints.filter((e) => e.style === 'file');
+  if (fileRoutes.length === 0) return '';
+
+  const byPath = new Map();
+  for (const e of fileRoutes) {
+    if (!byPath.has(e.path)) byPath.set(e.path, new Set());
+    byPath.get(e.path).add(e.method);
+  }
+  const lines = [...byPath.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([p, methods]) => `- ${[...methods].sort().join(', ')} ${p}`);
+
+  return [
+    `## Endpoint checklist (${byPath.size} paths, enumerated deterministically from the route files)`,
+    '',
+    'These paths MUST all appear in the generated spec. Read each route file to model its real request/response shapes, but do not drop any of these paths:',
+    '',
+    ...lines,
+  ].join('\n');
+}
+
+/**
+ * Guard against the single-pass generator's failure mode: it models schemas
+ * well but silently drops the largest/most-nested route trees when it runs
+ * out of output budget, emitting orphaned components and no error. We diff the
+ * authoritative file-route list against the spec's paths and, for anything
+ * missing, run a targeted follow-up pass that ADDS just those operations
+ * (chunked into one prompt so it can't truncate the way a whole-spec pass can).
+ * Re-checks after each pass. Returns `{ ok, missing }` - `ok` false means some
+ * routes are still absent after MAX_COVERAGE_ATTEMPTS, so the caller can
+ * surface the gap instead of shipping an incomplete spec silently.
+ */
+async function ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner }) {
+  for (let attempt = 0; attempt <= MAX_COVERAGE_ATTEMPTS; attempt++) {
+    const missing = missingFileRoutes(apiDir, oasFullPath);
+    if (missing.length === 0) return { ok: true, missing: [] };
+    if (attempt === MAX_COVERAGE_ATTEMPTS) return { ok: false, missing };
+
+    setSpinner({
+      phase: 'Adding missing endpoints',
+      detail: `${missing.length} route${missing.length === 1 ? '' : 's'} not yet in the spec`,
+    });
+    const missingList = missing
+      .map((m) => `- ${m.methods.join(', ')} ${m.path}  (${m.file})`)
+      .join('\n');
+    await runAI(loadPrompt('fill-oas-paths', { oasFile: oasFullPath, missingList }), packageDir, {
+      setSpinner,
+    });
+
+    // Re-validate after the edit - a broken write would wedge the next diff
+    // (loadOas returns null -> every route reads as "missing" forever).
+    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+    if (!validation.ok) return { ok: false, missing };
+  }
+  return { ok: false, missing: [] };
 }
 
 /**
@@ -1009,6 +1134,9 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     // project root," which sometimes meant the monorepo above the user's
     // actual package.
     const oasFileAbsolute = path.resolve(rootDir, oasFile);
+    const endpointChecklist = buildEndpointChecklist(
+      path.resolve(packageDir, selectedApi.rootDir || '.'),
+    );
     const vars = {
       name: selectedApi.name,
       domain: PLACEHOLDER_DOMAIN,
@@ -1016,6 +1144,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       existingOasNote,
       frameworkNote,
       internalNote,
+      endpointChecklist,
     };
 
     await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
@@ -1031,6 +1160,20 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
         `File: ${oasFullPath}`,
         'Try re-running, or open the file and fix it by hand.',
       ]);
+    }
+
+    // Completeness guard: the single-pass generator can silently drop large,
+    // deeply-nested route trees while still emitting their schemas. Diff the
+    // authoritative file-route list against what landed and fill any gaps.
+    const apiDir = path.resolve(packageDir, selectedApi.rootDir || '.');
+    const coverage = await ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner });
+    if (!coverage.ok && coverage.missing.length) {
+      // Never ship an incomplete spec silently - name what's still missing.
+      update({ sub: { 0: 'done' }, activeSub: 1, message: [
+        `  ${yellow('•')} ${coverage.missing.length} route${coverage.missing.length === 1 ? '' : 's'} couldn't be added to the spec automatically:`,
+        ...coverage.missing.slice(0, 8).map((m) => `    ${dim(`${m.methods.join(', ')} ${m.path}`)}`),
+        ...(coverage.missing.length > 8 ? [`    ${dim(`… and ${coverage.missing.length - 8} more`)}`] : []),
+      ]});
     }
   }
 

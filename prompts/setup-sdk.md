@@ -18,7 +18,14 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
    If you find a partial reference (an import with no setup at all, a stale comment, a callback missing `apiKey:`), treat the file as not wired and proceed with the normal wiring flow.
 
-1. **Find the server entry point.** Open the file where the framework is initialized (`express()`, `fastify()`, `new Hono()`, `createServer()`, etc.) and where routes are registered. That's where the SDK goes.
+1. **Find the integration point - it depends on the framework.**
+
+   **Next.js (App Router or Pages Router): do NOT look for a server entry point and do NOT register middleware.** Next has no `app.use(...)`. You wire capture by importing the dedicated adapter `@restlessai/sdk/next` and **wrapping route handlers** - `client.setup(cb)` returns a handler-wrapper `(handler) => handler`. Put the client + wrapper in one shared module (e.g. `lib/restless.ts`), then in each route file wrap every exported HTTP handler: `export const GET = wrap(existingGetHandler);`. Follow the "Setup - Next.js" section of the guide below exactly.
+   - **HARD RULE: never edit `middleware.ts` or `proxy.ts`** (Next 16 renamed `middleware` to `proxy`). Wiring the request-capturing SDK there crashes at runtime with `PageSignatureError` (E394) because Next middleware runs on the Edge runtime. If you find the SDK already (mis)wired into one of those files, REMOVE it and wrap the route handlers instead.
+   - Distinguish the routers: App Router uses `app/**/route.ts` with Web `Request`/`Response` on the Node runtime; Pages Router uses `pages/api/**` with `NextApiRequest`/`NextApiResponse`. `middleware.ts`/`proxy.ts` is neither - it is true Edge middleware and is off-limits.
+   - If there are genuinely no route handlers to wrap, STOP - do not emit middleware as a fallback. Say so plainly and end the run.
+
+   **Everything else (Express, Fastify, Koa, Hono, bare http):** open the file where the framework is initialized (`express()`, `fastify()`, `new Hono()`, `createServer()`, etc.) and where routes are registered. That's where the SDK middleware goes.
 
 2. **Follow the installation pattern in the guide exactly.** Here's the pattern:
 
@@ -132,7 +139,7 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 - **DO NOT modify package.json.** This includes the `scripts` block (no adding `--env-file`, no changing `start` or `dev`), `dependencies`, `engines`, or anything else. The package is already installed. Do not touch this file.
 - **DO NOT modify any other config file** (`tsconfig.json`, `.gitignore`, `Dockerfile`, CI configs, etc.). Your only edits should be to the server source file where the SDK middleware gets registered.
 - **DO NOT install or suggest installing extra packages** (e.g. `dotenv`). The SDK already handles loading `RESTLESS_KEY` from `.env` at runtime.
-- Register the middleware/plugin **BEFORE route definitions** so it captures all requests.
+- Register the middleware/plugin **BEFORE route definitions** so it captures all requests. (Next.js is the exception - there is no middleware registration; wrap route handlers with `@restlessai/sdk/next` and never touch `middleware.ts` / `proxy.ts`.)
 - Don't break existing imports, code structure, or formatting.
 - Use `require()` style imports if the project uses CommonJS (no `"type": "module"` in package.json). Use `import` style if the project uses ESM.
 - **`setup` takes EXACTLY ONE argument (the callback).** Never pass the framework instance as the first argument. `sdk.setup(app, cb)` is the OLD API and crashes at runtime. The new shape is `app.use(sdk.setup(cb))` / `fastify.register(sdk.setup(cb))` - the framework instance only appears in `app.use(...)` / `fastify.register(...)`, never inside `setup(...)`. This is true regardless of how surrounding code in the same file looks (e.g. `passport.use(app, ...)`, `sentryUtils.init(app)`); those are different libraries, do not mimic their shape.
