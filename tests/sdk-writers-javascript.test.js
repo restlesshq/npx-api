@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   generate, parse, readBlockFields, canonicalizeInitArg, setOwnerId, stripOwnerIdConfirm,
-  hasInit, hasSdkReference, findOldApiSetup,
+  hasInit, hasSdkReference, findOldApiSetup, hasWithRestless, hasDefineConfig,
 } from '../lib/sdk-writers/javascript.js';
 
 function ctxWith(overrides = {}) {
@@ -534,3 +534,79 @@ app.use(sdk.setup((req) => ({
   });
 });
 
+
+describe('Next.js plugin wiring detection (withRestless / defineConfig)', () => {
+  // The single-config integration uses NAMED exports of the /next subpath
+  // and has no factory call, so hasInit() must stay blind to it (a plugin
+  // file must not be mistaken for a classic wiring) while the dedicated
+  // checks see it.
+  const WRAPPED_CONFIG = `import { withRestless } from '@restlessai/sdk/next';
+const nextConfig = { reactStrictMode: true };
+export default withRestless(nextConfig);`;
+
+  const CAPTURE_CONFIG = `import { defineConfig, mask } from '@restlessai/sdk/next';
+export default defineConfig({
+  setup: async (req) => ({
+    apiKey: mask(req.headers.get('authorization')?.slice(7)),
+    owner: { id: 'workspace-1', enrich: async () => ({}) },
+  }),
+});`;
+
+  it('hasWithRestless matches the ESM wrapped config', () => {
+    expect(hasWithRestless(WRAPPED_CONFIG)).toBe(true);
+  });
+
+  it('hasWithRestless matches the CJS require form', () => {
+    expect(hasWithRestless(`const { withRestless } = require('@restlessai/sdk/next');
+module.exports = withRestless({});`)).toBe(true);
+  });
+
+  it('hasWithRestless follows an import alias', () => {
+    expect(hasWithRestless(`import { withRestless as withCapture } from '@restlessai/sdk/next';
+export default withCapture({});`)).toBe(true);
+  });
+
+  it('hasWithRestless needs the call, not just the import', () => {
+    expect(hasWithRestless(`import { withRestless } from '@restlessai/sdk/next';
+export default {};`)).toBe(false);
+  });
+
+  it('hasWithRestless rejects an import from the bare entry', () => {
+    expect(hasWithRestless(`import { withRestless } from '@restlessai/sdk';
+export default withRestless({});`)).toBe(false);
+  });
+
+  it('hasDefineConfig matches the capture config', () => {
+    expect(hasDefineConfig(CAPTURE_CONFIG)).toBe(true);
+  });
+
+  it('hasDefineConfig matches a CJS destructured require with alias', () => {
+    expect(hasDefineConfig(`const { defineConfig: dc, mask } = require('@restlessai/sdk/next');
+module.exports = dc({ setup: async () => ({ apiKey: mask(null) }) });`)).toBe(true);
+  });
+
+  it('hasDefineConfig needs the call, not just the import', () => {
+    expect(hasDefineConfig(`import { defineConfig } from '@restlessai/sdk/next';`)).toBe(false);
+  });
+
+  it('both return false on empty input', () => {
+    expect(hasWithRestless('')).toBe(false);
+    expect(hasDefineConfig(null)).toBe(false);
+  });
+
+  it('plugin files stay invisible to hasInit (no factory call)', () => {
+    expect(hasInit(WRAPPED_CONFIG)).toBe(false);
+    expect(hasInit(CAPTURE_CONFIG)).toBe(false);
+  });
+
+  it('readBlockFields reads the bare mask(...) credential and owner.id from a capture config', () => {
+    const fields = readBlockFields(CAPTURE_CONFIG);
+    expect(fields.credentialExpr).toBe("req.headers.get('authorization')?.slice(7)");
+    expect(fields.ownerIdExpr).toBe("'workspace-1'");
+  });
+
+  it('setOwnerId patches the owner inside a defineConfig block', () => {
+    const out = setOwnerId(CAPTURE_CONFIG, 'session.workspaceId');
+    expect(out).toContain('owner: { id: session.workspaceId, enrich: async () => ({}) }');
+  });
+});

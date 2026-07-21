@@ -10,7 +10,13 @@ import { fatalError } from '../lib/errors.js';
 import * as debug from '../lib/debug.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
-import { detectNext, isNextFramework } from '../lib/next-detect.js';
+import {
+  detectNext,
+  isNextFramework,
+  nextAutoWrapSupport,
+  nextPluginWiringStatus,
+  findNextConfigFile,
+} from '../lib/next-detect.js';
 
 /**
  * Pick the language-specific SDK writer for this run. Today we only
@@ -140,10 +146,10 @@ function isSdkWired(packageDir, language = 'javascript') {
 }
 
 /**
- * Next.js-specific wiring gate.
+ * Next.js wiring gate for the MANUAL (per-route factory) style, plus the
+ * middleware guard that applies to every style.
  *
- * On Next.js the SDK must wrap App Router route handlers via
- * `@restlessai/sdk/next` - it must NEVER be wired into the middleware file
+ * On Next.js the SDK must NEVER be wired into the middleware file
  * (`middleware.ts` / `proxy.ts`). Next passes middleware a `NextRequestHint`
  * whose `.request` getter throws `PageSignatureError` (E394) the moment the
  * SDK's adapter sniffs its argument, and middleware runs on the Edge runtime
@@ -151,8 +157,11 @@ function isSdkWired(packageDir, language = 'javascript') {
  * (any file with a factory call) is not enough: a middleware wiring passes
  * that check yet ships a crashing install.
  *
- * Returns which wired files sit on the middleware side vs the handler side,
- * and `ok` = at least one handler-side wiring AND zero middleware wirings.
+ * Returns which factory-call files sit on the middleware side vs the handler
+ * side, and `ok` = at least one handler-side wiring AND zero middleware
+ * wirings. The plugin-style wiring (withRestless + restless.config) has no
+ * factory call and is invisible here - `nextPluginWiringStatus` in
+ * lib/next-detect.js covers it; the composed gate lives in `wiredNow` below.
  */
 export function nextWiringStatus(installDir, nextInfo, language = 'javascript') {
   const writer = getSdkWriter(language);
@@ -388,6 +397,76 @@ export default async function installSdk({
   if (!detectedLanguage) detectedLanguage = 'javascript';
   const guideLanguage = languageAliases[detectedLanguage] || detectedLanguage;
 
+  // Next.js needs a fundamentally different wiring than the middleware /
+  // plugin model the guide's Express/Fastify/Koa sections describe, and it
+  // comes in two styles:
+  //
+  //   - 'plugin' (App Router on Next >= 13.4 / Turbopack >= 15.3): the
+  //     single-config integration. `withRestless` wraps the exported config
+  //     in next.config.*, `restless.config.*` holds the capture config, and
+  //     a build-time loader auto-wraps every route handler. Route files are
+  //     not touched.
+  //   - 'manual' (Pages Router, or App Router on an older Next): wrap route
+  //     handlers by hand with `@restlessai/sdk/next`.
+  //
+  // Either way the SDK must NEVER be wired into the middleware file
+  // (`middleware.ts` / `proxy.ts`). Detect the layout up front - before the
+  // API key step - so we can (a) fail fast when there's nothing to wrap,
+  // (b) hand the AI the exact files, (c) reject a middleware wiring in the
+  // gate below, and (d) let prepare-account drop the inline-key option when
+  // the plugin style is in play (it has no init line to inline a key into).
+  const nextInfo = detectNext(installDir);
+  // Trigger the Next.js path only on corroborated evidence: actual App/Pages
+  // routing files, a Next middleware file, or a Next framework label from
+  // detection. A bare `next` dependency alone (common in monorepo packages
+  // that don't actually serve the API through Next) must NOT hijack the flow.
+  const isNext =
+    nextInfo.router !== null ||
+    nextInfo.middlewareFiles.length > 0 ||
+    isNextFramework(detectedFramework);
+  const autoWrap = isNext && nextInfo.router === 'app'
+    ? nextAutoWrapSupport(installDir)
+    : { supported: false, version: null, reason: null };
+  const nextStyle = !isNext ? null : (autoWrap.supported ? 'plugin' : 'manual');
+  // prepare-account reads this to decide whether inline key delivery is
+  // even possible (the plugin style has no SDK init line in user code).
+  ctx.nextStyle = nextStyle;
+  debug.log('install-sdk.next-detect', {
+    isNext,
+    router: nextInfo.router,
+    style: nextStyle,
+    nextVersion: autoWrap.version,
+    autoWrapReason: autoWrap.reason,
+    routeHandlers: nextInfo.routeHandlerFiles.length,
+    middlewareFiles: nextInfo.middlewareFiles,
+  });
+
+  if (isNext && nextInfo.routeHandlerFiles.length === 0) {
+    // Nothing to capture. The only place left to put capture would be the
+    // middleware file - which is exactly the crash we're guarding against -
+    // so fail loudly with a clear message instead of emitting broken code.
+    // (The auto-wrap plugin needs route handlers just the same: it wraps
+    // `app/**/route.*` files, so an empty app captures nothing.)
+    const mwList = nextInfo.middlewareFiles.map((f) => bold(f)).join(', ')
+      || `${bold('middleware.ts')} / ${bold('proxy.ts')}`;
+    debug.log('install-sdk.next-no-handlers', { installDir, middlewareFiles: nextInfo.middlewareFiles });
+    fatalError(
+      "We couldn't wire the SDK into this Next.js project.",
+      [
+        `The Restless SDK captures traffic from App Router route handlers`,
+        `(${bold('app/**/route.ts')}) or Pages Router API routes (${bold('pages/api/**')}),`,
+        `but we found none under ${installLocation}.`,
+        '',
+        `It must NOT go in your Next middleware (${mwList}) - that runs on the Edge`,
+        `runtime and crashes with a PageSignatureError.`,
+        '',
+        `Add at least one route handler, then re-run \`npx ${CLI_NAME} init\`.`,
+      ],
+    );
+    // Unreachable: fatalError throws FatalExit.
+    return { detectedLanguage, detectedFramework, guideLanguage, installed: false, wired: false };
+  }
+
   // ── Sub 0: Install package ───────────────────────────────────────────────
   const alreadyInstalled = isSdkInstalled(installDir);
   if (alreadyInstalled) {
@@ -466,65 +545,39 @@ export default async function installSdk({
   // Cost: ~30-60s of AI time on re-runs that genuinely had nothing to
   // do. The AI is told to no-op if it finds a real wiring already in
   // place, so the bill is just turn-budget, not duplicate code.
-  // `preExistingWiring` is purely informational - feeds the prompt so
-  // the AI knows what it's looking at - and shapes the success message
-  // at the end.
-  const preExistingWiring = isSdkWired(installDir, detectedLanguage);
+  // `preExistingWiring` is purely informational - it shapes the progress
+  // and success messages. Plugin-style wiring counts too (it has no
+  // factory call, so isSdkWired alone can't see it).
+  const preExistingWiring =
+    isSdkWired(installDir, detectedLanguage) ||
+    (isNext && nextPluginWiringStatus(installDir).ok);
   const inlineMode = ctx.keyDelivery === 'inline';
   debug.log('install-sdk.pre-existing-wiring', { preExistingWiring, installDir });
 
-  // Next.js needs a fundamentally different wiring than the middleware /
-  // plugin model the guide's Express/Fastify/Koa sections describe: wrap App
-  // Router route handlers with `@restlessai/sdk/next`, and NEVER touch the
-  // middleware file (`middleware.ts` / `proxy.ts`). Detect the layout up
-  // front so we can (a) fail fast when there's nothing to wrap, (b) hand the
-  // AI the exact files, and (c) reject a middleware wiring in the gate below.
-  const nextInfo = detectNext(installDir);
-  // Trigger the Next.js path only on corroborated evidence: actual App/Pages
-  // routing files, a Next middleware file, or a Next framework label from
-  // detection. A bare `next` dependency alone (common in monorepo packages
-  // that don't actually serve the API through Next) must NOT hijack the flow.
-  const isNext =
-    nextInfo.router !== null ||
-    nextInfo.middlewareFiles.length > 0 ||
-    isNextFramework(detectedFramework);
-  debug.log('install-sdk.next-detect', {
-    isNext,
-    router: nextInfo.router,
-    routeHandlers: nextInfo.routeHandlerFiles.length,
-    middlewareFiles: nextInfo.middlewareFiles,
-  });
+  // Wiring that existed BEFORE this run's AI pass, by style. A complete
+  // manual (per-route) wiring from an earlier install keeps working on the
+  // new SDK, so a plugin-style re-run must accept it rather than churn the
+  // user's working setup into the plugin shape. Snapshot it here - after
+  // the AI runs we can no longer tell "pre-existing" from "just written".
+  const preNextStatus = isNext ? nextWiringStatus(installDir, nextInfo, detectedLanguage) : null;
+  const preExistingManualNextWiring = !!preNextStatus && preNextStatus.wiredHandlerSide.length > 0;
 
-  if (isNext && nextInfo.routeHandlerFiles.length === 0) {
-    // Nothing to wrap. The only place left to put capture would be the
-    // middleware file - which is exactly the crash we're guarding against -
-    // so fail loudly with a clear message instead of emitting broken code.
-    const mwList = nextInfo.middlewareFiles.map((f) => bold(f)).join(', ')
-      || `${bold('middleware.ts')} / ${bold('proxy.ts')}`;
-    debug.log('install-sdk.next-no-handlers', { installDir, middlewareFiles: nextInfo.middlewareFiles });
-    fatalError(
-      "We couldn't wire the SDK into this Next.js project.",
-      [
-        `The Restless SDK captures traffic by wrapping App Router route handlers`,
-        `(${bold('app/**/route.ts')}) or Pages Router API routes (${bold('pages/api/**')}),`,
-        `but we found none under ${installLocation}.`,
-        '',
-        `It must NOT go in your Next middleware (${mwList}) - that runs on the Edge`,
-        `runtime and crashes with a PageSignatureError.`,
-        '',
-        `Add at least one route handler, then re-run \`npx ${CLI_NAME} init\`.`,
-      ],
-    );
-    // Unreachable: fatalError throws FatalExit.
-    return { detectedLanguage, detectedFramework, guideLanguage, installed: true, wired: false };
-  }
-
-  // The wiring gate: on Next.js "wired" means a handler-side wiring exists
-  // AND no middleware file was touched; elsewhere any factory-call file counts.
-  const wiredNow = () =>
-    isNext
-      ? nextWiringStatus(installDir, nextInfo, detectedLanguage).ok
-      : isSdkWired(installDir, detectedLanguage);
+  // The wiring gate. On Next.js, ANY middleware wiring fails regardless of
+  // style. Then:
+  //   - plugin style: pass on the plugin wiring (withRestless + restless
+  //     config), OR on a manual wiring that predates this run (left alone).
+  //   - manual style: pass when a handler-side factory wiring exists.
+  // Elsewhere any factory-call file counts.
+  const wiredNow = () => {
+    if (!isNext) return isSdkWired(installDir, detectedLanguage);
+    const status = nextWiringStatus(installDir, nextInfo, detectedLanguage);
+    if (status.wiredMiddleware.length > 0) return false;
+    if (nextStyle === 'plugin') {
+      if (nextPluginWiringStatus(installDir).ok) return true;
+      return preExistingManualNextWiring && status.wiredHandlerSide.length > 0;
+    }
+    return status.wiredHandlerSide.length > 0;
+  };
 
   // Load the setup-sdk prompt once; retries re-use the base and append an
   // escalating coda telling the AI it must actually call Edit/Write.
@@ -537,34 +590,101 @@ export default async function installSdk({
     guide: setupSection,
   });
 
-  // For Next.js, append the concrete file list and the hard "never touch
-  // middleware" rule on top of the guide. The guide's Next.js section
-  // explains the wrap pattern; this coda pins it to THIS project's files.
+  // For Next.js, append the concrete files and the hard "never touch
+  // middleware" rule on top of the guide. The guide's Next.js sections
+  // explain both patterns; this coda pins the chosen one to THIS project.
   const mwLabels = nextInfo.middlewareFiles.length
     ? nextInfo.middlewareFiles.map((f) => `\`${f}\``).join(', ')
     : '`middleware.ts` / `proxy.ts`';
-  const nextCoda = isNext
-    ? `\n\n## This is a Next.js ${nextInfo.router === 'pages' ? 'Pages Router' : 'App Router'} project (READ THIS)\n\n` +
-      `Wire capture by WRAPPING route handlers with \`@restlessai/sdk/next\`. Do NOT register middleware.\n` +
-      `1. Create one shared client module (e.g. \`lib/restless.ts\` next to the routes):\n` +
-      `   \`\`\`ts\n` +
-      `   import restless from '@restlessai/sdk/next';\n` +
-      `   export const client = restless(process.env.RESTLESS_KEY);\n` +
-      `   export const wrap = client.setup(async (req) => ({ /* apiKey, owner */ }));\n` +
+  const mwHardRule =
+    `HARD RULE: do NOT edit ${mwLabels}. Next hands middleware a request whose \`.request\` getter ` +
+    `throws PageSignatureError (E394), and middleware runs on the Edge runtime where an \`owner.enrich\` ` +
+    `DB lookup can't run. If a previous attempt wired the SDK into a middleware/proxy file, REMOVE it.`;
+
+  // Plugin style: the single-config integration. The two files it consists
+  // of, resolved against this project.
+  const existingNextConfig = isNext ? findNextConfigFile(installDir) : null;
+  const nextConfigLabel = existingNextConfig
+    ? `\`${existingNextConfig}\` (this project's existing Next config - EDIT it, keep every current option)`
+    : '`next.config.mjs` (this project has no Next config yet - CREATE it)';
+  const restlessConfigName = guideLanguage === 'typescript' ? 'restless.config.ts' : 'restless.config.mjs';
+
+  const pluginCoda =
+    `\n\n## This is a Next.js App Router project (READ THIS)\n\n` +
+    `Wire capture with the SDK's single-config Next.js integration. Exactly TWO files change; ` +
+    `route files are NOT touched.\n` +
+    `1. Wrap the exported Next config with \`withRestless\` in ${nextConfigLabel}:\n` +
+    `   \`\`\`ts\n` +
+    `   import { withRestless } from '@restlessai/sdk/next';\n` +
+    `   const nextConfig = { /* existing config, unchanged */ };\n` +
+    `   export default withRestless(nextConfig);\n` +
+    `   \`\`\`\n` +
+    `   \`withRestless\` composes with object, function, and async config forms - wrap whatever is ` +
+    `exported today. For a CommonJS \`next.config.js\`, use ` +
+    `\`const { withRestless } = require('@restlessai/sdk/next');\` and ` +
+    `\`module.exports = withRestless(nextConfig);\`.\n` +
+    `2. Create \`${restlessConfigName}\` at the project root (same directory as the Next config):\n` +
+    `   \`\`\`ts\n` +
+    `   import { defineConfig, mask } from '@restlessai/sdk/next';\n` +
+    `\n` +
+    `   export default defineConfig({\n` +
+    `     setup: async (req) => ({\n` +
+    `       apiKey: mask(/* credential extracted from req */),\n` +
+    `       owner: { /* id, enrich - resolve per the guide above */ },\n` +
+    `     }),\n` +
+    `   });\n` +
+    `   \`\`\`\n` +
+    `   \`req\` is a standard Web \`Request\` - read the credential with \`req.headers.get('authorization')\`, ` +
+    `not Express's \`req.headers.authorization\`. Every apiKey / owner.id / enrich rule from the guide ` +
+    `applies to this callback exactly as written (\`mask\` is the named export here, not a client method).\n` +
+    `   CRITICAL: import auth/DB helpers LAZILY inside the setup callback ` +
+    `(\`const { getSession } = await import('@/lib/auth')\`), never at the top of the file. ` +
+    `restless.config is bundled into every route's server chunk and \`next build\` evaluates route ` +
+    `modules while collecting page data - a top-level import of DB-backed code breaks the build.\n` +
+    `3. Do NOT edit any route file and do NOT wrap handlers by hand (\`export const GET = wrap(...)\`) - ` +
+    `the plugin auto-wraps every \`app/**/route.*\` handler at build time. Exception: if this project ` +
+    `ALREADY has a complete per-route wiring from an earlier install (a shared client calling ` +
+    `\`restless(...)\` from \`@restlessai/sdk/next\` plus wrapped handlers), leave ALL of it alone and ` +
+    `end the run - that wiring still works and must not be migrated or duplicated.\n` +
+    `4. ${mwHardRule}\n` +
+    `5. There is NO SDK init line in this integration - do not write \`restless(process.env.RESTLESS_KEY)\` ` +
+    `anywhere and do not put an API key in any file. The SDK reads \`RESTLESS_KEY\` from the environment ` +
+    `at runtime by itself.`;
+
+  // Manual style: wrap route handlers by hand. Pages Router always;
+  // App Router only when the installed Next predates auto-wrap support.
+  const manualWrapExample = nextInfo.router === 'pages'
+    ? `   \`\`\`ts\n` +
+      `   export default wrap(existingHandler);\n` +
       `   \`\`\`\n` +
-      `   \`client.setup(cb)\` returns a handler-wrapper \`(handler) => handler\` - it is NOT middleware.\n` +
-      `2. In each route file, wrap every exported HTTP handler with \`wrap(...)\`:\n` +
-      `   \`\`\`ts\n` +
+      `   (Pages Router files export ONE default handler taking \`NextApiRequest\`/\`NextApiResponse\`; ` +
+      `read the credential off \`req.headers.authorization\`.)\n`
+    : `   \`\`\`ts\n` +
       `   export const GET = wrap(existingGetHandler);\n` +
       `   export const POST = wrap(existingPostHandler);\n` +
-      `   \`\`\`\n` +
-      `   Route handler files to wrap:\n` +
-      nextInfo.routeHandlerFiles.map((f) => `   - \`${f}\``).join('\n') + `\n` +
-      `3. HARD RULE: do NOT edit ${mwLabels}. Next hands middleware a request whose \`.request\` getter ` +
-      `throws PageSignatureError (E394), and middleware runs on the Edge runtime where an \`owner.enrich\` ` +
-      `DB lookup can't run. If a previous attempt wired the SDK into a middleware/proxy file, REMOVE it.\n` +
-      `4. Import from \`@restlessai/sdk/next\` (NOT bare \`@restlessai/sdk\`) and pass \`process.env.RESTLESS_KEY\`.`
-    : '';
+      `   \`\`\`\n`;
+  const manualCoda =
+    `\n\n## This is a Next.js ${nextInfo.router === 'pages' ? 'Pages Router' : 'App Router'} project (READ THIS)\n\n` +
+    (nextStyle === 'manual' && nextInfo.router === 'app' && autoWrap.reason
+      ? `(The single-config \`withRestless\` integration is NOT available here: ${autoWrap.reason}. ` +
+        `Use the manual per-route wrapping below instead - do not add \`withRestless\` to the Next config.)\n\n`
+      : '') +
+    `Wire capture by WRAPPING route handlers with \`@restlessai/sdk/next\`. Do NOT register middleware.\n` +
+    `1. Create one shared client module (e.g. \`lib/restless.ts\` next to the routes):\n` +
+    `   \`\`\`ts\n` +
+    `   import restless from '@restlessai/sdk/next';\n` +
+    `   export const client = restless(process.env.RESTLESS_KEY);\n` +
+    `   export const wrap = client.setup(async (req) => ({ /* apiKey, owner */ }));\n` +
+    `   \`\`\`\n` +
+    `   \`client.setup(cb)\` returns a handler-wrapper \`(handler) => handler\` - it is NOT middleware.\n` +
+    `2. In each route file, wrap every exported HTTP handler with \`wrap(...)\`:\n` +
+    manualWrapExample +
+    `   Route handler files to wrap:\n` +
+    nextInfo.routeHandlerFiles.map((f) => `   - \`${f}\``).join('\n') + `\n` +
+    `3. ${mwHardRule}\n` +
+    `4. Import from \`@restlessai/sdk/next\` (NOT bare \`@restlessai/sdk\`) and pass \`process.env.RESTLESS_KEY\`.`;
+
+  const nextCoda = !isNext ? '' : (nextStyle === 'plugin' ? pluginCoda : manualCoda);
 
   // The AI's job is to wire the SDK into the right entry file with
   // sentinel-bracketed comments and `process.env.RESTLESS_KEY` as a
@@ -578,14 +698,38 @@ export default async function installSdk({
   async function runSetupAi(attemptNum, userHint = null) {
     let prompt = basePrompt + nextCoda;
     if (attemptNum > 1 && isNext) {
-      // Next retries: the failure is either "wired the middleware" or "didn't
-      // wrap any handler". Tell the AI exactly which, so it can correct.
+      // Next retries: name the exact failure so the AI can correct it.
+      // Middleware wiring trumps everything; then, per style, either the
+      // missing plugin piece (withRestless / restless.config) or the
+      // missing handler wraps.
       const status = nextWiringStatus(installDir, nextInfo, detectedLanguage);
+      const plugin = nextStyle === 'plugin' ? nextPluginWiringStatus(installDir) : null;
       if (status.wiredMiddleware.length) {
+        const fixInstruction = nextStyle === 'plugin'
+          ? `REMOVE the SDK from that file, then apply the single-config integration described above ` +
+            `(\`withRestless\` in the Next config + \`${restlessConfigName}\`).`
+          : `REMOVE the SDK from that file, then wrap the route handlers above with \`wrap(...)\` from \`@restlessai/sdk/next\`.`;
         prompt += `\n\n## Retry context (READ THIS)\n\n` +
           `Your previous attempt wired the SDK into ${status.wiredMiddleware.map((f) => `\`${f}\``).join(', ')}, ` +
           `which is a Next.js middleware file. That crashes at runtime with PageSignatureError (E394). ` +
-          `REMOVE the SDK from that file, then wrap the route handlers above with \`wrap(...)\` from \`@restlessai/sdk/next\`.`;
+          fixInstruction;
+      } else if (plugin && !plugin.hasWithRestless) {
+        // Name the config file as it exists NOW - the previous attempt may
+        // have created one - not the pre-run snapshot in nextConfigLabel.
+        const configTarget = plugin.nextConfigFile
+          ? `\`${plugin.nextConfigFile}\``
+          : '`next.config.mjs` (create it - this project has no Next config)';
+        prompt += `\n\n## Retry context (READ THIS)\n\n` +
+          `Your previous attempt did not wrap the Next config export with \`withRestless\`. You MUST use ` +
+          `the Edit (or Write) tool on ${configTarget} so its exported config is wrapped: ` +
+          `\`export default withRestless(nextConfig);\` (with the \`withRestless\` import from ` +
+          `\`@restlessai/sdk/next\`). Producing text describing the change is not enough — apply it.`;
+      } else if (plugin && !plugin.hasDefineConfig) {
+        prompt += `\n\n## Retry context (READ THIS)\n\n` +
+          `The Next config is wrapped with \`withRestless\`, but \`${restlessConfigName}\` is missing or ` +
+          `does not call \`defineConfig\`. You MUST use the Write tool to create it at the project root ` +
+          `exactly as described in step 2 above (\`defineConfig\` + \`mask\` imported from ` +
+          `\`@restlessai/sdk/next\`). Producing text describing the change is not enough — apply it.`;
       } else {
         prompt += `\n\n## Retry context (READ THIS)\n\n` +
           `Your previous attempt did not wrap any route handlers. You MUST use the Edit (or Write) tool ` +
@@ -628,6 +772,12 @@ export default async function installSdk({
       `  Re-checking the ${bold('@restlessai/sdk')} wiring in your ${bold(detectedFramework || detectedLanguage)} code.`,
       dim(`  ${orange(aiTool)} is looking at what's there and adding anything missing.`),
     ]});
+  } else if (isNext && nextStyle === 'plugin') {
+    update({ activeSub: 2, message: [
+      `  Wiring ${bold('@restlessai/sdk/next')} into your ${bold(detectedFramework || 'Next.js')} config.`,
+      dim(`  ${orange(aiTool)} is adding ${bold('withRestless')} to your Next config and creating ${bold(restlessConfigName)}.`),
+      dim(`  Your route files stay untouched - the SDK wraps them at build time.`),
+    ]});
   } else if (isNext) {
     update({ activeSub: 2, message: [
       `  Wiring ${bold('@restlessai/sdk/next')} into your ${bold(detectedFramework || 'Next.js')} routes.`,
@@ -656,15 +806,32 @@ export default async function installSdk({
         // about; the coda already names the exact route files to wrap and the
         // middleware files to leave alone.
         const status = nextWiringStatus(installDir, nextInfo, detectedLanguage);
-        update({ activeSub: 2, message: status.wiredMiddleware.length
-          ? [
+        let retryMessage;
+        if (status.wiredMiddleware.length) {
+          retryMessage = [
             `  ${yellow('⚠')} ${orange(aiTool)} wired the SDK into ${bold(status.wiredMiddleware[0])} (Next middleware). Trying again.`,
-            dim('  Telling it to move the wiring onto the route handlers instead.'),
-          ]
-          : [
+            dim(nextStyle === 'plugin'
+              ? '  Telling it to move the wiring into the Next config instead.'
+              : '  Telling it to move the wiring onto the route handlers instead.'),
+          ];
+        } else if (nextStyle === 'plugin') {
+          const plugin = nextPluginWiringStatus(installDir);
+          retryMessage = !plugin.hasWithRestless
+            ? [
+              `  ${yellow('⚠')} ${orange(aiTool)} finished without adding ${bold('withRestless')} to your Next config. Trying again.`,
+              dim('  Giving it an explicit instruction to wrap the config export this time.'),
+            ]
+            : [
+              `  ${yellow('⚠')} ${orange(aiTool)} finished without creating ${bold(restlessConfigName)}. Trying again.`,
+              dim('  Giving it an explicit instruction to write the capture config this time.'),
+            ];
+        } else {
+          retryMessage = [
             `  ${yellow('⚠')} ${orange(aiTool)} finished without wrapping any route handlers. Trying again.`,
             dim('  Giving it an explicit instruction to wrap the routes this time.'),
-          ]});
+          ];
+        }
+        update({ activeSub: 2, message: retryMessage });
         await runSetupAi(attempt);
       } else if (attempt === 2) {
         update({ activeSub: 2, message: [
@@ -719,20 +886,37 @@ export default async function installSdk({
     debug.log('install-sdk.gave-up', { installDir, language: detectedLanguage, isNext });
     if (isNext) {
       // Distinguish "wired the wrong place" from "wrote nothing" so the
-      // manual-fix advice is actionable.
+      // manual-fix advice is actionable - and name the right fix for the
+      // wiring style we were installing.
       const status = nextWiringStatus(installDir, nextInfo, detectedLanguage);
-      const detail = status.wiredMiddleware.length
-        ? [
+      let detail;
+      if (status.wiredMiddleware.length) {
+        detail = [
           `${aiTool} kept wiring the SDK into ${status.wiredMiddleware.map((f) => bold(f)).join(', ')},`,
           `a Next.js middleware file. That crashes with PageSignatureError on the Edge runtime.`,
+        ];
+      } else if (nextStyle === 'plugin') {
+        const plugin = nextPluginWiringStatus(installDir);
+        detail = !plugin.hasWithRestless
+          ? [`${aiTool} read your project but never added ${bold('withRestless')} to your Next config, even after retries.`]
+          : [`${aiTool} wrapped your Next config but never wrote a valid ${bold(restlessConfigName)}, even after retries.`];
+      } else {
+        detail = [`${aiTool} read your project but never wrapped a route handler, even after retries.`];
+      }
+      const manualFix = nextStyle === 'plugin'
+        ? [
+          `Set it up by hand following docs/sdks/${guideLanguage}.md (the Next.js App Router`,
+          `section): wrap your Next config with ${bold('withRestless')} and create ${bold(restlessConfigName)}.`,
         ]
-        : [`${aiTool} read your project but never wrapped a route handler, even after retries.`];
+        : [
+          `Wrap your route handlers by hand following docs/sdks/${guideLanguage}.md`,
+          `(the Next.js section), then re-run \`npx ${CLI_NAME} init\`.`,
+        ];
       fatalError(
-        "We couldn't wire the SDK into your Next.js routes automatically.",
+        "We couldn't wire the SDK into your Next.js project automatically.",
         [
           ...detail,
-          `Wrap your App Router route handlers by hand following docs/sdks/${guideLanguage}.md`,
-          `(the Next.js section), then re-run \`npx ${CLI_NAME} init\`.`,
+          ...manualFix,
           '',
           'Re-running with --debug helps us see exactly what the AI did.',
         ],
@@ -756,9 +940,19 @@ export default async function installSdk({
   // CLI takes over: canonicalize the init line based on ctx.sdkLineSpec.
   // Runs every time (fresh install AND re-runs) so a previous broken
   // state can be repaired without another AI call.
+  //
+  // Plugin-style Next wiring has no init line to canonicalize (the SDK
+  // reads RESTLESS_KEY from the environment), so canonicalize comes back
+  // 'no-source' there. Point entryFile at restless.config.* instead -
+  // that's where the setup callback (credential + owner.id) lives, and
+  // it's what verify-owner-id / final-checks need to read.
   const canon = canonicalizeSdkBlock(ctx);
   ctx.sdkBlockPresent = true;
   ctx.entryFile = canon.file;
+  if (!ctx.entryFile && isNext && nextStyle === 'plugin') {
+    const plugin = nextPluginWiringStatus(installDir);
+    if (plugin.hasDefineConfig) ctx.entryFile = plugin.restlessConfigFile;
+  }
 
   const headerLine = preExistingWiring
     ? `  ${green('✓')} SDK wiring confirmed - left existing setup alone.`

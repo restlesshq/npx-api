@@ -6,6 +6,7 @@ import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
+import { nextPluginWiringStatus } from '../lib/next-detect.js';
 import * as debug from '../lib/debug.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
 
@@ -34,6 +35,16 @@ function getSdkWriter(language) {
  */
 function findWiredSourceFile(installDir, ctx) {
   const writer = getSdkWriter(ctx?.language || 'javascript');
+
+  // Plugin-style Next wiring: the setup callback (credential + owner.id)
+  // lives in restless.config.*, and that's the file the owner-id repair
+  // flows must patch. Resolve it directly - the grep below would surface
+  // next.config.* too (it also references the package), and which of the
+  // two comes back first is up to grep's walk order.
+  const plugin = nextPluginWiringStatus(installDir);
+  if (plugin.hasDefineConfig) {
+    return path.join(installDir, plugin.restlessConfigFile);
+  }
 
   // `hasSdkReference` (loose), not `hasInit` (strict). The strict check
   // rejects OLD-API files (they have the import but no factory call),
@@ -224,6 +235,142 @@ function describeInitForm(spec) {
 }
 
 /**
+ * Rows shared between the classic (factory + setup middleware/wrapper)
+ * checks and the Next.js plugin checks. Both wirings have a setup
+ * callback with a credential and an owner.id, a .gitignore to keep the
+ * key out of, and a redact list.
+ */
+function credentialRow(fields) {
+  return {
+    kind: 'credential',
+    ok: !!fields.credentialExpr,
+    label: 'Credential extracted',
+    detail: fields.credentialExpr
+      ? cyan(fields.credentialExpr)
+      : red('missing - every log will show up as anonymous'),
+  };
+}
+
+// owner.id security analysis. Four outcomes:
+//   - ok          → static fine AND no AI confirm marker. Pass.
+//   - unverified  → static fine BUT verify-owner-id left a CONFIRM
+//                   marker. The AI couldn't fully verify; ask the user
+//                   to confirm rather than nuking their probably-fine pick.
+//   - warning     → spoofable proxy header, mutable-looking field, etc.
+//   - critical    → secret / user-input / sentinel. Loud red.
+//
+// Critical wins over a CONFIRM marker: if the AI flagged it AND the
+// static check sees a secret/input pattern, the static signal is the
+// definitive one and we route through the repair flow.
+function ownerIdRow(fields) {
+  const idAnalysis = analyzeOwnerId(fields.ownerIdExpr);
+  const confirmReason = fields.ownerIdConfirmReason;
+  const exprText = fields.ownerIdExpr || '';
+  let severity = idAnalysis.severity;
+  if (confirmReason && severity !== 'critical') severity = 'unverified';
+
+  let detail;
+  if (severity === 'ok') {
+    detail = cyan(exprText);
+  } else if (!exprText) {
+    detail = red('not set - every log will roll up as "anonymous", and the dashboard cannot group this customer');
+  } else if (severity === 'critical') {
+    detail = `${red(exprText)}\n      ${red('SECURITY RISK:')} ${idAnalysis.reason}`;
+  } else if (severity === 'unverified') {
+    detail = `${yellow(exprText)}\n      ${yellow('Needs your confirmation:')} ${confirmReason}`;
+  } else {
+    detail = `${yellow(exprText)}\n      ${yellow('Suspect:')} ${idAnalysis.reason}`;
+  }
+  return {
+    kind: 'owner-id',
+    ok: severity === 'ok',
+    severity,
+    label: 'Owner identity',
+    detail,
+  };
+}
+
+// .gitignore covers .env. Only relevant when we created the .env file
+// ourselves - if the user already had one, we trust they manage it.
+// Returns null when the check doesn't apply.
+function gitignoreRow(ctx) {
+  const gi = path.join(ctx.installDir, '.gitignore');
+  if (!ctx.createdEnvFile || !fs.existsSync(gi)) return null;
+  let giContent = '';
+  try { giContent = fs.readFileSync(gi, 'utf8'); } catch {}
+  const covered = /(^|\n)\.env(\s|$|\/)/.test(giContent);
+  return {
+    kind: 'gitignore',
+    ok: covered,
+    label: '.gitignore covers .env',
+    detail: covered ? '.env is ignored' : red('.env is not ignored - your key could land in git'),
+    fix: covered ? null : () => safeAppendFileSync(gi, '\n.env\n'),
+  };
+}
+
+// Redacted fields (informational - no fail state).
+function redactRow(ctx) {
+  const settings = loadSettings(ctx.rootDir);
+  const apiEntry = settings.apis?.find((a) => (a.rootDir || '.') === (ctx.apiRootDir || '.')) || settings.apis?.[0];
+  const redactList = [
+    ...((apiEntry?.redact?.headers) || []),
+    ...((apiEntry?.redact?.bodyKeys) || []),
+    ...((apiEntry?.redact?.queryParams) || []),
+  ];
+  return {
+    kind: 'redact',
+    ok: true,
+    label: 'Redacted fields',
+    detail: redactList.length ? cyan(redactList.join(', ')) : dim('(none beyond SDK defaults)'),
+  };
+}
+
+/**
+ * Check set for the Next.js plugin wiring (withRestless + restless.config).
+ * There is no SDK init line here (the SDK reads RESTLESS_KEY from the
+ * environment) and no `.setup(` call site, so the init-form and old-api
+ * checks don't apply. What does: both plugin files present and valid, and
+ * the setup-callback fields (credential, owner.id) in restless.config.*.
+ */
+function runNextPluginChecks(ctx, writer, plugin) {
+  const rows = [];
+
+  rows.push({
+    kind: 'next-plugin',
+    ok: plugin.hasWithRestless,
+    label: 'Next.js plugin',
+    detail: plugin.hasWithRestless
+      ? `${cyan('withRestless')} wraps ${cyan(plugin.nextConfigFile)}`
+      : red(`withRestless isn't wrapping ${plugin.nextConfigFile || 'your Next config'} - re-run setup.`),
+  });
+
+  rows.push({
+    kind: 'capture-config',
+    ok: plugin.hasDefineConfig,
+    label: 'Capture config',
+    detail: plugin.hasDefineConfig
+      ? cyan(plugin.restlessConfigFile)
+      : red('restless.config with defineConfig is missing - re-run setup.'),
+  });
+
+  if (plugin.hasDefineConfig) {
+    let content = '';
+    try {
+      content = fs.readFileSync(path.join(ctx.installDir, plugin.restlessConfigFile), 'utf8');
+    } catch {}
+    const fields = writer.readBlockFields(content);
+    rows.push(credentialRow(fields));
+    rows.push(ownerIdRow(fields));
+  }
+
+  const gi = gitignoreRow(ctx);
+  if (gi) rows.push(gi);
+  rows.push(redactRow(ctx));
+
+  return rows;
+}
+
+/**
  * Run every check. Each check returns a row describing its outcome and,
  * when fixable, an `apply()` thunk that mutates the user's project.
  *
@@ -232,6 +379,16 @@ function describeInitForm(spec) {
  */
 export function runChecks(ctx) {
   const writer = getSdkWriter(ctx.language);
+
+  // Plugin-style Next.js wiring gets its own check set - detect it first,
+  // before the grep-based lookup treats next.config.* / restless.config.*
+  // as a classic wired file and misreads them (no init line -> a bogus
+  // "init form mismatch" on every plugin install).
+  const plugin = nextPluginWiringStatus(ctx.installDir);
+  if (plugin.hasWithRestless || plugin.hasDefineConfig) {
+    return runNextPluginChecks(ctx, writer, plugin);
+  }
+
   const sourceFile = findWiredSourceFile(ctx.installDir, ctx);
 
   if (!sourceFile) {
@@ -243,7 +400,6 @@ export function runChecks(ctx) {
     }];
   }
 
-  const relSource = path.relative(ctx.installDir, sourceFile);
   const content = fs.readFileSync(sourceFile, 'utf8');
   const rows = [];
   const fields = writer.readBlockFields(content);
@@ -289,82 +445,17 @@ export function runChecks(ctx) {
   });
 
   // ── 2. Credential extracted in setup callback.
-  rows.push({
-    kind: 'credential',
-    ok: !!fields.credentialExpr,
-    label: 'Credential extracted',
-    detail: fields.credentialExpr
-      ? cyan(fields.credentialExpr)
-      : red('missing - every log will show up as anonymous'),
-  });
+  rows.push(credentialRow(fields));
 
-  // ── 3. owner.id security analysis. Four outcomes:
-  //   - ok          → static fine AND no AI confirm marker. Pass.
-  //   - unverified  → static fine BUT verify-owner-id left a CONFIRM
-  //                   marker. The AI couldn't fully verify; ask the user
-  //                   to confirm rather than nuking their probably-fine pick.
-  //   - warning     → spoofable proxy header, mutable-looking field, etc.
-  //   - critical    → secret / user-input / sentinel. Loud red.
-  //
-  // Critical wins over a CONFIRM marker: if the AI flagged it AND the
-  // static check sees a secret/input pattern, the static signal is the
-  // definitive one and we route through the repair flow.
-  const idAnalysis = analyzeOwnerId(fields.ownerIdExpr);
-  const confirmReason = fields.ownerIdConfirmReason;
-  const exprText = fields.ownerIdExpr || '';
-  let severity = idAnalysis.severity;
-  if (confirmReason && severity !== 'critical') severity = 'unverified';
+  // ── 3. owner.id security analysis (see ownerIdRow for the outcomes).
+  rows.push(ownerIdRow(fields));
 
-  let detail;
-  if (severity === 'ok') {
-    detail = cyan(exprText);
-  } else if (!exprText) {
-    detail = red('not set - every log will roll up as "anonymous", and the dashboard cannot group this customer');
-  } else if (severity === 'critical') {
-    detail = `${red(exprText)}\n      ${red('SECURITY RISK:')} ${idAnalysis.reason}`;
-  } else if (severity === 'unverified') {
-    detail = `${yellow(exprText)}\n      ${yellow('Needs your confirmation:')} ${confirmReason}`;
-  } else {
-    detail = `${yellow(exprText)}\n      ${yellow('Suspect:')} ${idAnalysis.reason}`;
-  }
-  rows.push({
-    kind: 'owner-id',
-    ok: severity === 'ok',
-    severity,
-    label: 'Owner identity',
-    detail,
-  });
-
-  // ── 4. .gitignore covers .env. Only run when we created the .env file
-  // ourselves - if the user already had one, we trust they manage it.
-  const gi = path.join(ctx.installDir, '.gitignore');
-  if (ctx.createdEnvFile && fs.existsSync(gi)) {
-    let giContent = '';
-    try { giContent = fs.readFileSync(gi, 'utf8'); } catch {}
-    const covered = /(^|\n)\.env(\s|$|\/)/.test(giContent);
-    rows.push({
-      kind: 'gitignore',
-      ok: covered,
-      label: '.gitignore covers .env',
-      detail: covered ? '.env is ignored' : red('.env is not ignored - your key could land in git'),
-      fix: covered ? null : () => safeAppendFileSync(gi, '\n.env\n'),
-    });
-  }
+  // ── 4. .gitignore covers .env (when we created the .env ourselves).
+  const gi = gitignoreRow(ctx);
+  if (gi) rows.push(gi);
 
   // ── 5. Redacted fields (informational - no fail state).
-  const settings = loadSettings(ctx.rootDir);
-  const apiEntry = settings.apis?.find((a) => (a.rootDir || '.') === (ctx.apiRootDir || '.')) || settings.apis?.[0];
-  const redactList = [
-    ...((apiEntry?.redact?.headers) || []),
-    ...((apiEntry?.redact?.bodyKeys) || []),
-    ...((apiEntry?.redact?.queryParams) || []),
-  ];
-  rows.push({
-    kind: 'redact',
-    ok: true,
-    label: 'Redacted fields',
-    detail: redactList.length ? cyan(redactList.join(', ')) : dim('(none beyond SDK defaults)'),
-  });
+  rows.push(redactRow(ctx));
 
   return rows;
 }

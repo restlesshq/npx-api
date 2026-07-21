@@ -334,3 +334,103 @@ app.use(sdk.setup((req) => ({
     expect(after).toContain('TODO: move this out of the codebase');
   });
 });
+
+// The Next.js plugin wiring (withRestless in next.config.* + defineConfig in
+// restless.config.*) has no SDK init line and no `.setup(` call site, so
+// runChecks must swap the init-form / old-api checks for the plugin-file
+// checks while keeping the credential / owner.id / gitignore / redact rows.
+describe('runChecks (Next.js plugin wiring)', () => {
+  let dir;
+  beforeEach(() => {
+    dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'final-checks-next-')));
+    setGitRoot(dir);
+    fs.mkdirSync(path.join(dir, '.restless'));
+    fs.writeFileSync(path.join(dir, '.restless', 'settings.json'), JSON.stringify({ apis: [{ rootDir: '.' }] }));
+  });
+  afterEach(() => {
+    setGitRoot(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function ctxFor(overrides = {}) {
+    return {
+      packageDir: dir, rootDir: dir, apiRootDir: '.', installDir: dir, apiDir: dir,
+      language: 'typescript', framework: 'Next.js', aiTool: 'Claude Code',
+      envLoader: { mode: 'none', evidence: 'none' },
+      apiKey: null, projectId: null, setupKey: null,
+      keyDelivery: 'env', envFile: null, envRelative: null,
+      ...overrides,
+    };
+  }
+
+  const WRAPPED_CONFIG = `import { withRestless } from '@restlessai/sdk/next';
+export default withRestless({ reactStrictMode: true });`;
+
+  function captureConfig(ownerIdExpr = "'workspace-1'") {
+    return `import { defineConfig, mask } from '@restlessai/sdk/next';
+export default defineConfig({
+  setup: async (req) => ({
+    apiKey: mask(req.headers.get('authorization')?.slice(7)),
+    owner: { id: ${ownerIdExpr}, enrich: async () => ({}) },
+  }),
+});`;
+  }
+
+  it('passes every check on a fully wired plugin install', () => {
+    fs.writeFileSync(path.join(dir, 'next.config.mjs'), WRAPPED_CONFIG);
+    fs.writeFileSync(path.join(dir, 'restless.config.ts'), captureConfig());
+    const rows = runChecks(ctxFor());
+    const byKind = Object.fromEntries(rows.map((r) => [r.kind, r]));
+    expect(byKind['next-plugin'].ok).toBe(true);
+    expect(byKind['capture-config'].ok).toBe(true);
+    expect(byKind['credential'].ok).toBe(true);
+    expect(byKind['owner-id'].ok).toBe(true);
+    expect(byKind['redact'].ok).toBe(true);
+    // No classic-wiring rows: there is no init line to check and no
+    // `.setup(` call site for the old-api guard to misread.
+    expect(byKind['init-form']).toBeUndefined();
+    expect(byKind['old-api']).toBeUndefined();
+    expect(byKind['no-source']).toBeUndefined();
+  });
+
+  it('flags zero-config mode (withRestless without a restless.config)', () => {
+    fs.writeFileSync(path.join(dir, 'next.config.mjs'), WRAPPED_CONFIG);
+    const rows = runChecks(ctxFor());
+    const byKind = Object.fromEntries(rows.map((r) => [r.kind, r]));
+    expect(byKind['next-plugin'].ok).toBe(true);
+    expect(byKind['capture-config'].ok).toBe(false);
+    // Without a capture config there is no callback to read fields from.
+    expect(byKind['credential']).toBeUndefined();
+    expect(byKind['owner-id']).toBeUndefined();
+  });
+
+  it('flags a restless.config whose next.config lost the withRestless wrap', () => {
+    fs.writeFileSync(path.join(dir, 'next.config.mjs'), 'export default { reactStrictMode: true };');
+    fs.writeFileSync(path.join(dir, 'restless.config.ts'), captureConfig());
+    const rows = runChecks(ctxFor());
+    const byKind = Object.fromEntries(rows.map((r) => [r.kind, r]));
+    expect(byKind['next-plugin'].ok).toBe(false);
+    expect(byKind['capture-config'].ok).toBe(true);
+    // The callback still gets read so owner/credential state is visible.
+    expect(byKind['credential'].ok).toBe(true);
+  });
+
+  it('runs the owner.id security analysis against the capture config', () => {
+    fs.writeFileSync(path.join(dir, 'next.config.mjs'), WRAPPED_CONFIG);
+    fs.writeFileSync(path.join(dir, 'restless.config.ts'), captureConfig('req.query.tenant'));
+    const rows = runChecks(ctxFor());
+    const owner = rows.find((r) => r.kind === 'owner-id');
+    expect(owner.ok).toBe(false);
+    expect(owner.severity).toBe('critical');
+  });
+
+  it('keeps the gitignore check for the env-delivered key', () => {
+    fs.writeFileSync(path.join(dir, 'next.config.mjs'), WRAPPED_CONFIG);
+    fs.writeFileSync(path.join(dir, 'restless.config.ts'), captureConfig());
+    fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules\n');
+    const rows = runChecks(ctxFor({ createdEnvFile: true }));
+    const gi = rows.find((r) => r.kind === 'gitignore');
+    expect(gi.ok).toBe(false);
+    expect(typeof gi.fix).toBe('function');
+  });
+});

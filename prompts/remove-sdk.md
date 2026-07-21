@@ -24,7 +24,12 @@ For each file above (and anywhere else you find SDK code), remove:
 
 4. **Any other call sites** of SDK methods: `sdk.mask(...)`, `restless.mask(...)`, `sdk.upsertUser(...)`, etc. If a helper variable was defined purely to feed the SDK callback (e.g. `function getApiKey(req) { ... }` only used inside `sdk.setup(req => ({ apiKey: sdk.mask(getApiKey(req)) }))`), remove that helper too.
 
-5. **Comments** that mention Restless, ReadMe, `@restlessai/sdk`, `RESTLESS_KEY`, or the install steps left behind by `npx api init`.
+5. **The Next.js single-config integration**, if present:
+   - In `next.config.*`: remove the `withRestless` import and UNWRAP the config export - `export default withRestless(nextConfig)` goes back to `export default nextConfig` (same for `module.exports` / function / async forms). Every other config option stays exactly as it is.
+   - `restless.config.*` at the project root exists solely for the SDK: strip it to a minimal valid empty module (`export {}`).
+   - Per-route wrapping, if any (`export const GET = wrap(getPets)` with `wrap` from a Restless client module): unwrap back to `export const GET = getPets;` and remove the shared client module's SDK code.
+
+6. **Comments** that mention Restless, ReadMe, `@restlessai/sdk`, `RESTLESS_KEY`, or the install steps left behind by `npx api init`.
 
 ## Rules
 

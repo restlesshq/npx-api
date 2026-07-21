@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { inlineKeyIntoSource, nextWiringStatus } from '../steps/install-sdk.js';
-import { detectNext } from '../lib/next-detect.js';
+import { detectNext, nextPluginWiringStatus } from '../lib/next-detect.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 
 function tmp() {
@@ -252,5 +252,60 @@ export async function proxy(req) { await restlessMiddleware(req); }`,
     const status = nextWiringStatus(dir, info, 'typescript');
     expect(status.ok).toBe(false);
     expect(status.wired).toEqual([]);
+  });
+});
+
+// The plugin-style wiring (withRestless + restless.config) has no factory
+// call, so it is deliberately INVISIBLE to nextWiringStatus - the composed
+// gate in installSdk pairs that status (for the middleware guard and manual
+// wraps) with nextPluginWiringStatus (for the plugin files). These tests pin
+// the interplay.
+describe('nextWiringStatus vs the plugin wiring', () => {
+  let dir;
+
+  function put(rel, content = '') {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+  }
+
+  beforeEach(() => { dir = tmp(); setGitRoot(dir); });
+  afterEach(() => { setGitRoot(null); fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('a pure plugin install has zero factory wirings but a passing plugin status', () => {
+    put('package.json', JSON.stringify({ dependencies: { next: '16.0.0' } }));
+    put(path.join('app', 'pets', 'route.ts'), 'export async function GET() { return Response.json([]); }');
+    put('next.config.mjs', `import { withRestless } from '@restlessai/sdk/next';
+export default withRestless({});`);
+    put('restless.config.ts', `import { defineConfig, mask } from '@restlessai/sdk/next';
+export default defineConfig({ setup: async (req) => ({ apiKey: mask(req.headers.get('authorization')) }) });`);
+
+    const info = detectNext(dir);
+    const status = nextWiringStatus(dir, info, 'typescript');
+    // Invisible to the factory-call gate...
+    expect(status.wired).toEqual([]);
+    expect(status.wiredMiddleware).toEqual([]);
+    // ...but fully wired per the plugin gate.
+    expect(nextPluginWiringStatus(dir).ok).toBe(true);
+  });
+
+  it('a middleware mis-wiring is still caught alongside a plugin install', () => {
+    put('package.json', JSON.stringify({ dependencies: { next: '16.0.0' } }));
+    put(path.join('app', 'pets', 'route.ts'), 'export async function GET() { return Response.json([]); }');
+    put('next.config.mjs', `import { withRestless } from '@restlessai/sdk/next';
+export default withRestless({});`);
+    put('restless.config.ts', `import { defineConfig } from '@restlessai/sdk/next';
+export default defineConfig({ setup: async () => ({}) });`);
+    // A stray factory wiring in the middleware file - the crash case.
+    put(path.join('src', 'proxy.ts'), `import restless from '@restlessai/sdk/next';
+const sdk = restless(process.env.RESTLESS_KEY);
+export async function proxy(req) { return sdk.setup(() => ({}))(req); }`);
+
+    const info = detectNext(dir);
+    const status = nextWiringStatus(dir, info, 'typescript');
+    expect(status.wiredMiddleware).toEqual([path.join('src', 'proxy.ts')]);
+    // Plugin status alone says ok - which is exactly why the composed gate
+    // in installSdk must ALSO require zero middleware wirings.
+    expect(nextPluginWiringStatus(dir).ok).toBe(true);
   });
 });

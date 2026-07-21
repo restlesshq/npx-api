@@ -194,7 +194,11 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
 
   // Build the option list. The first option differs based on whether we'd
   // be appending to an existing .env or creating a new one. The inline
-  // option is always offered as an explicit testing-only escape hatch.
+  // option is offered as an explicit testing-only escape hatch - EXCEPT on
+  // the Next.js plugin wiring (withRestless + restless.config), which has
+  // no SDK init line in user code to inline a key into; the SDK reads
+  // RESTLESS_KEY from the environment there. Offering inline would let the
+  // user pick a delivery mode where the key ends up nowhere.
   const options = [
     existingEnvFile
       ? {
@@ -214,6 +218,11 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
       hint: "We'll print the line so you can paste it wherever you load env vars.",
     },
   ];
+  const optionValues = ['env', 'inline', 'manual'];
+  if (ctx.nextStyle === 'plugin') {
+    options.splice(1, 1);
+    optionValues.splice(1, 1);
+  }
 
   update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
     `  We've generated your ${bold('RESTLESS_KEY')}: ${keyPreview}.`,
@@ -224,14 +233,14 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   });
 
   let createdEnvFile = false;
-  if (choice === 0) {
+  keyDelivery = optionValues[choice] || 'env';
+  if (keyDelivery === 'env') {
     if (existingEnvFile) {
       safeAppendFileSync(envFile, `\n${appendLine}\n`);
     } else {
       safeWriteFileSync(envFile, `${appendLine}\n`);
       createdEnvFile = true;
     }
-    keyDelivery = 'env';
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
       existingEnvFile
         ? `  ${green('✓')} Added ${bold('RESTLESS_KEY')} to ${bold(envRelative)}.`
@@ -240,14 +249,12 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
       dim(`  If your server uses a file watcher (nodemon, tsx --watch, node --watch),`),
       dim(`  it'll restart automatically after we wire the middleware in.`),
     ]});
-  } else if (choice === 1) {
-    keyDelivery = 'inline';
+  } else if (keyDelivery === 'inline') {
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
       `  ${yellow('⚠')} Inline mode: we'll embed the key directly in the SDK init line during the next sub-step.`,
       dim(`  Suitable for quick local testing only - don't commit this code.`),
     ]});
   } else {
-    keyDelivery = 'manual';
     update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: [
       `  ${bold('Set RESTLESS_KEY however your server reads env vars')}  ${yellow("- we won't show this key again:")}`,
       '',

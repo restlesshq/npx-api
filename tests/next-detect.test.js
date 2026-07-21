@@ -2,7 +2,16 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { detectNext, isNextMiddlewareFile, isNextFramework } from '../lib/next-detect.js';
+import {
+  detectNext,
+  isNextMiddlewareFile,
+  isNextFramework,
+  findNextConfigFile,
+  findRestlessConfigFile,
+  resolveNextVersion,
+  nextAutoWrapSupport,
+  nextPluginWiringStatus,
+} from '../lib/next-detect.js';
 
 function tmp() {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'next-detect-')));
@@ -140,5 +149,178 @@ describe('detectNext', () => {
 
     const info = detectNext(dir);
     expect(info.appRouteFiles).toEqual([path.join('app', 'pets', 'route.ts')]);
+  });
+});
+
+describe('findNextConfigFile / findRestlessConfigFile', () => {
+  let dir;
+  beforeEach(() => { dir = tmp(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('finds each supported Next config name at the root', () => {
+    for (const name of ['next.config.js', 'next.config.mjs', 'next.config.ts']) {
+      const d = tmp();
+      put(d, name, 'export default {};');
+      expect(findNextConfigFile(d)).toBe(name);
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('finds each restless.config name from the SDK discovery set', () => {
+    for (const name of ['restless.config.ts', 'restless.config.mjs', 'restless.config.js']) {
+      const d = tmp();
+      put(d, name, 'export default {};');
+      expect(findRestlessConfigFile(d)).toBe(name);
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('returns null when the files are absent or not at the root', () => {
+    put(dir, path.join('config', 'next.config.js'), 'export default {};'); // nested - Next ignores it
+    expect(findNextConfigFile(dir)).toBe(null);
+    expect(findRestlessConfigFile(dir)).toBe(null);
+  });
+});
+
+describe('resolveNextVersion', () => {
+  let dir;
+  beforeEach(() => { dir = tmp(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('prefers the installed node_modules/next version', () => {
+    put(dir, 'package.json', JSON.stringify({ dependencies: { next: '^15.0.0' } }));
+    put(dir, path.join('node_modules', 'next', 'package.json'), JSON.stringify({ version: '15.4.2' }));
+    expect(resolveNextVersion(dir)).toBe('15.4.2');
+  });
+
+  it('walks up to a hoisted monorepo install', () => {
+    put(dir, path.join('node_modules', 'next', 'package.json'), JSON.stringify({ version: '16.1.0' }));
+    const workspace = path.join(dir, 'packages', 'api');
+    fs.mkdirSync(workspace, { recursive: true });
+    put(dir, path.join('packages', 'api', 'package.json'), JSON.stringify({ dependencies: { next: '*' } }));
+    expect(resolveNextVersion(workspace)).toBe('16.1.0');
+  });
+
+  it('falls back to the declared dependency range', () => {
+    put(dir, 'package.json', JSON.stringify({ dependencies: { next: '^14.2.0' } }));
+    expect(resolveNextVersion(dir)).toBe('^14.2.0');
+  });
+
+  it('returns null when nothing declares Next', () => {
+    put(dir, 'package.json', JSON.stringify({ dependencies: { express: '4.0.0' } }));
+    expect(resolveNextVersion(dir)).toBe(null);
+  });
+});
+
+describe('nextAutoWrapSupport', () => {
+  let dir;
+  beforeEach(() => { dir = tmp(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  function scaffold(version, scripts = {}) {
+    put(dir, 'package.json', JSON.stringify({ dependencies: { next: '*' }, scripts }));
+    put(dir, path.join('node_modules', 'next', 'package.json'), JSON.stringify({ version }));
+  }
+
+  it('supports a modern Next on webpack', () => {
+    scaffold('15.4.2');
+    expect(nextAutoWrapSupport(dir)).toEqual({ supported: true, version: '15.4.2', reason: null });
+  });
+
+  it('supports Next 16 with Turbopack scripts', () => {
+    scaffold('16.0.0', { build: 'next build --turbopack' });
+    expect(nextAutoWrapSupport(dir).supported).toBe(true);
+  });
+
+  it('rejects Next older than 13.4 (webpack auto-wrap floor)', () => {
+    scaffold('13.2.0');
+    const support = nextAutoWrapSupport(dir);
+    expect(support.supported).toBe(false);
+    expect(support.reason).toMatch(/13\.4/);
+  });
+
+  it('rejects Turbopack builds on Next older than 15.3', () => {
+    scaffold('15.1.0', { dev: 'next dev --turbopack' });
+    const support = nextAutoWrapSupport(dir);
+    expect(support.supported).toBe(false);
+    expect(support.reason).toMatch(/Turbopack/);
+  });
+
+  it('honors the old --turbo flag spelling too', () => {
+    scaffold('14.2.0', { dev: 'next dev --turbo' });
+    expect(nextAutoWrapSupport(dir).supported).toBe(false);
+  });
+
+  it('allows webpack builds on 14.x when no script uses Turbopack', () => {
+    scaffold('14.2.0', { dev: 'next dev', build: 'next build' });
+    expect(nextAutoWrapSupport(dir).supported).toBe(true);
+  });
+
+  it('assumes a modern release when the version is unknowable', () => {
+    // No package.json at all - detection elsewhere already corroborated Next.
+    expect(nextAutoWrapSupport(dir)).toEqual({ supported: true, version: null, reason: null });
+  });
+});
+
+describe('nextPluginWiringStatus', () => {
+  let dir;
+  beforeEach(() => { dir = tmp(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const WRAPPED_CONFIG = `import { withRestless } from '@restlessai/sdk/next';
+const nextConfig = { reactStrictMode: true };
+export default withRestless(nextConfig);`;
+
+  const CAPTURE_CONFIG = `import { defineConfig, mask } from '@restlessai/sdk/next';
+export default defineConfig({
+  setup: async (req) => ({ apiKey: mask(req.headers.get('authorization')) }),
+});`;
+
+  it('is ok when both plugin files are wired', () => {
+    put(dir, 'next.config.mjs', WRAPPED_CONFIG);
+    put(dir, 'restless.config.ts', CAPTURE_CONFIG);
+    const status = nextPluginWiringStatus(dir);
+    expect(status).toEqual({
+      nextConfigFile: 'next.config.mjs',
+      restlessConfigFile: 'restless.config.ts',
+      hasWithRestless: true,
+      hasDefineConfig: true,
+      ok: true,
+    });
+  });
+
+  it('recognizes the CommonJS require form', () => {
+    put(dir, 'next.config.js', `const { withRestless } = require('@restlessai/sdk/next');
+module.exports = withRestless({ reactStrictMode: true });`);
+    put(dir, 'restless.config.js', `const { defineConfig, mask } = require('@restlessai/sdk/next');
+module.exports = defineConfig({ setup: async (req) => ({ apiKey: mask(null) }) });`);
+    expect(nextPluginWiringStatus(dir).ok).toBe(true);
+  });
+
+  it('is not ok with withRestless alone (zero-config mode)', () => {
+    put(dir, 'next.config.mjs', WRAPPED_CONFIG);
+    const status = nextPluginWiringStatus(dir);
+    expect(status.hasWithRestless).toBe(true);
+    expect(status.hasDefineConfig).toBe(false);
+    expect(status.ok).toBe(false);
+  });
+
+  it('is not ok with a restless.config alone', () => {
+    put(dir, 'next.config.mjs', 'export default { reactStrictMode: true };');
+    put(dir, 'restless.config.ts', CAPTURE_CONFIG);
+    const status = nextPluginWiringStatus(dir);
+    expect(status.hasWithRestless).toBe(false);
+    expect(status.hasDefineConfig).toBe(true);
+    expect(status.ok).toBe(false);
+  });
+
+  it('requires the import AND the call, not a stray mention', () => {
+    put(dir, 'next.config.mjs', `// TODO: add withRestless from '@restlessai/sdk/next'
+export default {};`);
+    put(dir, 'restless.config.ts', `import { defineConfig } from '@restlessai/sdk/next';
+// defineConfig never called`);
+    const status = nextPluginWiringStatus(dir);
+    expect(status.hasWithRestless).toBe(false);
+    expect(status.hasDefineConfig).toBe(false);
   });
 });
