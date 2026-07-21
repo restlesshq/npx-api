@@ -1,10 +1,10 @@
 {
-  "name": "api-beta",
-  "version": "0.1.4",
+  "name": "@restlessai/cli",
+  "version": "0.2.0",
   "description": "AI-powered SDK installer CLI. Scans your project, generates an OpenAPI spec, and wires up the ReadMe SDK.",
   "type": "module",
   "bin": {
-    "api-beta": "bin/api.js"
+    "api": "bin/api.js"
   },
   "files": [
     "bin",

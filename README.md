@@ -1,4 +1,4 @@
-# npx api-beta init
+# npx api init
 
 Restless makes sure every 🔴 400 Bad Request turns out 🟢 200 Okay.
 
