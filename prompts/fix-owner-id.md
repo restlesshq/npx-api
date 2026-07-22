@@ -6,7 +6,11 @@ The Restless SDK is already wired into this {{language}} project that uses {{fra
 
 ## What to do
 
-1. **Find the file containing the SDK setup code.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. There will be one server file with `restless()` / `require('@restlessai/sdk')()` plus an `sdk.setup((req) => ({ ... }))` registration. That's the only file you should edit.
+1. **Find the file containing the SDK setup code.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
+   - Classic: a server file with `restless()` / `require('@restlessai/sdk')()` plus an `sdk.setup((req) => ({ ... }))` registration.
+   - Next.js single-config: a `restless.config.*` at the project root containing `defineConfig({ setup: async (req) => ({ ... }) })` (ignore `next.config.*` - it only wraps the build config and holds no owner).
+
+   That's the only file you should edit.
 
 2. **Look harder at the codebase for a stable, immutable identity field.** `owner.id` is the **permanent identifier the dashboard pins this customer's entire log history to**. Once a customer has produced any logs under one id, changing it fragments their history.
 
@@ -43,9 +47,11 @@ The Restless SDK is already wired into this {{language}} project that uses {{fra
    }))
    ```
 
+   (Next.js single-config shape: the same return object inside `defineConfig({ setup: async (req) => ({ ... }) })`, with `apiKey: mask(<credential>)` - `mask` is a named import there.)
+
    If the file currently uses the legacy `project: { id: ... }` shape, rewrite the property name to `owner` while you're patching the expression.
 
-   Do NOT change the `apiKey:` line. Do NOT change the SDK init line above. Do NOT touch anything else in the file.
+   Do NOT change the `apiKey:` line. Do NOT change the SDK init line above (if there is one). Do NOT touch anything else in the file.
 
 ## Rules
 

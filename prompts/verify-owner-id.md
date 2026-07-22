@@ -11,7 +11,11 @@ So: be skeptical. Confirm rather than assume.
 
 ## What to do
 
-1. **Find the wired file.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. There will be one file containing `sdk.setup((req) => ({ ... }))`. Open it and locate the `owner: { id: <expr> }` line inside the setup callback.
+1. **Find the wired file.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
+   - Classic: a file containing `sdk.setup((req) => ({ ... }))`.
+   - Next.js single-config: a `restless.config.*` at the project root containing `defineConfig({ setup: async (req) => ({ ... }) })` (ignore `next.config.*` - it only wraps the build config and holds no owner).
+
+   Open the file and locate the `owner: { id: <expr> }` line inside the setup callback.
 
 2. **Extract the expression.** Note the exact code currently inside `owner: { id: <expr> }`. This is what you're verifying.
 

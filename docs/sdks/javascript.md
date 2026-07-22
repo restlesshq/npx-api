@@ -215,16 +215,68 @@ app.use(sdk.setup((ctx) => ({
 })));
 ```
 
-## Setup - Next.js (App Router)
+## Setup - Next.js (App Router) - single config, zero route changes
 
-Next.js is different from every framework above. There is **no `app.use(...)` and no middleware registration.** Import the dedicated adapter `@restlessai/sdk/next` and **wrap each route handler**. `client.setup(cb)` here returns a *handler-wrapper* `(handler) => handler`, not middleware.
+Next.js is different from every framework above. There is **no `app.use(...)` and no middleware registration.** On the App Router (Next >= 13.4 for webpack builds, >= 15.3 for Turbopack builds) the SDK ships a build-time plugin: exactly **two files** change, and **route files are not touched**.
 
 **Never wire the SDK into `middleware.ts` (or `proxy.ts` on Next 16).** Next middleware runs on the Edge runtime and is handed a request object whose `.request` getter throws a `PageSignatureError` (code E394) the moment the adapter inspects it - so capture never even runs. An `owner.enrich` DB lookup (Mongoose/Prisma) can't run on Edge either. The SDK belongs on your route handlers, which run on the Node runtime.
 
-Create one shared client module - put it next to your routes, e.g. `lib/restless.ts` or `app/lib/restless.ts`:
+**File 1: wrap the Next config with `withRestless`** (works from `next.config.ts` / `.mjs` / `.js`, and with object / function / async config forms - keep every existing option):
 
 ```ts
-// lib/restless.ts
+// next.config.ts
+import { withRestless } from '@restlessai/sdk/next';
+
+const nextConfig = { /* your existing config, unchanged */ };
+export default withRestless(nextConfig);
+```
+
+For a CommonJS `next.config.js`: `const { withRestless } = require('@restlessai/sdk/next');` and `module.exports = withRestless(nextConfig);`. If the project has no Next config at all, create `next.config.mjs` containing just the import and `export default withRestless({});`.
+
+**File 2: create `restless.config.ts` at the project root** (next to the Next config; `restless.config.{ts,mts,cts,js,mjs,cjs}` are all discovered):
+
+```ts
+// restless.config.ts
+import { defineConfig, mask } from '@restlessai/sdk/next';
+
+export default defineConfig({
+  setup: async (req) => {
+    // Lazy-import anything heavy (auth helpers, DB clients) INSIDE the
+    // callback - see the warning below.
+    const { getSessionUser } = await import('@/lib/auth');
+    const user = await getSessionUser(req);
+    return {
+      apiKey: mask(req.headers.get('authorization')?.slice(7)),
+      owner: user ? {
+        id: user.workspaceId,
+        enrich: async (id) => {
+          const { db } = await import('@/lib/db');
+          const ws = await db.workspaces.findById(id);
+          return { label: ws.name, email: ws.adminEmails };
+        },
+      } : undefined,
+    };
+  },
+});
+```
+
+How it works: `withRestless` injects a loader (webpack AND Turbopack - the active bundler is detected automatically) that wraps every `app/**/route.ts` HTTP-method export with the capture pipeline at build time. On-disk files are untouched, so route types, segment config (`dynamic`, `revalidate`, ...) and static analysis behave exactly as without the SDK.
+
+Notes:
+- `req` in the setup callback is the standard Web `Request`. Read the credential with `req.headers.get('authorization')` etc. - not Express's `req.headers.authorization`.
+- Every `apiKey` / `owner.id` / `enrich` rule described above applies to this callback unchanged. `mask` is a **named export** here - call it bare (`mask(...)`), there is no client object.
+- **There is NO SDK init line.** Do not call `restless(...)` anywhere and do not pass an API key. The SDK reads `RESTLESS_KEY` from the environment at runtime.
+- **Top-level imports in `restless.config.ts` are a build hazard.** The file is bundled into EVERY route's server chunk, and `next build` evaluates route modules while collecting page data - a top-level import of DB-backed code (a Mongoose client that throws without env, etc.) breaks builds for routes that never touch the DB. Import auth/DB helpers dynamically inside the callback: `const { authenticate } = await import('@/lib/auth')`.
+- Scoping: by default every App Router route handler is wrapped. `withRestless(cfg, { include: ['app/api/v1/**'] })` restricts to an allowlist; `exclude: ['app/api/health/**']` skips routes and wins over `include`. A `// restless-disable` comment at the top of a route file opts out that single file.
+- Routes with `export const runtime = 'edge'` are skipped with a build warning (current SDK limitation). Prerendered/static routes serve from cache and are not captured.
+- Do NOT add a `middleware.ts` / `proxy.ts`, and do NOT edit an existing one.
+
+### Manual wrapping (App Router escape hatch / legacy)
+
+The per-route API still works: for Next versions older than the plugin's support matrix, or for a rare file the loader can't transform (`export *` re-exports). **If a project already has a complete per-route wiring, leave it alone - it keeps working.** Do not mix styles on new installs: manually wrapping handlers in an app that already uses `withRestless` is harmless (a double-wrap guard captures once) but redundant.
+
+```ts
+// lib/restless.ts - shared client module
 import restless from '@restlessai/sdk/next';
 
 export const client = restless(process.env.RESTLESS_KEY);
@@ -236,32 +288,22 @@ export const wrap = client.setup(async (req) => ({
 }));
 ```
 
-Then in each route file, wrap every exported HTTP method:
-
 ```ts
-// app/pets/route.ts
+// app/pets/route.ts - wrap EVERY exported HTTP method (GET, POST, PUT, ...)
 import { wrap } from '@/lib/restless';
 
 async function getPets(req: Request) {
   return Response.json(await listPets());
 }
-async function createPet(req: Request) {
-  return Response.json(await addPet(await req.json()), { status: 201 });
-}
 
 export const GET = wrap(getPets);
-export const POST = wrap(createPet);
 ```
 
-Notes:
-- `req` in the setup callback is the standard Web `Request` (App Router / Node runtime). Read the credential with `req.headers.get('authorization')` etc. - not Express's `req.headers.authorization`.
-- Wrap **all** exported handlers in a file (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, ...), not just one.
-- If the file already assigns handlers to consts, wrap the existing function: `export const GET = wrap(existingGetHandler);`. Don't rewrite the handler body.
-- Do NOT add a `middleware.ts` / `proxy.ts`, and do NOT edit an existing one.
+If the file already assigns handlers to consts, wrap the existing function: `export const GET = wrap(existingGetHandler);`. Don't rewrite the handler body.
 
 ## Setup - Next.js (Pages Router)
 
-Pages Router API routes (`pages/api/**`) use `NextApiRequest` / `NextApiResponse` and a single default-exported handler. Wrap that default export with the same `@restlessai/sdk/next` adapter - still never touch middleware:
+The `withRestless` plugin auto-wraps **App Router routes only** - Pages Router API routes always use manual wrapping. Pages Router routes (`pages/api/**`) use `NextApiRequest` / `NextApiResponse` and a single default-exported handler. Create the shared client module shown in the escape-hatch section above (`lib/restless.ts`), then wrap the default export - still never touch middleware:
 
 ```ts
 // pages/api/pets.ts
@@ -280,12 +322,13 @@ Read the credential off `req.headers.authorization` (Pages Router hands you Node
 ## Rules (hard constraints for LLM installers)
 
 - **Placement:** the middleware/plugin MUST be registered BEFORE the route definitions.
-- **Next.js:** wrap route handlers with `@restlessai/sdk/next`; there is no `app.use`. NEVER wire the SDK into `middleware.ts` / `proxy.ts` - it crashes with `PageSignatureError` (E394) on the Edge runtime. If there are no route handlers to wrap, do not fall back to middleware.
+- **Next.js App Router:** use the single-config integration - `withRestless` around the config export in `next.config.*` plus `restless.config.*` at the project root. Do NOT edit route files. NEVER wire the SDK into `middleware.ts` / `proxy.ts` - it crashes with `PageSignatureError` (E394) on the Edge runtime.
+- **Next.js Pages Router (or App Router on Next older than the plugin's support matrix):** wrap route handlers with `@restlessai/sdk/next`; there is no `app.use`. Same middleware prohibition. If there are no route handlers to wrap, do not fall back to middleware.
 - **Shape:** the setup callback returns `{ apiKey, owner: { id, enrich } }`. `owner` is nested and holds only `id` plus the required `enrich`. There are no inline `label` / `email` fields on `owner`, no top-level `projectId`, no top-level `project`, and no top-level `enrich`. Anything else is wrong.
 - **`owner.id` must be immutable.** Read the schema or model for the field you pick. If it could be edited by the user (email, username, display name), it is invalid.
 - **Never use the API key, the masked API key, or any secret as `owner.id`.** If you cannot find a stable internal id, use the `'NEEDS_CONFIGURATION'` placeholder + `RESTLESS_OWNER_ID_TODO` marker comment shown above. The CLI handles it.
 - **Never modify `package.json`, not the scripts, not the dependencies, nothing.** Adding `--env-file=.env` to the `start` script is a no. The user handles env loading their own way.
-- **Never modify any other config file** (`tsconfig.json`, `.gitignore`, `Dockerfile`, CI, etc.). Your changes go in the server source file only.
+- **Never modify any other config file** (`tsconfig.json`, `.gitignore`, `Dockerfile`, CI, etc.). Your changes go in the server source file only. The ONE exception: the Next.js App Router integration requires editing `next.config.*` (wrap the export with `withRestless`) and creating `restless.config.*` - those two files, nothing else.
 - **Never install or suggest installing extra packages.** No `dotenv`, no adapters, nothing. `process.env.RESTLESS_KEY` is assumed to be available at runtime.
 - **Never read `.env`, `.env.local`, or any credentials file.** This is non-negotiable.
 - **Never read files inside `node_modules/`.** The SDK is a black box.
@@ -296,5 +339,5 @@ Read the credential off `req.headers.authorization` (Pages Router hands you Node
 ## Verify
 
 1. `@restlessai/sdk` appears in `package.json` dependencies.
-2. The middleware/plugin is registered in the server code with a `setup(cb)` callback.
+2. The middleware/plugin is registered in the server code with a `setup(cb)` callback. On the Next.js App Router single-config integration this means: `withRestless` wraps the export in `next.config.*` AND `restless.config.*` exists with a `defineConfig({ setup })` call.
 3. Starting the server and hitting any endpoint returns an `x-restless-id` response header.
