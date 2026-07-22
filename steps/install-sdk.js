@@ -411,10 +411,10 @@ export default async function installSdk({
   //
   // Either way the SDK must NEVER be wired into the middleware file
   // (`middleware.ts` / `proxy.ts`). Detect the layout up front - before the
-  // API key step - so we can (a) fail fast when there's nothing to wrap,
-  // (b) hand the AI the exact files, (c) reject a middleware wiring in the
-  // gate below, and (d) let prepare-account drop the inline-key option when
-  // the plugin style is in play (it has no init line to inline a key into).
+  // install and API key steps - so we can (a) fail fast when there's nothing
+  // to wrap, (b) hand the AI the exact files, and (c) reject a middleware
+  // wiring in the gate below. The plugin-vs-manual STYLE decision happens
+  // after the install sub-step: it depends on the installed SDK version.
   const nextInfo = detectNext(installDir);
   // Trigger the Next.js path only on corroborated evidence: actual App/Pages
   // routing files, a Next middleware file, or a Next framework label from
@@ -424,19 +424,9 @@ export default async function installSdk({
     nextInfo.router !== null ||
     nextInfo.middlewareFiles.length > 0 ||
     isNextFramework(detectedFramework);
-  const autoWrap = isNext && nextInfo.router === 'app'
-    ? nextAutoWrapSupport(installDir)
-    : { supported: false, version: null, reason: null };
-  const nextStyle = !isNext ? null : (autoWrap.supported ? 'plugin' : 'manual');
-  // prepare-account reads this to decide whether inline key delivery is
-  // even possible (the plugin style has no SDK init line in user code).
-  ctx.nextStyle = nextStyle;
   debug.log('install-sdk.next-detect', {
     isNext,
     router: nextInfo.router,
-    style: nextStyle,
-    nextVersion: autoWrap.version,
-    autoWrapReason: autoWrap.reason,
     routeHandlers: nextInfo.routeHandlerFiles.length,
     middlewareFiles: nextInfo.middlewareFiles,
   });
@@ -511,6 +501,36 @@ export default async function installSdk({
     update({ sub: { 0: 'done' }, activeSub: 1, message: [
       `  ${green('✓')} Package installed in ${installLocation}.`,
     ]});
+  }
+
+  // Pick the Next.js wiring style now that the SDK on disk is final:
+  //
+  //   - 'plugin' (App Router; Next >= 13.4 / Turbopack >= 15.3; installed
+  //     @restlessai/sdk >= 0.4.0): the single-config integration.
+  //     `withRestless` wraps the exported config in next.config.*,
+  //     `restless.config.*` holds the capture config, and a build-time
+  //     loader auto-wraps every route handler. Route files are not touched.
+  //   - 'manual' (Pages Router, older Next, or an older pre-installed SDK
+  //     that predates the plugin): wrap route handlers by hand with
+  //     `@restlessai/sdk/next`.
+  //
+  // This must run AFTER the install sub-step (a fresh `npm install` pulls
+  // the latest SDK; a skipped install can leave an old one that lacks the
+  // plugin exports) and BEFORE prepare-account, which reads ctx.nextStyle
+  // to drop the inline-key option on plugin installs (they have no init
+  // line to inline a key into).
+  const autoWrap = isNext && nextInfo.router === 'app'
+    ? nextAutoWrapSupport(installDir)
+    : { supported: false, version: null, sdkVersion: null, reason: null };
+  const nextStyle = !isNext ? null : (autoWrap.supported ? 'plugin' : 'manual');
+  ctx.nextStyle = nextStyle;
+  if (isNext) {
+    debug.log('install-sdk.next-style', {
+      style: nextStyle,
+      nextVersion: autoWrap.version,
+      sdkVersion: autoWrap.sdkVersion,
+      autoWrapReason: autoWrap.reason,
+    });
   }
 
   // ── Sub 1: Generate API key (delegated to the caller) ────────────────────

@@ -224,7 +224,9 @@ describe('nextAutoWrapSupport', () => {
 
   it('supports a modern Next on webpack', () => {
     scaffold('15.4.2');
-    expect(nextAutoWrapSupport(dir)).toEqual({ supported: true, version: '15.4.2', reason: null });
+    expect(nextAutoWrapSupport(dir)).toEqual({
+      supported: true, version: '15.4.2', sdkVersion: null, reason: null,
+    });
   });
 
   it('supports Next 16 with Turbopack scripts', () => {
@@ -258,7 +260,47 @@ describe('nextAutoWrapSupport', () => {
 
   it('assumes a modern release when the version is unknowable', () => {
     // No package.json at all - detection elsewhere already corroborated Next.
-    expect(nextAutoWrapSupport(dir)).toEqual({ supported: true, version: null, reason: null });
+    expect(nextAutoWrapSupport(dir)).toEqual({
+      supported: true, version: null, sdkVersion: null, reason: null,
+    });
+  });
+
+  // The plugin exports (withRestless / defineConfig) first shipped in
+  // @restlessai/sdk 0.4.0. A pre-installed older SDK skips the installer's
+  // `npm install`, so scaffolding the plugin against it would produce
+  // imports that don't resolve - the gate must fall back to manual style.
+  function installSdkVersion(version) {
+    put(dir, path.join('node_modules', '@restlessai', 'sdk', 'package.json'), JSON.stringify({ version }));
+  }
+
+  it('rejects a pre-installed SDK older than 0.4.0', () => {
+    scaffold('15.4.2');
+    installSdkVersion('0.3.8');
+    const support = nextAutoWrapSupport(dir);
+    expect(support.supported).toBe(false);
+    expect(support.sdkVersion).toBe('0.3.8');
+    expect(support.reason).toMatch(/0\.4\.0/);
+  });
+
+  it('supports the SDK release that introduced the plugin (0.4.0)', () => {
+    scaffold('15.4.2');
+    installSdkVersion('0.4.0');
+    expect(nextAutoWrapSupport(dir)).toEqual({
+      supported: true, version: '15.4.2', sdkVersion: '0.4.0', reason: null,
+    });
+  });
+
+  it('supports later SDK majors', () => {
+    scaffold('16.0.0');
+    installSdkVersion('1.2.0');
+    expect(nextAutoWrapSupport(dir).supported).toBe(true);
+  });
+
+  it('reports the Next floor even when the SDK is also old', () => {
+    // Next incompatibility is the more fundamental blocker - its reason wins.
+    scaffold('13.2.0');
+    installSdkVersion('0.3.8');
+    expect(nextAutoWrapSupport(dir).reason).toMatch(/13\.4/);
   });
 });
 
