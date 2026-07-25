@@ -37,45 +37,37 @@ describe('normalizePickerItem', () => {
 
 describe('pickContextualHint', () => {
   it('returns the default invitation when nothing has happened yet', () => {
-    const r = pickContextualHint({ command: 'curl http://x' });
+    const r = pickContextualHint({});
     expect(r.kind).toBe('default');
     const text = r.lines.map(strip).join('\n');
-    expect(text).toContain("Make a successful call to confirm everything's set up.");
-    expect(text).toContain('Edit the snippet below to make a valid request.');
+    expect(text).toContain('Press enter to send a test request - no API key needed.');
+    expect(text).toContain('401');
     expect(text).not.toContain('API_KEY_HERE');
   });
 
-  it('mentions API_KEY_HERE when the placeholder is still in the command', () => {
-    const r = pickContextualHint({
-      command: 'curl http://x -H "Authorization: Bearer API_KEY_HERE"',
-    });
-    expect(r.kind).toBe('placeholder');
+  it('flips to success when the SDK header was detected (no logs, no key)', () => {
+    const r = pickContextualHint({ sdkDetected: true });
+    expect(r.kind).toBe('success');
     const text = r.lines.map(strip).join('\n');
-    expect(text).toContain('API_KEY_HERE');
-    expect(text).toContain('replace');
-    expect(text).toContain('real API key');
+    expect(text).toContain('the SDK is picking up your requests');
+    expect(text).toContain('Press Tab to continue the setup.');
   });
 
-  it('switches to success on any 2xx in logs', () => {
+  it('switches to success on any landed log, regardless of status', () => {
     const r = pickContextualHint({
-      command: 'curl x',
       logs: [{ status: 200, method: 'GET', url: '/pets' }],
     });
     expect(r.kind).toBe('success');
     const text = r.lines.map(strip).join('\n');
-    expect(text).toContain("Congrats! It's working.");
+    expect(text).toContain('the SDK is picking up your requests');
     expect(text).toContain('Press Tab to continue the setup.');
   });
 
-  it('treats other 2xx codes as success too (201, 204)', () => {
-    expect(pickContextualHint({ logs: [{ status: 201 }] }).kind).toBe('success');
-    expect(pickContextualHint({ logs: [{ status: 204 }] }).kind).toBe('success');
-  });
-
-  it('does NOT treat 3xx / 4xx / 5xx as success', () => {
-    expect(pickContextualHint({ logs: [{ status: 301 }] }).kind).toBe('default');
-    expect(pickContextualHint({ logs: [{ status: 404 }] }).kind).toBe('default');
-    expect(pickContextualHint({ logs: [{ status: 500 }] }).kind).toBe('default');
+  it('treats a rejected request (401/404/500) as success too - the log still landed', () => {
+    expect(pickContextualHint({ logs: [{ status: 401 }] }).kind).toBe('success');
+    expect(pickContextualHint({ logs: [{ status: 404 }] }).kind).toBe('success');
+    expect(pickContextualHint({ logs: [{ status: 500 }] }).kind).toBe('success');
+    expect(pickContextualHint({ logs: [{ status: 301 }] }).kind).toBe('success');
   });
 
   it('shows the failing nudge once 3+ attempts have failed', () => {
@@ -84,7 +76,8 @@ describe('pickContextualHint', () => {
     });
     expect(r.kind).toBe('failing');
     const text = r.lines.map(strip).join('\n');
-    expect(text).toContain('Edit the code snippet below to make a valid call.');
+    expect(text).toContain('Still not seeing it');
+    expect(text).toContain('RESTLESS_KEY');
     expect(text).toContain("skip ahead");
     expect(text).toContain('press Tab to continue');
   });
@@ -124,8 +117,8 @@ describe('pickContextualHint', () => {
     for (const variant of [
       pickContextualHint(),
       pickContextualHint({ logs: [{ status: 200 }] }),
+      pickContextualHint({ sdkDetected: true }),
       pickContextualHint({ failedAttempts: [{}, {}, {}] }),
-      pickContextualHint({ command: 'curl x API_KEY_HERE' }),
     ]) {
       const raw = variant.lines.join('');
       expect(raw).toMatch(/\x1b\[1mTab\x1b\[0m/);
