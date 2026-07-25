@@ -1,10 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, yellow, red, terminalRunScreen } from '../lib/ui.js';
+import { bold, dim, green, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
+import { runAI, loadPrompt } from '../lib/ai.js';
+import * as debug from '../lib/debug.js';
+import { parseStatus, validatePort, describeDiagnosis, fixActions, fixContext } from '../lib/test-diagnosis.js';
 
 // A bare host[:port] like `api.example.com` or `api.example.com:8080` -
 // a token with a dot before the first slash and no scheme. Used to catch
@@ -29,6 +32,21 @@ function rewriteCurlBase(curl, localBase) {
   return curl
     .replace(/https?:\/\/[^\s/'"`]+/g, clean)
     .replace(SCHEMELESS_HOST, (m) => (isLocalHost(m) ? m : clean.replace(/^https?:\/\//, '')));
+}
+
+/**
+ * Strip the target API's auth off a saved curl. We now send the test
+ * request unauthenticated on purpose - a rejected request (401) still
+ * proves the SDK middleware saw it, and it means the user never has to
+ * paste a real API key. New curls are built without auth (see
+ * lib/test-endpoint.js), but settings written by older CLI versions may
+ * still carry an `API_KEY_HERE` header/query, so we scrub it here.
+ */
+function stripAuthPlaceholder(curl) {
+  return curl
+    .replace(/\s+(?:-H|--header|--url-query)\s+(["'])[^"']*API_KEY_HERE[^"']*\1/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function isLocalHost(host) {
@@ -64,24 +82,6 @@ function curlTargetIsLocal(curl) {
  */
 function curlHasIncludeFlag(curl) {
   return /(?:^|\s)(?:-i|--include)(?:\s|$)/.test(curl);
-}
-
-/**
- * Pull `{ method, url }` out of a curl command for display in the
- * "in-flight" placeholder. We show the path (not the full URL) - the
- * box already established it's hitting localhost, so the path alone is
- * less noisy.
- */
-function extractPending(curl) {
-  const methodMatch = curl.match(/(?:^|\s)(?:-X|--request)\s+(\w+)/);
-  const method = (methodMatch?.[1] || 'GET').toUpperCase();
-  const urlMatch = curl.match(/\bhttps?:\/\/[^\s"']+/);
-  let url = urlMatch?.[0] || '';
-  try {
-    const u = new URL(url);
-    url = u.pathname + (u.search || '');
-  } catch {}
-  return { method, url };
 }
 
 /**
@@ -221,184 +221,235 @@ export default async function testSetup({
   domain,
   projectId,
   setupKey,
+  ctx = {},
 }) {
+  const aiTool = ctx.aiTool || 'the AI';
+
   await startStep({
     update,
     stepNum: 3,
     title: 'Test your setup',
-    intro: "Now let's make sure everything's wired up.",
+    intro: "Now let's make sure the SDK is picking up your requests.",
     sections: [
       {
         label: 'Why',
         body:
-          `Before you ship, you want to see a real request actually flow through\n` +
-          `the SDK and land in your dashboard. This catches any wiring mistakes\n` +
-          `while they're still cheap to fix.`,
+          `Before you ship, you want to confirm the SDK is actually seeing your\n` +
+          `traffic. This catches wiring mistakes while they're still cheap to fix.`,
       },
       {
         label: "What we'll do",
         body:
-          `Start your server (in another terminal), then we hit the test endpoint\n` +
-          `we picked earlier with ${bold('curl')} and watch the log show up live on the\n` +
-          `dashboard side.`,
+          `Start your server in another terminal and we'll watch for it - no\n` +
+          `command to run here, no API key needed. We send a test request in the\n` +
+          `background and confirm it flows through the SDK. A rejected request\n` +
+          `(like a ${bold('401')}) still counts. If something's off, ${orange(aiTool)} can fix it and\n` +
+          `we'll re-check on its own.`,
       },
     ],
-    actionRequired: 'Make sure your server is up and running so we can test everything locally.',
-    action: 'run a test request',
+    actionRequired: 'Start your server so we can watch for a request flowing through the SDK.',
+    action: 'start watching',
   });
 
-  // The test curl was picked at the end of step 1 (when the OAS was fresh)
-  // and saved to .restless/settings.json. Read it back and rewrite its base URL
-  // to localhost so the user can hit their dev server without editing the
-  // command. Falls back to a generic GET / if nothing was saved (e.g. the
-  // OAS had no safe GET endpoint to pick).
   const searchDir = apiRootDir && apiRootDir !== '.' ? path.resolve(packageDir, apiRootDir) : packageDir;
-  const localPort = detectLocalPort(searchDir);
-  const localBase = `http://localhost:${localPort}`;
+  // The SDK was wired into this same directory by the install step, so
+  // that's where the fix AI should run.
+  const installDir = searchDir;
 
+  // The port is mutable - the user can correct a wrong guess mid-flight,
+  // so `localBase()` always reflects the current choice.
+  let localPort = detectLocalPort(searchDir);
+  const localBase = () => `http://localhost:${localPort}`;
+
+  // The test curl was picked at the end of step 1 (auth stripped - we send
+  // it unauthenticated on purpose). We re-point its base at the current
+  // port on every probe. Falls back to a bare GET / if none was saved.
   const settings = loadSettings(rootDir);
   const apiEntry = settings.apis?.find((a) => a.rootDir === (apiRootDir || '.')) || settings.apis?.[0];
-  const baseCurl = apiEntry?.testCurl
-    ? rewriteCurlBase(apiEntry.testCurl, localBase)
-    : `curl -sS ${localBase}/`;
+  const savedCurl = apiEntry?.testCurl ? stripAuthPlaceholder(apiEntry.testCurl) : null;
 
-  // Show `-i` in the visible command - what the user runs is exactly
-  // what we run. We need it to read response headers and confirm the
-  // SDK middleware actually ran on this request.
-  const curlCommand = curlHasIncludeFlag(baseCurl)
-    ? baseCurl
-    : baseCurl.replace(/^curl\b/, 'curl -i');
-
-  update({ message: [
-    `  ${green('✓')} Make sure your server is running on ${bold(localBase)},`,
-    dim(`  then hit enter in the box below to fire off the request.`),
-  ]});
-
-  // ── Sub 1: Verify - interactive terminal with live log polling ──────────
-  const pollConfig = projectId
-    ? { url: `${SITE_URL}/api/logs/poll`, projectId, setupKey }
-    : null;
-
-  // The diagnostic state from the most recent run. terminalRunScreen
-  // can run the command multiple times; we use the latest reading.
-  let lastHeaders = {};
-  let lastDiagState = null;
-
-  // Hint copy. The row's icon column already shows the warning glyph,
-  // so the strings here lead straight into the message.
-  const noSdkHint = [
-    `The Restless SDK didn't fire on this request.`,
-    `Either the middleware isn't wired in, or ${bold('RESTLESS_KEY')} isn't set in the running process - ${bold('restart')} your server after fixing either.`,
-  ];
-  const noKeyHint = [
-    `Server is loaded, but ${bold('RESTLESS_KEY')} isn't set in the running process.`,
-    `${bold('Restart your server')} so it picks up ${bold('.env')}, then run again.`,
-  ];
-  const wrongKeyHint = [
-    `The SDK fired, but no log landed at Restless.`,
-    `Most likely your ${bold('RESTLESS_KEY')} is stale. Re-check ${bold('.env')} and ${bold('restart')} your server.`,
-  ];
-
-  const result = await terminalRunScreen(curlCommand, {
-    pollConfig,
-    noLogsHint: () => (lastDiagState === 'ok' ? wrongKeyHint : null),
-    onRun: (cmd) => {
-      // If the user removed `-i` while editing, put it back. We need it
-      // to read response headers (the only way to confirm the SDK ran
-      // on this request). Mutate the visible command so what they see
-      // matches what actually ran.
-      let runCmd = cmd;
-      if (!curlHasIncludeFlag(runCmd)) {
-        runCmd = runCmd.replace(/^curl\b/, 'curl -i');
-      }
-
-      // If the user pasted a non-local URL (or somehow the rewrite
-      // missed one), refuse to run rather than firing at production.
-      // Force the host back to the detected localBase and re-display.
-      if (!curlTargetIsLocal(runCmd)) {
-        runCmd = rewriteCurlBase(runCmd, localBase);
-        if (!curlTargetIsLocal(runCmd)) {
-          return {
-            output: `This step only runs against your local server (${localBase}). Edit the URL above to a localhost address and try again.`,
-            success: false,
-            command: runCmd,
-          };
-        }
-      }
-      try {
-        const raw = execSync(runCmd, { encoding: 'utf8', timeout: 10000 });
-        const { headers, body } = splitCurlIncludeOutput(raw);
-        lastHeaders = headers;
-        const diag = diagnoseFromHeaders(headers);
-        lastDiagState = diag.state;
-
-        // Show only the body to the user - the headers are for us.
-        // Pretty-print JSON when possible.
-        let output = body;
-        try { output = JSON.stringify(JSON.parse(body), null, 2); } catch {}
-
-        // Push an immediate hint when we already know logs aren't
-        // coming - no point making the user wait the noLogsHint timeout
-        // for a definite negative.
-        const immediateHint =
-          diag.state === 'no-sdk' ? noSdkHint :
-          diag.state === 'no-key' ? noKeyHint :
-          undefined;
-
-        return {
-          output,
-          success: true,
-          command: runCmd,
-          immediateHint,
-          pending: extractPending(runCmd),
-        };
-      } catch (err) {
-        lastDiagState = null;
-        return {
-          output: err.stderr || err.stdout || err.message || '',
-          success: false,
-          command: runCmd,
-        };
-      }
-    },
-  });
-
-  // Diagnose what happened. The response headers are the source of
-  // truth for SDK state; the log poll inside terminalRunScreen tells us
-  // whether the metrics server actually received the upload, which
-  // separates a working key from a wrong one.
-  const diag = diagnoseFromHeaders(lastHeaders);
-
-  let doneMessage;
-  if (!result.success) {
-    doneMessage = [
-      `  ${yellow('⚠')} Request didn't come back clean. Make sure your server is running on ${bold(localBase)} and try again.`,
-    ];
-  } else if (diag.state === 'no-sdk') {
-    doneMessage = [
-      `  ${red('✗')} The Restless SDK didn't run on this request.`,
-      `  Add the middleware to your server (see ${bold('.restless/INSTALL.md')}) and ${bold('restart')} it.`,
-    ];
-  } else if (diag.state === 'no-key') {
-    doneMessage = [
-      `  ${red('✗')} The SDK is loaded, but ${bold('RESTLESS_KEY')} isn't set in the running process.`,
-      `  This almost always means your dev server is running on a stale environment.`,
-      `  ${bold('Restart your server')} so it picks up ${bold('.env')}, then run the request again.`,
-    ];
-  } else if (diag.state === 'ok') {
-    // We got an upload upstream if the log polling has anything from
-    // this run. If nothing landed, the most likely culprit is a wrong
-    // RESTLESS_KEY - a valid one would have produced a log already.
-    doneMessage = pollConfig
-      ? [`  ${green('✓')} Test request succeeded and logs are flowing.`]
-      : [`  ${green('✓')} Test request succeeded.`];
-  } else {
-    // 'no-headers' - couldn't read the dump (user edited the curl, etc).
-    // Don't pretend we know more than we do.
-    doneMessage = [`  ${green('✓')} Test request succeeded.`];
+  function buildProbeCurl() {
+    const base = savedCurl ? rewriteCurlBase(savedCurl, localBase()) : `curl -sS ${localBase()}/`;
+    let cmd = curlHasIncludeFlag(base) ? base : base.replace(/^curl\b/, 'curl -i');
+    if (!curlTargetIsLocal(cmd)) cmd = rewriteCurlBase(cmd, localBase());
+    return cmd;
   }
 
-  update({ status: 'done', message: doneMessage });
+  const pollConfig = projectId ? { url: `${SITE_URL}/api/logs/poll`, projectId, setupKey } : null;
 
-  return { success: result.success, diagnostic: diag.state };
+  // Fire one request at the local server and classify from the response
+  // headers. A connection error → 'unreachable' (server down / wrong port);
+  // otherwise the SDK's `x-restless-id` header tells us the rest.
+  function probe() {
+    const cmd = buildProbeCurl();
+    if (!curlTargetIsLocal(cmd)) return { state: 'unreachable' };
+    try {
+      const raw = execSync(cmd, { encoding: 'utf8', timeout: 10000 });
+      const { headers } = splitCurlIncludeOutput(raw);
+      const diag = diagnoseFromHeaders(headers);
+      return { state: diag.state, status: parseStatus(raw), requestId: diag.requestId };
+    } catch (err) {
+      debug.log('test-setup.probe-unreachable', { message: String(err?.message || '').slice(0, 160) });
+      return { state: 'unreachable' };
+    }
+  }
+
+  // Render a diagnosis into the plan step message. The waiting state also
+  // gets a footer advertising the escape-hatch keys.
+  function render(state, { status, attempt } = {}) {
+    const { icon, lines } = describeDiagnosis(state, { status, localBase: localBase(), aiTool, attempt });
+    const msg = [`  ${icon}  ${lines[0]}`, ...lines.slice(1).map((l) => `     ${l}`)];
+    if (state === 'unreachable') {
+      msg.push('');
+      msg.push(dim(`     Press ${bold('p')} to change the port · ${bold('Tab')} to skip`));
+    }
+    update({ message: msg });
+  }
+
+  // Poll the dashboard for a log from this run. A landed log (any status,
+  // incl. 401) proves RESTLESS_KEY is valid end-to-end; nothing landing
+  // after a clean header points at a stale key.
+  async function dashboardLogged(since) {
+    if (!pollConfig) return true; // no poll available → the clean header is all we have
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(pollConfig.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectId, setupKey, since, limit: 5 }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.logs && data.logs.length > 0) return true;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return false;
+  }
+
+  async function changePort() {
+    const answer = await ask(`\n  ${cyan('?')} What port is your server on? `, { defaultValue: String(localPort) });
+    const p = validatePort(answer);
+    if (p) localPort = p;
+    return localPort;
+  }
+
+  // Hand the runtime evidence to the agent and let it edit the code.
+  async function runFix(state) {
+    const { evidence, guidance } = fixContext(state, { localBase: localBase() });
+    update({ message: [
+      `  ${orange(aiTool)} is reading your code and fixing the wiring…`,
+      dim(`     When it's done, restart your server - we'll re-check on our own.`),
+    ]});
+    debug.log('test-setup.fix-start', { state });
+    try {
+      await runAI(loadPrompt('fix-sdk', { evidence, guidance, base: localBase() }), installDir, { setSpinner });
+      update({ message: [
+        `  ${green('✓')} ${orange(aiTool)} applied a fix. ${bold('Restart your server')} and we'll re-check automatically.`,
+      ]});
+    } catch (err) {
+      debug.log('test-setup.fix-error', { message: String(err?.message || '').slice(0, 160) });
+      update({ message: [
+        `  ${yellow('⚠')} Couldn't complete the automatic fix. Check the notes above, then restart your server.`,
+      ]});
+    }
+  }
+
+  function statusNoteFor(status) {
+    return status && (status < 200 || status >= 300)
+      ? ` ${dim(`(got a ${status} - that's expected, we only needed the SDK to see the request.)`)}`
+      : '';
+  }
+
+  function confirmSkip() {
+    return askYesNo(`\n  ${yellow("Skip without confirming the SDK is set up?")} `, { defaultValue: false });
+  }
+
+  function finishSkipped(lastState) {
+    update({ status: 'done', message: [
+      `  ${yellow('⚠')} Skipped the setup check - you can run setup again anytime to finish it.`,
+    ]});
+    debug.log('test-setup.skipped', { lastState });
+  }
+
+  // ── Main loop: watch → diagnose → (fix / retry / port / skip) → repeat ──
+  let lastState = null;
+  while (true) {
+    // Passive watch: poll until the server answers, or the user hits a key.
+    const ev = await waitForServerOrKey(probe, {
+      intervalMs: 2000,
+      render: (attempt) => render('unreachable', { attempt }),
+    });
+
+    if (ev.type === 'key') {
+      if (ev.key === '\t') {
+        if (await confirmSkip()) { finishSkipped(lastState); return { success: false, diagnostic: lastState }; }
+        continue;
+      }
+      if ((ev.key || '').toLowerCase() === 'p') { await changePort(); continue; }
+      continue; // any other key → re-check immediately
+    }
+
+    const diag = ev.result;
+    lastState = diag.state;
+
+    // Success path: the header is clean. Confirm the log reached the
+    // dashboard (when we can) to catch a stale key; otherwise the clean
+    // header is enough.
+    if (diag.state === 'ok') {
+      update({ message: [`  ${green('✓')} The SDK saw your request - confirming it reached your dashboard…`] });
+      const since = new Date(Date.now() - 15000).toISOString();
+      const landed = await dashboardLogged(since);
+      if (landed) {
+        const extra = pollConfig ? ' and logging them to your dashboard' : '';
+        update({ status: 'done', message: [
+          `  ${green('✓')} The SDK is picking up your requests${extra}.${statusNoteFor(diag.status)}`,
+        ]});
+        debug.log('test-setup.done', { state: 'ok', logged: !!pollConfig });
+        return { success: true, diagnostic: 'ok' };
+      }
+      // Clean header but nothing landed → stale key. Fall through to the
+      // fix menu with that diagnosis.
+      diag.state = 'stale-key';
+      lastState = 'stale-key';
+    }
+
+    // Failing path: show the diagnosis, then offer the fix loop.
+    render(diag.state, { status: diag.status });
+    const choice = await actionPicker([], {
+      message: 'What would you like to do?',
+      actions: fixActions(diag.state, { aiTool }),
+    });
+    const action = choice.key;
+    if (action === 'skip') {
+      if (await confirmSkip()) { finishSkipped(lastState); return { success: false, diagnostic: lastState }; }
+      continue;
+    }
+    if (action === 'port') { await changePort(); continue; }
+    if (action === 'fix') {
+      await runFix(diag.state);
+      // The server is still running the OLD code until the user restarts,
+      // so an immediate re-probe would show the same failure and read as
+      // "the fix didn't work". Wait until the diagnosis actually CHANGES
+      // (the restart landed) - or the user presses a key to re-check now.
+      const prev = diag.state;
+      await waitForServerOrKey(
+        () => {
+          const r = probe();
+          return r.state === prev ? { state: 'unreachable' } : r;
+        },
+        {
+          intervalMs: 2000,
+          render: () => update({ message: [
+            `  ${dim('⟳')}  Fix applied - ${bold('restart your server')} and we'll pick it up…`,
+            dim(`     Press any key to re-check now.`),
+          ]}),
+        },
+      );
+      continue; // re-enter the main watch, which re-probes fresh.
+    }
+    // 'recheck' → loop again; waitForServerOrKey probes immediately.
+  }
 }
