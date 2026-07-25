@@ -686,7 +686,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
   });
   plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done', 4: 'done' } });
 
-  // Step 3: Test your setup (with live log polling)
+  // Step 3: Test your setup (auto-detect the server, confirm the SDK sees
+  // requests, and offer an AI fix loop when it doesn't).
   await testSetup({
     packageDir,
     rootDir,
@@ -696,6 +697,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     domain: oasResult.domain,
     projectId: ctx.projectId,
     setupKey: ctx.setupKey,
+    ctx,
   });
 
   // Step 4: Set up account (log in + upload OAS specs).
