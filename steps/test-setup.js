@@ -8,6 +8,7 @@ import { loadSettings } from '../lib/settings.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
 import { parseStatus, validatePort, describeDiagnosis, fixActions, fixContext } from '../lib/test-diagnosis.js';
+import { isInteractive } from '../lib/env.js';
 
 // A bare host[:port] like `api.example.com` or `api.example.com:8080` -
 // a token with a dot before the first slash and no scheme. Used to catch
@@ -372,6 +373,65 @@ export default async function testSetup({
       `  ${yellow('⚠')} Skipped the setup check - you can run setup again anytime to finish it.`,
     ]});
     debug.log('test-setup.skipped', { lastState });
+  }
+
+  // ── Non-interactive (agent / CI) ───────────────────────────────────────
+  // The interactive loop below relies on a human to press keys, restart the
+  // server on cue, and drive the fix menu - none of which happens under an
+  // agent, so it would hang (the post-fix watch waits forever for a manual
+  // restart). Instead: poll for the server for a bounded window, diagnose
+  // once, and report. Success = the SDK saw the request (any status, incl.
+  // a 401 / `missing-key` - an agent has no key and doesn't need one). On a
+  // real failure we surface the diagnosis + fix guidance and return so the
+  // driving agent can act, rather than blocking on a restart we can't get.
+  if (!isInteractive()) {
+    const MAX_ATTEMPTS = 15; // ~30s at 2s spacing - room for a dev server to boot
+    let diag = { state: 'unreachable' };
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      diag = probe();
+      if (diag.state !== 'unreachable') break;
+      if (attempt === 1) render('unreachable', { attempt });
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    if (diag.state === 'unreachable') {
+      update({ status: 'done', message: [
+        `  ${yellow('⚠')} Couldn't reach your server on ${bold(localBase())} within the wait window.`,
+        dim(`     Start it (or set the right port) and run setup again to finish the check.`),
+      ]});
+      debug.log('test-setup.noninteractive', { state: 'unreachable' });
+      return { success: false, diagnostic: 'unreachable' };
+    }
+
+    // The SDK saw the request. For a real key we'd also confirm a dashboard
+    // log, but an agent has none - the clean header is the proof of wiring.
+    if (diag.state === 'ok' || diag.state === 'no-key') {
+      let landed = false;
+      if (diag.state === 'ok' && pollConfig) {
+        landed = await dashboardLogged(new Date(Date.now() - 15000).toISOString());
+      }
+      const msg = [`  ${green('✓')} The SDK is picking up your requests.${statusNoteFor(diag.status)}`];
+      if (diag.state === 'no-key') {
+        msg.push(dim(`     No ${bold('RESTLESS_KEY')} is set, so nothing was uploaded - set it and restart to stream logs.`));
+      } else if (!landed && pollConfig) {
+        msg.push(dim(`     The header looked good but no log reached the dashboard - double-check ${bold('RESTLESS_KEY')}.`));
+      }
+      update({ status: 'done', message: msg });
+      debug.log('test-setup.noninteractive', { state: diag.state, landed });
+      return { success: true, diagnostic: diag.state };
+    }
+
+    // no-sdk / stale-key → a real problem. Report the diagnosis and, when the
+    // state is AI-fixable, the exact guidance so the outer agent can fix it.
+    const desc = describeDiagnosis(diag.state, { status: diag.status, localBase: localBase(), aiTool });
+    const msg = [`  ${desc.icon}  ${desc.lines[0]}`, ...desc.lines.slice(1).map((l) => `     ${l}`)];
+    if (desc.canFix) {
+      const { guidance } = fixContext(diag.state, { localBase: localBase() });
+      if (guidance) msg.push(dim(`     Fix hint: ${guidance}`));
+    }
+    update({ status: 'done', message: msg });
+    debug.log('test-setup.noninteractive', { state: diag.state });
+    return { success: false, diagnostic: diag.state };
   }
 
   // ── Main loop: watch → diagnose → (fix / retry / port / skip) → repeat ──

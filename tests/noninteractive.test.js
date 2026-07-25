@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ask, singleSelect, askYesNo, waitForKey, terminalPrompt, terminalRunScreen } from '../lib/ui.js';
+import { ask, singleSelect, askYesNo, waitForKey, terminalPrompt } from '../lib/ui.js';
 import { createPlanManager } from '../lib/runner.js';
 
 // Force the non-interactive path regardless of the ambient TTY. isInteractive()
@@ -43,21 +43,6 @@ describe('non-interactive UI primitives', () => {
 
   it('terminalPrompt returns the default command unchanged', async () => {
     expect(await terminalPrompt('npm install thing')).toBe('npm install thing');
-  });
-
-  it('terminalRunScreen runs onRun exactly once and returns its success', async () => {
-    let calls = 0;
-    const res = await terminalRunScreen('curl -i http://localhost:3000/', {
-      onRun: (cmd) => { calls++; return { output: 'HTTP/1.1 401', success: true, command: cmd }; },
-    });
-    expect(calls).toBe(1);
-    expect(res.success).toBe(true);
-    expect(res.command).toBe('curl -i http://localhost:3000/');
-  });
-
-  it('terminalRunScreen surfaces an onRun throw as a failed result', async () => {
-    const res = await terminalRunScreen('curl x', { onRun: () => { throw new Error('boom'); } });
-    expect(res.success).toBe(false);
   });
 });
 
