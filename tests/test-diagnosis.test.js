@@ -2,10 +2,18 @@ import { describe, it, expect } from 'vitest';
 import {
   parseStatus,
   validatePort,
+  normalizeBaseUrl,
+  basePathFromServers,
   statusNote,
   describeDiagnosis,
   fixActions,
   fixContext,
+  portFromCommand,
+  portFromPackageJson,
+  portFromSource,
+  portFromUrl,
+  portFromDocker,
+  frameworkDefaultPort,
 } from '../lib/test-diagnosis.js';
 
 // eslint-disable-next-line no-control-regex
@@ -39,6 +47,149 @@ describe('validatePort', () => {
     expect(validatePort(null)).toBeNull();
     expect(validatePort('0')).toBeNull();
     expect(validatePort('999999')).toBeNull();
+  });
+});
+
+describe('portFromCommand', () => {
+  it('reads every common port-flag shape', () => {
+    expect(portFromCommand('next dev -p 3002')).toBe('3002');
+    expect(portFromCommand('next dev -p3002')).toBe('3002');
+    expect(portFromCommand('vite --port 3002')).toBe('3002');
+    expect(portFromCommand('vite --port=3002')).toBe('3002');
+    expect(portFromCommand('PORT=3002 next dev')).toBe('3002');
+    expect(portFromCommand('cross-env PORT=3002 tsx watch src/index.ts')).toBe('3002');
+  });
+  it('ignores non-port -p flags and returns null when absent', () => {
+    // concurrently's -p prefix flag takes a quoted string, not a number.
+    expect(portFromCommand('concurrently -p "{name}" "next dev" "npm run api"')).toBeNull();
+    expect(portFromCommand('next dev')).toBeNull();
+    expect(portFromCommand('')).toBeNull();
+    expect(portFromCommand(null)).toBeNull();
+  });
+});
+
+describe('portFromPackageJson', () => {
+  it('prefers the dev script and reads its explicit port', () => {
+    expect(portFromPackageJson({ scripts: { dev: 'next dev -p 3002', build: 'next build' } })).toBe('3002');
+  });
+  it('finds a port in any script when dev has none', () => {
+    expect(portFromPackageJson({ scripts: { dev: 'next dev', start: 'next start -p 4000' } })).toBe('4000');
+  });
+  it('falls back to the npm config.port field', () => {
+    expect(portFromPackageJson({ config: { port: 3002 }, scripts: { dev: 'next dev -p $npm_package_config_port' } })).toBe('3002');
+  });
+  it('returns null when no port is declared', () => {
+    expect(portFromPackageJson({ scripts: { dev: 'next dev' } })).toBeNull();
+    expect(portFromPackageJson({})).toBeNull();
+    expect(portFromPackageJson(null)).toBeNull();
+  });
+});
+
+describe('portFromSource', () => {
+  it('reads the Node fallback idiom (the demo benefits-api case)', () => {
+    expect(portFromSource('const PORT = Number(process.env.PORT) || 3002;\napp.listen(PORT);')).toBe('3002');
+    expect(portFromSource('const PORT = process.env.PORT ?? 3001;')).toBe('3001');
+    expect(portFromSource('fastify.listen({ port: Number(process.env.PORT) || 3001, host: "0.0.0.0" });')).toBe('3001');
+  });
+  it('reads a literal listen() and a direct assignment', () => {
+    expect(portFromSource('app.listen(4000, () => {})')).toBe('4000');
+    expect(portFromSource('const PORT = 8080;')).toBe('8080');
+    expect(portFromSource('server: { port: 5174 }')).toBe('5174');
+  });
+  it('returns null when there is no port literal to grab', () => {
+    expect(portFromSource('const PORT = process.env.PORT;')).toBeNull();
+    expect(portFromSource('app.listen(PORT);')).toBeNull();
+    expect(portFromSource('')).toBeNull();
+    expect(portFromSource(null)).toBeNull();
+  });
+});
+
+describe('portFromUrl', () => {
+  it('reads the port from a localhost URL (the demo README case)', () => {
+    expect(portFromUrl('Server listens on `http://localhost:3002`.')).toBe('3002');
+    expect(portFromUrl('curl -H "Authorization: Token x" http://localhost:3002/v1/employees')).toBe('3002');
+    expect(portFromUrl('visit http://127.0.0.1:4000/ to start')).toBe('4000');
+  });
+  it('skips well-known DB/service ports and returns the real one', () => {
+    expect(portFromUrl('DATABASE_URL=postgres://localhost:5432/app\nAPI at http://localhost:3002')).toBe('3002');
+    expect(portFromUrl('redis://localhost:6379')).toBeNull();
+  });
+  it('returns null when there is no localhost URL', () => {
+    expect(portFromUrl('no url here')).toBeNull();
+    expect(portFromUrl('https://api.example.com/v1')).toBeNull();
+    expect(portFromUrl(null)).toBeNull();
+  });
+});
+
+describe('portFromDocker', () => {
+  it('takes the host port from a compose ports mapping', () => {
+    expect(portFromDocker('services:\n  api:\n    ports:\n      - "3002:3000"')).toBe('3002');
+    expect(portFromDocker('    ports:\n      - 4000:3000')).toBe('4000');
+    expect(portFromDocker('    ports:\n      - "127.0.0.1:3002:3000"')).toBe('3002');
+    expect(portFromDocker('    ports:\n      - "8080"')).toBe('8080');
+  });
+  it('reads a Dockerfile EXPOSE', () => {
+    expect(portFromDocker('FROM node:20\nEXPOSE 3002\nCMD ["node","index.js"]')).toBe('3002');
+  });
+  it('skips a DB port mapping and finds the app port', () => {
+    expect(portFromDocker('    ports:\n      - "5432:5432"\n      - "3002:3000"')).toBe('3002');
+    expect(portFromDocker('    ports:\n      - "5432:5432"')).toBeNull();
+  });
+  it('returns null when there is no port', () => {
+    expect(portFromDocker('services:\n  api:\n    build: .')).toBeNull();
+    expect(portFromDocker(null)).toBeNull();
+  });
+});
+
+describe('frameworkDefaultPort', () => {
+  it('maps frameworks to their conventional default port', () => {
+    expect(frameworkDefaultPort({ dependencies: { next: '14.0.0' } })).toBe('3000');
+    expect(frameworkDefaultPort({ devDependencies: { vite: '5.0.0' } })).toBe('5173');
+    expect(frameworkDefaultPort({ dependencies: { astro: '4.0.0' } })).toBe('4321');
+    expect(frameworkDefaultPort({ dependencies: { '@angular/core': '17.0.0' } })).toBe('4200');
+    expect(frameworkDefaultPort({ dependencies: { gatsby: '5.0.0' } })).toBe('8000');
+  });
+  it('resolves a SvelteKit app (kit + vite) as Vite, and Next before Vite', () => {
+    expect(frameworkDefaultPort({ devDependencies: { '@sveltejs/kit': '2.0.0', vite: '5.0.0' } })).toBe('5173');
+    expect(frameworkDefaultPort({ dependencies: { next: '14.0.0' }, devDependencies: { vite: '5.0.0' } })).toBe('3000');
+  });
+  it('returns null for an unrecognized (e.g. bare Express) project', () => {
+    expect(frameworkDefaultPort({ dependencies: { express: '4.0.0' } })).toBeNull();
+    expect(frameworkDefaultPort({})).toBeNull();
+    expect(frameworkDefaultPort(null)).toBeNull();
+  });
+});
+
+describe('normalizeBaseUrl', () => {
+  it('turns a bare port or host into a localhost base URL', () => {
+    expect(normalizeBaseUrl('3002')).toBe('http://localhost:3002');
+    expect(normalizeBaseUrl(':4000')).toBe('http://localhost:4000');
+    expect(normalizeBaseUrl('localhost:3002')).toBe('http://localhost:3002');
+    expect(normalizeBaseUrl('127.0.0.1:8080')).toBe('http://127.0.0.1:8080');
+  });
+  it('keeps a full URL and its base path, trimming a trailing slash', () => {
+    expect(normalizeBaseUrl('http://localhost:3002/api')).toBe('http://localhost:3002/api');
+    expect(normalizeBaseUrl('http://localhost:3002/api/')).toBe('http://localhost:3002/api');
+    expect(normalizeBaseUrl('https://localhost:3002')).toBe('https://localhost:3002');
+  });
+  it('returns null for nonsense', () => {
+    expect(normalizeBaseUrl('')).toBeNull();
+    expect(normalizeBaseUrl(null)).toBeNull();
+    expect(normalizeBaseUrl('not a url')).toBeNull();
+  });
+});
+
+describe('basePathFromServers', () => {
+  it('extracts a base path from an absolute or relative server url', () => {
+    expect(basePathFromServers({ servers: [{ url: 'http://localhost:3000/api' }] })).toBe('/api');
+    expect(basePathFromServers({ servers: [{ url: '/api/v1' }] })).toBe('/api/v1');
+    expect(basePathFromServers({ servers: [{ url: 'https://api.example.com/v2/' }] })).toBe('/v2');
+  });
+  it('is empty for a host-only server or a missing servers block', () => {
+    expect(basePathFromServers({ servers: [{ url: 'https://whatever.com' }] })).toBe('');
+    expect(basePathFromServers({ servers: [{ url: 'http://localhost:3000/' }] })).toBe('');
+    expect(basePathFromServers({})).toBe('');
+    expect(basePathFromServers(null)).toBe('');
   });
 });
 
@@ -76,14 +227,13 @@ describe('describeDiagnosis', () => {
     expect(text(r)).toContain('.env');
   });
 
-  it('unreachable only nudges about the port after a few misses', () => {
-    const early = describeDiagnosis('unreachable', { localBase: 'http://localhost:3000', attempt: 1 });
-    expect(early.canFix).toBe(false);
-    expect(text(early)).toContain('Waiting for your server');
-    expect(text(early)).not.toContain('different port');
-
-    const later = describeDiagnosis('unreachable', { localBase: 'http://localhost:3000', attempt: 4 });
-    expect(text(later)).toContain('different port');
+  it('unreachable is a terse CTA plus the URL being watched', () => {
+    const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api' });
+    expect(r.canFix).toBe(false);
+    expect(text(r)).toContain('Start your server');
+    expect(text(r)).toContain('Watching for http://localhost:3002/api');
+    // Keep it minimal - no extra explanatory sentences.
+    expect(r.lines.length).toBe(2);
   });
 });
 
