@@ -227,13 +227,22 @@ describe('describeDiagnosis', () => {
     expect(text(r)).toContain('.env');
   });
 
-  it('unreachable is a terse CTA plus the URL being watched', () => {
+  it('unreachable leads with an action imperative and demotes the poll', () => {
     const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api' });
     expect(r.canFix).toBe(false);
-    expect(text(r)).toContain('Start your server');
-    expect(text(r)).toContain('Watching for http://localhost:3002/api');
-    // Keep it minimal - no extra explanatory sentences.
-    expect(r.lines.length).toBe(2);
+    // Lead with an imperative that makes clear the user has to act...
+    expect(text(r)).toContain('start your dev server');
+    // ...and tell them to run it in another terminal (the biggest confusion).
+    expect(text(r)).toContain('another terminal');
+    // The passive "checking" poll is demoted to a small sub-line under the CTA.
+    expect(text(r)).toContain('checking localhost:3002');
+    expect(r.lines.length).toBe(3);
+  });
+
+  it('unreachable escalates the copy after several silent probes', () => {
+    const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api', attempt: 8 });
+    expect(text(r)).toContain('Still nothing on :3002');
+    expect(text(r)).toContain('have you started your server yet?');
   });
 });
 

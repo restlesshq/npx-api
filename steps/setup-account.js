@@ -2,7 +2,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, brightGreen, celebrationBanner } from '../lib/ui.js';
+import { parseOas } from '../lib/oas-parse.js';
 import { loadSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
 import { isInteractive } from '../lib/env.js';
@@ -77,6 +78,22 @@ function waitForEnter() {
   return { promise, cancel: () => cancel() };
 }
 
+// Count operations (method entries under each path) in a parsed OAS, so the
+// completion recap can show a concrete "Mapped N endpoints" number.
+const OAS_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace']);
+function countEndpoints(oas) {
+  if (!oas || typeof oas.paths !== 'object' || !oas.paths) return 0;
+  let n = 0;
+  for (const item of Object.values(oas.paths)) {
+    if (item && typeof item === 'object') {
+      for (const method of Object.keys(item)) {
+        if (OAS_METHODS.has(method.toLowerCase())) n++;
+      }
+    }
+  }
+  return n;
+}
+
 // Find the API entry whose rootDir matches apiRootDir, falling back to the
 // first one if there's no match (typical single-API setup).
 function pickApiEntry(settings, apiRootDir) {
@@ -109,11 +126,17 @@ export default async function setupAccount({
     : [dim('  No local OpenAPI spec found to upload.')],
   });
 
+  let endpointCount = 0;
   if (hasLocalOas) {
     setSpinner?.('Uploading OpenAPI spec');
     try {
       const oasRaw = fs.readFileSync(oasPath, 'utf8');
       const isJson = oasPath.endsWith('.json');
+      // Count endpoints off the same bytes we're uploading, for the recap.
+      try {
+        const parsed = parseOas(oasRaw, isJson ? 'json' : 'yaml');
+        if (parsed.ok) endpointCount = countEndpoints(parsed.oas);
+      } catch {}
       const uploadRes = await fetch(`${SITE_URL}/api/projects/${projectId}/oas`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -219,6 +242,18 @@ export default async function setupAccount({
     ? `  ${green('✓')} Uploaded ${bold(oasFile)}.`
     : null;
 
+  // A concrete recap of what the setup actually accomplished. Shown on the
+  // completion screen so the final step reads as a payoff with real numbers,
+  // not just another identical-looking intermediate step.
+  const recap = [
+    `  ${bold('Here’s what you set up:')}`,
+    `    ${green('✓')} ${endpointCount
+      ? `Mapped ${bold(String(endpointCount))} endpoint${endpointCount === 1 ? '' : 's'}`
+      : 'Mapped your API'}`,
+    `    ${green('✓')} Installed and wired the Restless SDK`,
+    hasLocalOas ? `    ${green('✓')} Uploaded ${bold(oasFile)}` : null,
+  ].filter(Boolean);
+
   // Non-interactive (agent / CI): claiming the project is a human action -
   // it needs a browser login that no one is here to complete, and the auth
   // poll below is unbounded, so racing it would hang forever. The OAS +
@@ -237,15 +272,22 @@ export default async function setupAccount({
     return { apiKey };
   }
 
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    uploadDoneLine,
-    uploadDoneLine ? '' : null,
-    '  Now log in to claim your project on Restless.',
+  // All the setup work is done - the only thing left is the human action of
+  // claiming the project. Mark the step tree complete (all green, no in-progress
+  // arrow), celebrate, and frame the login as claiming a reward. The CTA is the
+  // hero (bright-green + bold, brightest thing on screen); the URL is demoted to
+  // a dim fallback below it.
+  update({ status: 'done', sub: { 0: 'done', 1: 'done' }, message: [
+    ...celebrationBanner(`🎉  ${bold('Setup complete')} — your API is ready to claim`),
     '',
-    `    ${cyan(loginUrl)}`,
+    ...recap,
     '',
-    dim('  Press Enter to open in your browser, or click the link above.'),
-  ].filter((l) => l !== null) });
+    `  ${brightGreen(bold('▶ Press Enter to open your browser and log in'))}`,
+    `  ${brightGreen('❯')}`,
+    '',
+    dim('  Didn’t open? Paste this link instead:'),
+    `  ${dim(loginUrl)}`,
+  ] });
 
   // Race the Enter prompt against polling: if the user clicks the link
   // directly (skipping Enter), polling finishes first and we cancel the
@@ -262,13 +304,17 @@ export default async function setupAccount({
   let result;
   if (winner.kind === 'enter') {
     openBrowser(loginUrl);
-    update({ activeSub: 1, message: [
-      uploadDoneLine,
-      uploadDoneLine ? '' : null,
-      '  Waiting for you to log in...',
+    // Keep the completed step tree (status stays done) so the payoff doesn't
+    // snap back to an in-progress look while we wait on the browser login.
+    update({ status: 'done', message: [
+      ...celebrationBanner(`🎉  ${bold('Setup complete')} — one last step to claim it`),
       '',
-      dim('  Complete the login in your browser. We\'ll continue automatically.'),
-    ].filter((l) => l !== null) });
+      `  ${brightGreen(bold('▶ Opening your browser…'))}`,
+      `  ${brightGreen('❯')} ${dim('finish logging in there — we’ll continue automatically')}`,
+      '',
+      dim('  Didn’t open? Paste this link instead:'),
+      `  ${dim(loginUrl)}`,
+    ] });
     process.stdin.resume();
     result = await pollPromise;
     process.stdin.pause();
