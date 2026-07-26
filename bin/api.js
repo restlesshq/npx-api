@@ -1134,7 +1134,9 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
-  const loginUrl = `${SITE_URL}/login?token=${token}`;
+  // Short form of `/login?token=<token>`; the site redirects it there.
+  // People retype this out of a terminal, so keep it as short as possible.
+  const loginUrl = `${SITE_URL}/init/${token}`;
   if (asJson) {
     console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId }, null, 2));
   } else {

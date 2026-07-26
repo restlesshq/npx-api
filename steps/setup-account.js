@@ -236,7 +236,9 @@ export default async function setupAccount({
     return { apiKey };
   }
   setSpinner?.('');
-  const loginUrl = `${SITE_URL}/login?token=${token}`;
+  // Short form of `/login?token=<token>`; the site redirects it there.
+  // People retype this out of a terminal, so keep it as short as possible.
+  const loginUrl = `${SITE_URL}/init/${token}`;
 
   const uploadDoneLine = hasLocalOas
     ? `  ${green('✓')} Uploaded ${bold(oasFile)}.`
