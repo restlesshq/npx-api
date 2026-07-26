@@ -1,16 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey, watchSpinner } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
-import { parseStatus, validatePort, describeDiagnosis, fixActions, fixContext } from '../lib/test-diagnosis.js';
+import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, fixActions, fixContext, portFromPackageJson, portFromSource, portFromUrl, portFromDocker, frameworkDefaultPort } from '../lib/test-diagnosis.js';
+import { loadOas } from '../lib/oas-auth.js';
 import { isInteractive } from '../lib/env.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
-import { loadOas } from '../lib/oas-auth.js';
 
 // A bare host[:port] like `api.example.com` or `api.example.com:8080` -
 // a token with a dot before the first slash and no scheme. Used to catch
@@ -143,76 +143,99 @@ function diagnoseFromHeaders(headers) {
 }
 
 /**
- * Best-effort detection of the port the dev server runs on. We check
- * multiple sources because frameworks differ in where the port is
- * declared:
+ * Best-effort detection of the port the dev server runs on. The port is
+ * almost always either declared explicitly (package.json / .env / code) or
+ * left at the framework's default, so we look in that order:
  *
- *   1. `package.json` scripts - `next dev -p 4000`, `vite --port 4000`,
- *      `nodemon -p 4000`, etc. Most JS/TS apps surface their port here.
- *   2. `.env*` files - `PORT=4000`. Common for Express/Fastify/Koa and
- *      also honored by `next dev` and `nuxt dev`.
- *   3. Source files - `.listen(PORT)` literal or `PORT = N` constant.
- *      Catches the bare-Express path; Next.js / Nuxt have no such call.
+ *   1. package.json - a port flag / `PORT=` in the scripts, or `config.port`
+ *      (via `portFromPackageJson`). Where most JS/TS apps surface their port.
+ *   2. `.env*` files - `PORT=4000` and common aliases. Honored by Express /
+ *      Fastify / Koa and also by `next dev` / `nuxt dev`.
+ *   3. Source / config / Docker / doc files - `.listen(4000)`, the
+ *      `process.env.PORT || 4000` idiom, a `port: 4000` config field, a
+ *      compose `ports:` mapping / Dockerfile `EXPOSE`, or (softest fallback)
+ *      a `localhost:4000` URL in a README / curl example.
+ *   4. The framework's conventional default (Next 3000, Vite 5173,
+ *      Angular 4200, …) via `frameworkDefaultPort`.
  *
- * Falls back to 3000 (Next.js / Express convention) when nothing
- * matches. We deliberately read .env* here even though AI prompts
- * forbid it - this is a local Node read, not a value sent to an LLM,
- * and the port is the only field we extract.
+ * Falls back to 3000 only when we can't recognize anything. Returns
+ * `{ port, source }` where `source` is a short human label (a filename,
+ * `package.json`, `the framework default`, or null for the blind fallback)
+ * so the caller can tell the user where the guess came from. We deliberately
+ * read .env* here even though AI prompts forbid it - this is a local Node
+ * read, not a value sent to an LLM, and the port is the only field we extract.
  */
+function isDockerFile(file) {
+  return /(?:^|\/)(?:docker-compose[^/]*\.ya?ml|compose\.ya?ml|Dockerfile)$/i.test(file);
+}
+
 function detectLocalPort(searchDir) {
-  // 1. package.json scripts.
+  let pkg = null;
   try {
     const pkgPath = path.join(searchDir, 'package.json');
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      const scripts = pkg.scripts || {};
-      // Try the conventional dev-script names first, then any script.
-      const ordered = [
-        ...['dev', 'start:dev', 'start', 'serve', 'develop'].map((k) => scripts[k]).filter(Boolean),
-        ...Object.values(scripts),
-      ];
-      for (const cmd of ordered) {
-        if (typeof cmd !== 'string') continue;
-        // Match `-p 4000`, `--port 4000`, `--port=4000`, and inline
-        // `PORT=4000 next dev`. Anchor on word boundaries so we don't
-        // grab e.g. `--polyfill 1234`.
-        const m =
-          cmd.match(/(?:^|\s)(?:-p|--port)\s*=?\s*(\d{2,5})\b/) ||
-          cmd.match(/\bPORT\s*=\s*(\d{2,5})\b/);
-        if (m) return m[1];
+    if (fs.existsSync(pkgPath)) pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  } catch {}
+
+  // 1. Explicit port declared in package.json (scripts or config.port).
+  if (pkg) {
+    const p = portFromPackageJson(pkg);
+    if (p) return { port: p, source: 'package.json' };
+  }
+
+  // 2. .env* files. We don't list every variant by hand - glob the dir. We
+  //    accept an optional `export ` prefix and a trailing comment, and try
+  //    the canonical `PORT` first before common alternatives.
+  try {
+    const envFiles = fs.readdirSync(searchDir).filter((f) => /^\.env(\..+)?$/.test(f));
+    for (const name of ['PORT', 'SERVER_PORT', 'APP_PORT', 'API_PORT']) {
+      const re = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*["']?(\\d{2,5})["']?`, 'm');
+      for (const f of envFiles) {
+        try {
+          const content = fs.readFileSync(path.join(searchDir, f), 'utf8');
+          const m = content.match(re);
+          if (m) return { port: m[1], source: f };
+        } catch {}
       }
     }
   } catch {}
 
-  // 2. .env* files. We don't list every variant by hand - glob the dir.
-  try {
-    const envFiles = fs.readdirSync(searchDir).filter((f) => /^\.env(\..+)?$/.test(f));
-    for (const f of envFiles) {
-      try {
-        const content = fs.readFileSync(path.join(searchDir, f), 'utf8');
-        // `PORT=4000` (no quotes), `PORT="4000"`, `PORT='4000'`.
-        const m = content.match(/^\s*PORT\s*=\s*["']?(\d{2,5})["']?\s*$/m);
-        if (m) return m[1];
-      } catch {}
-    }
-  } catch {}
-
-  // 3. Source files. Broader extension list now (.tsx, .jsx, .mjs, .cjs).
+  // 3. Source / config / Docker / doc files. Broad extension list so we also
+  //    read framework config files (next.config, vite.config, etc), Docker
+  //    configs, and README / docs. We make three passes over the same files,
+  //    strongest signal first: a high-confidence code/config declaration, then
+  //    a Docker `ports:`/`EXPOSE`, then - only if nothing matched - a
+  //    localhost URL anywhere (softest, so it never pre-empts an explicit one).
   try {
     const files = execSync(
-      'find . -maxdepth 3 \\( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.py" -o -name "*.rb" \\) -not -path "*/node_modules/*" | head -40',
-      { cwd: searchDir, encoding: 'utf8' },
+      'find . -maxdepth 3 \\( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.py" -o -name "*.rb" -o -name "*.md" -o -name "*.mdx" -o -name "*.txt" -o -name "docker-compose*.yml" -o -name "docker-compose*.yaml" -o -name "compose.yml" -o -name "compose.yaml" -o -name "Dockerfile" \\) -not -path "*/node_modules/*" | head -100',
+      { cwd: searchDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
     );
+    const entries = [];
     for (const file of files.trim().split('\n').filter(Boolean)) {
-      try {
-        const content = fs.readFileSync(path.join(searchDir, file), 'utf8');
-        const match = content.match(/\.listen\(\s*(\d{2,5})\s*[,)]/) || content.match(/\bPORT\s*(?:=|:)\s*(\d{2,5})\b/);
-        if (match) return match[1];
-      } catch {}
+      try { entries.push({ file, content: fs.readFileSync(path.join(searchDir, file), 'utf8') }); } catch {}
+    }
+    for (const { file, content } of entries) {
+      const p = portFromSource(content);
+      if (p) return { port: p, source: path.basename(file) };
+    }
+    for (const { file, content } of entries) {
+      if (!isDockerFile(file)) continue;
+      const p = portFromDocker(content);
+      if (p) return { port: p, source: path.basename(file) };
+    }
+    for (const { file, content } of entries) {
+      const p = portFromUrl(content);
+      if (p) return { port: p, source: path.basename(file) };
     }
   } catch {}
 
-  return '3000';
+  // 4. Nothing explicit - fall back to the framework's conventional default.
+  if (pkg) {
+    const d = frameworkDefaultPort(pkg);
+    if (d) return { port: d, source: 'the framework default' };
+  }
+
+  return { port: '3000', source: null };
 }
 
 export default async function testSetup({
@@ -237,10 +260,10 @@ export default async function testSetup({
       {
         label: 'How',
         body:
-          `As soon as your server is up, we detect it, quietly send a test request,\n` +
-          `and confirm it flows through the SDK - a rejected request (like a ${bold('401')})\n` +
-          `still counts. Nothing to run, no key needed. If it's not wired right,\n` +
-          `${orange(aiTool)} fixes it and we re-check on our own.`,
+          `As soon as your server is up, we detect it, quietly send a few test\n` +
+          `requests, and confirm they flow through the SDK - a rejected request\n` +
+          `(like a ${bold('401')}) still counts. Nothing to run, no key needed. If it's not\n` +
+          `wired right, ${orange(aiTool)} fixes it and we re-check on our own.`,
       },
     ],
     actionRequired: 'Start your server in another terminal.',
@@ -252,17 +275,25 @@ export default async function testSetup({
   // that's where the fix AI should run.
   const installDir = searchDir;
 
-  // The port is mutable - the user can correct a wrong guess mid-flight,
-  // so `localBase()` always reflects the current choice.
-  let localPort = detectLocalPort(searchDir);
-  const localBase = () => `http://localhost:${localPort}`;
-
   // The test curl was picked at the end of step 1 (auth stripped - we send
-  // it unauthenticated on purpose). We re-point its base at the current
-  // port on every probe. Falls back to a bare GET / if none was saved.
+  // it unauthenticated on purpose). We re-point its base at the current URL
+  // on every probe. Falls back to a bare GET / if none was saved.
   const settings = loadSettings(rootDir);
   const apiEntry = settings.apis?.find((a) => a.rootDir === (apiRootDir || '.')) || settings.apis?.[0];
   const savedCurl = apiEntry?.testCurl ? stripAuthPlaceholder(apiEntry.testCurl) : null;
+
+  // The base URL is mutable - the user can correct a wrong guess mid-flight,
+  // so `localBase()` always reflects the current choice. We compose it from
+  // the detected port plus any base path the OAS mounts the API under (e.g.
+  // servers `.../api` → we probe `http://localhost:PORT/api`), so an API
+  // that isn't at the root still gets hit correctly.
+  const detected = detectLocalPort(searchDir);
+  let oas = null;
+  try { if (apiEntry?.oasFile) oas = loadOas(path.resolve(rootDir, apiEntry.oasFile)); } catch {}
+  const basePath = basePathFromServers(oas);
+  let baseUrl = `http://localhost:${detected.port}${basePath}`;
+  const localBase = () => baseUrl;
+  debug.log('test-setup.url-detected', { url: baseUrl, portSource: detected.source, basePath });
 
   function buildProbeCurl() {
     const base = savedCurl ? rewriteCurlBase(savedCurl, localBase()) : `curl -sS ${localBase()}/`;
@@ -275,12 +306,15 @@ export default async function testSetup({
 
   // Fire one request at the local server and classify from the response
   // headers. A connection error → 'unreachable' (server down / wrong port);
-  // otherwise the SDK's `x-restless-id` header tells us the rest.
+  // otherwise the SDK's `x-restless-id` header tells us the rest. We pipe
+  // curl's stderr (stdio slot 2) instead of letting it inherit the terminal -
+  // otherwise a failed connection prints a raw `curl: (7) Failed to connect…`
+  // line that corrupts the rendered plan UI.
   function probe() {
     const cmd = buildProbeCurl();
     if (!curlTargetIsLocal(cmd)) return { state: 'unreachable' };
     try {
-      const raw = execSync(cmd, { encoding: 'utf8', timeout: 10000 });
+      const raw = execSync(cmd, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
       const { headers } = splitCurlIncludeOutput(raw);
       const diag = diagnoseFromHeaders(headers);
       return { state: diag.state, status: parseStatus(raw), requestId: diag.requestId };
@@ -290,21 +324,29 @@ export default async function testSetup({
     }
   }
 
-  // ── Visible "test" batch ────────────────────────────────────────────────
-  // Once we know the server is up and the SDK is wired, we fire a few real
-  // requests and show each one's status code + whether the SDK captured it.
-  // A single silent probe reads as "did it even do anything?"; watching 2-3
-  // requests come back with status codes makes it obvious we tested and it
-  // worked.
+  // Render a diagnosis into the plan step message. The waiting state also
+  // gets a footer advertising the escape-hatch keys.
+  function render(state, { status, attempt, frame } = {}) {
+    const { icon, lines } = describeDiagnosis(state, { status, localBase: localBase(), aiTool, attempt, frame });
+    const msg = [`  ${icon}  ${lines[0]}`, ...lines.slice(1).map((l) => `     ${l}`)];
+    if (state === 'unreachable') {
+      msg.push('');
+      msg.push(dim(`     Not the right address? Press ${bold('p')} to change the URL · ${bold('Tab')} to skip`));
+    }
+    update({ message: msg });
+  }
 
-  // Up to 3 safe GET requests, pulled from the OAS's ranked test candidates
-  // (so we exercise a few different real endpoints). Falls back to the single
-  // saved probe curl if the OAS isn't readable.
+  // ── Visible "test" batch ────────────────────────────────────────────────
+  // A single silent probe reads as "did it even do anything?". Once we know
+  // the server is up and the SDK is wired, we fire a few real requests and
+  // show each one's status code + whether the SDK captured it - so it's
+  // obvious we tested it and it worked, even when the statuses are 401s.
+
+  // Up to 3 safe GET requests from the OAS's ranked test candidates (so we
+  // exercise a few real endpoints). Falls back to the single saved probe curl.
   function buildTestRequests() {
     const reqs = [];
     try {
-      const oasPath = apiEntry?.oasFile ? path.join(rootDir, apiEntry.oasFile) : null;
-      const oas = oasPath ? loadOas(oasPath) : null;
       if (oas) {
         for (const cand of findTestCandidates(oas, { max: 3 })) {
           let curl = buildCurl(oas, cand, localBase());
@@ -355,9 +397,9 @@ export default async function testSetup({
     return lines;
   }
 
-  // Fire the batch. Interactively we animate it row-by-row (each request
-  // flips from "sending…" to its status code); non-interactively we run them
-  // all and let the caller print the final list once (no per-row redraw spam).
+  // Fire the batch. Interactively we animate it row-by-row (each request flips
+  // from "sending…" to its status code); non-interactively we run them all and
+  // let the caller print the final list once (no per-row redraw spam).
   async function runTestBatch() {
     const rows = buildTestRequests().map((r) => ({ ...r, state: 'pending', status: null, captured: false }));
     const interactive = isInteractive();
@@ -366,7 +408,7 @@ export default async function testSetup({
     for (const row of rows) {
       if (interactive) { row.state = 'running'; draw(); await new Promise((r) => setTimeout(r, 250)); }
       try {
-        const raw = execSync(row.curl, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] });
+        const raw = execSync(row.curl, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
         row.status = parseStatus(raw);
         row.captured = diagnoseFromHeaders(splitCurlIncludeOutput(raw).headers).state !== 'no-sdk';
       } catch {
@@ -377,18 +419,6 @@ export default async function testSetup({
       if (interactive) draw();
     }
     return rows;
-  }
-
-  // Render a diagnosis into the plan step message. The waiting state also
-  // gets a footer advertising the escape-hatch keys.
-  function render(state, { status, attempt } = {}) {
-    const { icon, lines } = describeDiagnosis(state, { status, localBase: localBase(), aiTool, attempt });
-    const msg = [`  ${icon}  ${lines[0]}`, ...lines.slice(1).map((l) => `     ${l}`)];
-    if (state === 'unreachable') {
-      msg.push('');
-      msg.push(dim(`     Press ${bold('p')} to change the port · ${bold('Tab')} to skip`));
-    }
-    update({ message: msg });
   }
 
   // Poll the dashboard for a log from this run. A landed log (any status,
@@ -414,11 +444,11 @@ export default async function testSetup({
     return false;
   }
 
-  async function changePort() {
-    const answer = await ask(`\n  ${cyan('?')} What port is your server on? `, { defaultValue: String(localPort) });
-    const p = validatePort(answer);
-    if (p) localPort = p;
-    return localPort;
+  async function changeUrl() {
+    const answer = await ask(`\n  ${cyan('?')} What URL is your server on? `, { defaultValue: baseUrl });
+    const u = normalizeBaseUrl(answer);
+    if (u) baseUrl = u;
+    return baseUrl;
   }
 
   // Hand the runtime evidence to the agent and let it edit the code.
@@ -457,11 +487,11 @@ export default async function testSetup({
   // The interactive loop below relies on a human to press keys, restart the
   // server on cue, and drive the fix menu - none of which happens under an
   // agent, so it would hang (the post-fix watch waits forever for a manual
-  // restart). Instead: poll for the server for a bounded window, diagnose
-  // once, and report. Success = the SDK saw the request (any status, incl.
-  // a 401 / `missing-key` - an agent has no key and doesn't need one). On a
-  // real failure we surface the diagnosis + fix guidance and return so the
-  // driving agent can act, rather than blocking on a restart we can't get.
+  // restart). Instead: poll for the server for a bounded window, diagnose,
+  // and on success fire the visible batch and report. Success = the SDK saw
+  // the request (any status, incl. a 401 / `missing-key` - an agent has no
+  // key and doesn't need one). On a real failure we surface the diagnosis +
+  // fix guidance and return, rather than blocking on a restart we can't get.
   if (!isInteractive()) {
     const MAX_ATTEMPTS = 15; // ~30s at 2s spacing - room for a dev server to boot
     let diag = { state: 'unreachable' };
@@ -474,17 +504,13 @@ export default async function testSetup({
 
     if (diag.state === 'unreachable') {
       update({ status: 'done', message: [
-        `  ${yellow('⚠')} Couldn't reach your server on ${bold(localBase())} within the wait window.`,
-        dim(`     Start it (or set the right port) and run setup again to finish the check.`),
+        `  ${yellow('⚠')} Couldn't reach your server at ${bold(localBase())} within the wait window.`,
+        dim(`     Start it (or fix the URL) and run setup again to finish the check.`),
       ]});
       debug.log('test-setup.noninteractive', { state: 'unreachable' });
       return { success: false, diagnostic: 'unreachable' };
     }
 
-    // The SDK saw the request. Fire a few visible requests so the outcome is
-    // concrete (status codes + captured flags), then confirm. For a real key
-    // we'd also check the dashboard, but an agent has none - the header is the
-    // proof of wiring.
     if (diag.state === 'ok' || diag.state === 'no-key') {
       const since = new Date(Date.now() - 15000).toISOString();
       const rows = await runTestBatch();
@@ -524,7 +550,7 @@ export default async function testSetup({
     // Passive watch: poll until the server answers, or the user hits a key.
     const ev = await waitForServerOrKey(probe, {
       intervalMs: 2000,
-      render: (attempt) => render('unreachable', { attempt }),
+      render: (attempt, frame) => render('unreachable', { attempt, frame }),
     });
 
     if (ev.type === 'key') {
@@ -532,7 +558,7 @@ export default async function testSetup({
         if (await confirmSkip()) { finishSkipped(lastState); return { success: false, diagnostic: lastState }; }
         continue;
       }
-      if ((ev.key || '').toLowerCase() === 'p') { await changePort(); continue; }
+      if ((ev.key || '').toLowerCase() === 'p') { await changeUrl(); continue; }
       continue; // any other key → re-check immediately
     }
 
@@ -574,7 +600,7 @@ export default async function testSetup({
       if (await confirmSkip()) { finishSkipped(lastState); return { success: false, diagnostic: lastState }; }
       continue;
     }
-    if (action === 'port') { await changePort(); continue; }
+    if (action === 'port') { await changeUrl(); continue; }
     if (action === 'fix') {
       await runFix(diag.state);
       // The server is still running the OLD code until the user restarts,
@@ -589,8 +615,8 @@ export default async function testSetup({
         },
         {
           intervalMs: 2000,
-          render: () => update({ message: [
-            `  ${dim('⟳')}  Fix applied - ${bold('restart your server')} and we'll pick it up…`,
+          render: (attempt, frame) => update({ message: [
+            `  ${watchSpinner(frame)}  Fix applied - ${bold('restart your server')} and we'll pick it up…`,
             dim(`     Press any key to re-check now.`),
           ]}),
         },
