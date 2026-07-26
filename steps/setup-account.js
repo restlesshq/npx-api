@@ -283,7 +283,6 @@ export default async function setupAccount({
     ...recap,
     '',
     `  ${brightGreen(bold('▶ Press Enter to open your browser and log in'))}`,
-    `  ${brightGreen('❯')}`,
     '',
     dim('  Didn’t open? Paste this link instead:'),
     `  ${dim(loginUrl)}`,
@@ -310,7 +309,9 @@ export default async function setupAccount({
       ...celebrationBanner(`🎉  ${bold('Setup complete')} — one last step to claim it`),
       '',
       `  ${brightGreen(bold('▶ Opening your browser…'))}`,
-      `  ${brightGreen('❯')} ${dim('finish logging in there — we’ll continue automatically')}`,
+      // No second glyph: a bare ❯ under the line reads as an input prompt
+      // waiting on you, when the only thing left is to finish in the browser.
+      `  ${dim('You can finish the setup there!')}`,
       '',
       dim('  Didn’t open? Paste this link instead:'),
       `  ${dim(loginUrl)}`,
@@ -331,9 +332,18 @@ export default async function setupAccount({
     `  ${green('✓')} Logged in as ${bold(email)}.`,
     `  ${green('✓')} Project claimed: ${cyan(`${SITE_URL}/api/${slug}`)}`,
     '',
+    '',
     `  ${bold('Next steps:')}`,
-    `    Commit ${cyan('.restless/')} to your repo so your team and CI use the same config.`,
-  ].filter(Boolean) });
+    '',
+    `    Commit your changes and deploy.`,
+    // All one dim line - a cyan `.restless/` inside it would render
+    // dim-cyan, which is muddier than just leaving it gray.
+    `    ${dim('Include the .restless/ folder so your team and CI use the same config.')}`,
+    '',
+    // `uploadDoneLine` is conditionally null, but the blank separators are
+    // real content - filtering on truthiness dropped them and jammed this
+    // whole block against the checkmarks above it.
+  ].filter((l) => l !== null && l !== undefined) });
 
   return { apiKey, email, slug };
 }

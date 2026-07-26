@@ -1,11 +1,11 @@
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { bold, dim, green, red, yellow, cyan, ask, askYesNo, singleSelect, waitForKey } from '../lib/ui.js';
-import { loadSettings, saveSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
 import { fatalError } from '../lib/errors.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
+import { generateWriteKey, ensureProject } from '../lib/project-init.js';
+import * as debug from '../lib/debug.js';
 
 /**
  * Resolve the directory that owns the detected API's `package.json`, so
@@ -103,67 +103,33 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   let envFile = existingEnvFile || path.join(apiDir, '.env');
   let envRelative = path.relative(packageDir, envFile);
 
-  // Idempotency: if a pre-existing .env already has a RESTLESS_KEY, reuse it
-  // and re-register with the backend using the same hash.
+  // Idempotency: if a pre-existing .env already has a RESTLESS_KEY, reuse it -
+  // `ensureProject` then keeps this repo on the project that key is already
+  // registered against rather than minting another one.
   const existingKey = existingEnvFile ? existingRestlessKey(envFile) : null;
-  const apiKey = existingKey || 'rstlss_' + crypto.randomBytes(32).toString('hex');
-  const writeKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+  const apiKey = existingKey || generateWriteKey();
 
   update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
     `  Generating a key for this project and registering it with Restless.`,
     dim('  The key goes in .env; we only send its hash to our server.'),
   ]});
 
-  let projectId, setupKey;
-  // Retry once on 500 / network failure - the metrics service cold-starts
-  // and the first request often times out at the Vercel layer with a 500.
-  // The second attempt almost always hits a warm container.
-  async function callInit() {
-    return fetch(`${SITE_URL}/api/projects/init`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ write_key_hash: writeKeyHash }),
-    });
-  }
-
+  let projectId, setupKey, reusedProject;
   setSpinner({ phase: 'Registering project', detail: `POST ${SITE_URL}/api/projects/init` });
   try {
-    let res = await callInit();
-    if (res.status >= 500) {
-      setSpinner({ phase: 'Server warming up, retrying', detail: `POST ${SITE_URL}/api/projects/init` });
-      await new Promise((r) => setTimeout(r, 2000));
-      res = await callInit();
-    }
-    if (!res.ok) {
-      const text = await res.text();
-      setSpinner('');
-      fatalError(`Failed to initialize project (HTTP ${res.status}).`, [
-        text && text.slice(0, 200),
-        `Endpoint: ${SITE_URL}/api/projects/init`,
-      ].filter(Boolean));
-    }
-    const data = await res.json();
-    projectId = data.project_id;
-    setupKey = data.setup_key;
-    const regSettings = loadSettings(rootDir);
-    // projectId lives on the API entry (one Restless project per API) - not
-    // at the root. Match by rootDir; fall back to the first API if no match
-    // is found (typical single-API setup).
-    const apiRootKey = apiRootDir || '.';
-    const target =
-      regSettings.apis.find((a) => (a.rootDir || '.') === apiRootKey) ||
-      regSettings.apis[0];
-    if (target) {
-      target.projectId = projectId;
-    }
-    saveSettings(rootDir, regSettings);
+    // Shared with `npx api key`, so guided and agent-driven runs resolve the
+    // project identically - including reusing this repo's existing project
+    // when the key hasn't changed, instead of minting a fresh one per run and
+    // leaving the previous project holding all the logs.
+    ({ projectId, setupKey, reused: reusedProject } = await ensureProject({ rootDir, apiRootDir, apiKey }));
   } catch (err) {
     setSpinner('');
-    fatalError(`Could not reach the site at ${SITE_URL}.`, [
+    fatalError(`Couldn't register this project with ${SITE_URL}.`, [
       err?.message || String(err),
-      'Is the server running?',
-    ]);
+      `Endpoint: ${SITE_URL}/api/projects/init`,
+    ].filter(Boolean));
   }
+  debug.log('prepare-account.project', { projectId, reused: !!reusedProject });
 
   setSpinner('');
 
@@ -189,7 +155,6 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   }
 
   const appendLine = `RESTLESS_KEY=${apiKey}`;
-  const keyPreview = `${cyan(apiKey.slice(0, 8))}${dim('...')}${cyan(apiKey.slice(-4))}`;
   let keyDelivery; // 'env' | 'manual' | 'inline'
 
   // Build the option list. The first option differs based on whether we'd
@@ -224,8 +189,15 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
     optionValues.splice(1, 1);
   }
 
+  // Full key on its own line. Truncating it to `rstlss_7...46f2` protected
+  // nothing - it's the user's own screen, and their next decision is where
+  // to put this value, which they can't do with an abbreviation.
   update({ status: 'active', sub: { 0: 'done' }, activeSub: 1, message: [
-    `  We've generated your ${bold('RESTLESS_KEY')}: ${keyPreview}.`,
+    `  We've generated your ${bold('RESTLESS_KEY')}:`,
+    '',
+    `  ${cyan(apiKey)}`,
+    '',
+    `  ${dim("Copy it somewhere safe - we won't show it again.")}`,
   ]});
   const choice = await singleSelect(options, {
     message: 'Where do you want it to be stored?',

@@ -93,7 +93,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
 
   update({ message: [
     `  Verifying ${bold('owner.id')} is a stable, immutable identifier.`,
-    dim(`  ${orange(aiTool)} is tracing the data flow and checking your schema. This is a security check.`),
+    `  ${orange(aiTool)} ${dim('is tracing the data flow and checking your schema. This is a security check.')}`,
   ]});
 
   const prompt = loadPrompt('verify-owner-id', {

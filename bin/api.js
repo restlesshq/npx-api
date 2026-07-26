@@ -6,7 +6,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
@@ -20,8 +20,13 @@ import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
-import { isInteractive, detectAgent } from '../lib/env.js';
-import { loadSettings, saveSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
+import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
+import { buildAgentPlan } from '../lib/agent-plan.js';
+import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
+import { findExistingEnvFile, existingRestlessKey } from '../steps/prepare-account.js';
+import { generateWriteKey, ensureProject, loadProjectCreds } from '../lib/project-init.js';
+import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
+import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
 import * as debug from '../lib/debug.js';
@@ -290,9 +295,44 @@ await showDebugBanner();
  * placeholder if the file can't be read - the version string is
  * informational and should never be able to crash the CLI.
  */
+// Root of the installed package - where the guides and prompts we ship live.
+const PKG_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * Put text on the system clipboard. Returns false when there's no clipboard
+ * tool available (headless Linux, a container, an SSH session), so callers
+ * can fall back to printing the text instead of claiming a copy that never
+ * happened.
+ */
+function copyToClipboard(text) {
+  const cmds = process.platform === 'darwin' ? ['pbcopy']
+    : process.platform === 'win32' ? ['clip']
+    : ['wl-copy', 'xclip -selection clipboard', 'xsel --clipboard --input'];
+  for (const cmd of cmds) {
+    try {
+      execSync(cmd, { input: text, stdio: ['pipe', 'ignore', 'ignore'] });
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Read `--flag value` off argv. Returns null when the flag is absent or is
+ * the last argument (so `--dir` with nothing after it doesn't swallow the
+ * next flag as its value).
+ */
+function flagValue(flag) {
+  const i = process.argv.indexOf(flag);
+  if (i === -1) return null;
+  const val = process.argv[i + 1];
+  if (!val || val.startsWith('--')) return null;
+  return val;
+}
+
 function readVersion() {
   try {
-    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    const pkgPath = path.join(PKG_DIR, 'package.json');
     return JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || 'unknown';
   } catch {
     return 'unknown';
@@ -323,6 +363,22 @@ function printHelp() {
     console.log(`    ${cyan(name.padEnd(width))}  ${dim(hint)}`);
   }
   console.log('');
+  // Listed apart from the main commands: these are the pieces a coding agent
+  // calls while doing the setup itself (run `init` inside one and it prints
+  // the plan that uses them). A human running setup never needs them.
+  console.log(`  ${bold('For coding agents')}`);
+  const agentRows = [
+    ['guide [oas|sdk]', 'Print the instructions for writing the spec / wiring the SDK'],
+    ['key', 'Register the project and put RESTLESS_KEY in .env'],
+    ['register --oas <f>', 'Record a spec in .restless/settings.json'],
+    ['verify --url <u>', 'Send one request and report whether the SDK saw it'],
+    ['login', 'Print the URL the user opens to claim the project'],
+  ];
+  const agentWidth = Math.max(...agentRows.map(([name]) => name.length));
+  for (const [name, hint] of agentRows) {
+    console.log(`    ${cyan(name.padEnd(agentWidth))}  ${dim(hint)}`);
+  }
+  console.log('');
   console.log(`  ${dim('New here? Run')} ${cyan(`npx ${CLI_NAME} init`)} ${dim('to get started.')}`);
   console.log('');
 }
@@ -333,13 +389,31 @@ if (command === '--version' || command === '-v' || command === 'version') {
 } else if (!command || command === 'help' || command === '--help' || command === '-h') {
   printHelp();
   await debug.flushAndExit(0);
+} else if (
+  (command === 'init' || command === 'setup' || command === 'supercharge') &&
+  isAgent() &&
+  !process.argv.includes('--self-drive')
+) {
+  // ── Driven by a coding agent: hand over instructions, don't self-drive ──
+  // Running our own model here means editing the caller's repo from inside a
+  // child process: no diffs in their session, nothing to interrupt, and a
+  // second agent re-deriving context the caller already has. Print the
+  // playbook and let them do the code work in the open. `--self-drive`
+  // restores the old behaviour for CI and for agents that would rather
+  // delegate the whole thing.
+  const { rootDir: agentRoot } = resolveProjectDirs(process.cwd());
+  const agentName = detectAgent() === 'codex' ? 'Codex' : 'Claude Code';
+  console.log(buildAgentPlan({ rootDir: agentRoot, cli: CLI_NAME, agent: agentName }));
+  debug.log('init.agent-plan', { agent: detectAgent(), rootDir: agentRoot });
+  await debug.flushAndExit(0);
+
 } else if (command === 'init' || command === 'setup' || command === 'supercharge') {
   // ── Welcome screen ────────────────────────────────────────────────────
   // Clear viewport + scrollback so the welcome starts at the top of the
   // terminal, matching where every subsequent screen lands after each
   // transition clears + homes the cursor.
   if (isInteractive()) {
-  process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+  clearScreen();
   console.log('');
   // Swallow keystrokes for the whole animated intro so they don't echo into
   // the text being typed out (and don't queue up to skip the CTA). Restored
@@ -443,7 +517,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   // ENTER: continue normal setup.
   // Clear the viewport + scrollback so the welcome doesn't linger.
-  process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+  clearScreen();
   } else {
     // Non-interactive (agent / CI / pipe): skip the animated welcome and its
     // ENTER / demo / human-handoff gate entirely - there's no TTY to drive
@@ -456,31 +530,46 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   const plan = createPlanManager();
 
-  console.log('');
-  printLogo();
-  console.log('');
+  // Logo + the four steps: the fixed part of the pre-setup screen. Anything
+  // below it is a question, and questions get replaced rather than stacked -
+  // so this is redrawable.
+  function drawSetupHeader() {
+    console.log('');
+    // No separate printLogo() here - drawInitial draws the logo beside the
+    // steps, the same frame the run itself uses, so nothing jumps when the
+    // setup starts.
+    plan.drawInitial();
+    console.log('');
+  }
 
-  // Show the initial plan as static output (not managed by the redraw system)
-  plan.drawInitial();
-
-  console.log('');
+  drawSetupHeader();
   const claudeInstalled = hasClaude();
   const codexInstalled = hasCodex();
-  console.log(`  We use your local AI tooling (Claude or Codex) to set up the project.`);
-  console.log(`  None of your code is ever seen by us. The AI runs on your machine and`);
-  console.log(`  talks to our SDKs directly. We won't upload anything to our servers`);
-  console.log(`  without checking with you first.`);
+  // Three short promises beat a paragraph: the old copy explained the
+  // architecture ("talks to our SDKs directly") when all anyone wants to know
+  // is whose machine the AI runs on and whether anything leaves it.
+  console.log(`  ${bold("Let's get you set up!")} Here's how it works:`);
   console.log('');
-  const claudeLabel = claudeInstalled
-    ? `Claude ${dim('(Recommended)')}`
-    : `${dim('Claude (Recommended)')}`;
-  const codexLabel = codexInstalled ? 'Codex' : dim('Codex');
+  console.log(`  ${dim('·')} We use your local Agent for setup`);
+  console.log(`  ${dim('·')} Your code is never seen by Restless`);
+  console.log(`  ${dim('·')} We won't upload anything until the end`);
+  // No blank line here - the picker opens with one of its own.
+
+  // Name the agent the user actually has. Offering "Claude or Codex" as a
+  // first decision makes them choose a tool before they've agreed to the
+  // approach; the alternatives live one level down, behind "No".
+  const preferred = claudeInstalled || !codexInstalled ? 'claude' : 'codex';
+  const preferredLabel = preferred === 'claude' ? 'Claude' : 'Codex';
+
+  // `choice` keeps the meanings the branches below already handle:
+  // 0 = Claude, 1 = Codex, 2 = book a call, 3 = learn more, 4 = copy a
+  // prompt, 5 = manual setup.
   let choice;
   if (!isInteractive()) {
-    // Non-interactive: never offer Manual / Learn-more (both need a human).
-    // Prefer the agent actually driving us - if Codex is running the CLI,
-    // `claude` may not even be installed - then fall back to whatever's
-    // available so we still surface a clear "install X" message if neither is.
+    // Non-interactive: never offer anything that needs a human. Prefer the
+    // agent actually driving us - if Codex is running the CLI, `claude` may
+    // not even be installed - then fall back to whatever's available so we
+    // still surface a clear "install X" message if neither is.
     const agent = detectAgent();
     if (agent === 'codex' && codexInstalled) choice = 1;
     else if (agent === 'claude' && claudeInstalled) choice = 0;
@@ -489,48 +578,139 @@ if (command === '--version' || command === '-v' || command === 'version') {
     else choice = 0;
     console.log(`  ${dim(`Using ${['Claude', 'Codex'][choice]} to run setup.`)}`);
   } else {
-    choice = await singleSelect(
+    const useAgent = await singleSelect(
       [
-        { label: claudeLabel, hint: claudeInstalled ? 'Use Claude Code running locally on your machine.' : "Claude Code isn't installed - we'll show you how." },
-        { label: codexLabel, hint: codexInstalled ? 'Use the Codex CLI running locally on your machine.' : "Codex isn't installed - we'll show you how." },
-        { label: 'Manual install', hint: "We'll book a quick call so we can pair on it together." },
-        { label: 'Learn more', hint: "Read about how setup works and what we touch before deciding." },
+        {
+          label: `Yes, use ${preferredLabel} ${dim('(recommended)')}`,
+          hint: (preferred === 'claude' ? claudeInstalled : codexInstalled)
+            ? `Runs locally on your machine. You'll see every change.`
+            : `${preferredLabel} isn't installed yet - we'll show you how.`,
+        },
+        { label: 'No, other options', hint: 'Copy a prompt, set it up by hand, or talk to us first.' },
       ],
-      { message: 'How would you like to set this up?', defaultIndex: 0 },
+      { message: 'Is it okay if we set up using your Agent?', defaultIndex: 0 },
     );
+
+    if (useAgent === 0) {
+      choice = preferred === 'claude' ? 0 : 1;
+    } else {
+      // Replace, don't append. The three promises are about handing work to
+      // their agent - moot once they've declined - and leaving the answered
+      // question above the new one reads as two open questions at once.
+      clearScreen();
+      drawSetupHeader();
+      const alt = await singleSelect(
+        [
+          { label: 'Copy a prompt for your Agent', hint: 'Paste it into any agent and it runs the setup itself.' },
+          { label: 'Manual setup', hint: 'Do it by hand - we print the steps and the commands.' },
+          { label: 'Book a quick installation call', hint: "We'll pair on it with you." },
+          { label: 'Learn more', hint: 'Ask us anything about what setup does before deciding.' },
+        ],
+        { message: 'How would you like to set this up?', defaultIndex: 0 },
+      );
+      choice = [4, 5, 2, 3][alt];
+    }
   }
 
   // Clear the viewport so after-selection stuff starts clean at the top.
   // Skip in non-interactive mode - clearing the scrollback just destroys the
   // output an agent is reading.
-  if (isInteractive()) process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+  if (isInteractive()) clearScreen();
 
   if (choice === 3) {
-    // "Learn more" - explain how it works
+    // "Learn more" - a Q&A loop rather than a wall of text. Someone who
+    // picked this has a specific worry (what gets read? what gets uploaded?
+    // what happens to my middleware?), and a static page answers whichever
+    // three we guessed at.
     console.log('');
-    console.log(`  ${bold('What this does')}`);
+    console.log(`  ${bold('Ask us anything about the setup')}`);
     console.log('');
-    console.log(`  Restless wires your API up so you can see what's happening in real time and`);
-    console.log(`  help your users make successful calls. This CLI does the boring part: scans`);
-    console.log(`  your code, generates an OpenAPI spec, installs the SDK, and hooks it into`);
-    console.log(`  your server's middleware.`);
+    console.log(dim(`  What we touch, what we upload, how to undo it - anything.`));
+    console.log(dim(`  Answered locally by ${preferredLabel}. Press ENTER on an empty line to leave.`));
     console.log('');
-    console.log(`  When it finishes, you sign in to claim the project and your logs start`);
-    console.log(`  showing up on the dashboard.`);
-    console.log('');
-    console.log(`  ${bold('How we keep it safe')}`);
-    console.log('');
-    console.log(`  ${green('1.')} ${bold('Your code never leaves your machine.')} Scanning is done by Claude or`);
-    console.log(`     Codex running locally via the CLI you already have installed. We don't`);
-    console.log(`     proxy it, upload it, or see any of it.`);
-    console.log('');
-    console.log(`  ${green('2.')} ${bold('We handle the fiddly bits.')} Framework-specific middleware placement,`);
-    console.log(`     auth-header redaction, env wiring, and OAS generation are all done for you.`);
-    console.log('');
-    console.log(`  ${green('3.')} ${bold('Nothing runs without your OK.')} You see every file change and command`);
-    console.log(`     before it happens, and can bail at any point.`);
+
+    const canAnswer = preferred === 'claude' ? claudeInstalled : codexInstalled;
+    if (!canAnswer) {
+      console.log(`  ${yellow('!')} ${preferredLabel} isn't installed, so we can't answer questions here.`);
+      console.log('');
+      console.log(`  The short version: we read your code locally to write an OpenAPI spec and`);
+      console.log(`  wire in the SDK. Nothing is uploaded until the last step, when you sign in`);
+      console.log(`  to claim the project. ${bold(`npx ${CLI_NAME} reset`)} undoes all of it.`);
+      console.log('');
+      await debug.flushAndExit(0);
+    }
+    setProvider(preferred);
+
+    while (true) {
+      const q = (await ask(`  ${cyan('?')} `)).trim();
+      if (!q) break;
+      console.log('');
+      let answer;
+      try {
+        answer = await runAI(loadPrompt('learn-more-chat', { question: q, cli: CLI_NAME }), process.cwd());
+      } catch (err) {
+        answer = `Couldn't reach ${preferredLabel} (${err.message}).`;
+      }
+      for (const line of String(answer).trim().split('\n')) console.log(`  ${line}`);
+      console.log('');
+    }
     console.log('');
     console.log(`  Run ${cyan(`npx ${CLI_NAME} init`)} again when you're ready.`);
+    console.log('');
+    await debug.flushAndExit(0);
+  }
+
+  if (choice === 4) {
+    // "Copy a prompt for your Agent" - the same playbook `init` prints when
+    // it detects it's being run inside an agent, handed over for a paste.
+    const { rootDir: promptRoot } = resolveProjectDirs(process.cwd());
+    const promptText = buildAgentPlan({ rootDir: promptRoot, cli: CLI_NAME, agent: 'your agent' });
+    const copied = copyToClipboard(promptText);
+
+    console.log('');
+    if (copied) {
+      console.log(`  ${green('✓')} Copied to your clipboard.`);
+      console.log('');
+      console.log(`  Paste it into Claude Code, Codex, Cursor, or whatever you use. It has`);
+      console.log(`  everything they need: the steps, the rules, and the commands to call.`);
+    } else {
+      console.log(`  ${bold('Paste this into your agent:')}`);
+      console.log('');
+      console.log(dim('  ─'.repeat(34)));
+      for (const line of promptText.split('\n')) console.log(`  ${line}`);
+      console.log(dim('  ─'.repeat(34)));
+    }
+    console.log('');
+    console.log(dim(`  Your agent can also just run ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} itself - it prints these`));
+    console.log(dim(`  same instructions when it detects an agent driving it.`));
+    console.log('');
+    await debug.flushAndExit(0);
+  }
+
+  if (choice === 5) {
+    // "Manual setup" - real instructions now that each deterministic piece
+    // has its own command. Previously this just offered to book a call.
+    console.log('');
+    console.log(`  ${bold('Setting up by hand')}`);
+    console.log('');
+    console.log(`  ${green('1.')} ${bold('Write an OpenAPI spec')} for your API at ${cyan('.restless/openapi.json')}, then:`);
+    console.log(`     ${cyan(`npx ${CLI_NAME} register --oas .restless/openapi.json --dir <your-api-dir>`)}`);
+    console.log(dim(`     Already have a spec? Point that command at it - any path works.`));
+    console.log('');
+    console.log(`  ${green('2.')} ${bold('Get your key')} (registers the project, writes ${cyan('RESTLESS_KEY')} to ${cyan('.env')}):`);
+    console.log(`     ${cyan(`npx ${CLI_NAME} key`)}`);
+    console.log('');
+    console.log(`  ${green('3.')} ${bold('Install and wire the SDK.')} Install ${cyan('@restlessai/sdk')}, then follow:`);
+    console.log(`     ${cyan(`npx ${CLI_NAME} guide sdk`)}`);
+    console.log(dim(`     The one thing to get right: register the middleware above any auth`));
+    console.log(dim(`     guard, so a rejected 401 still reaches the SDK.`));
+    console.log('');
+    console.log(`  ${green('4.')} ${bold('Check it.')} Start your server, then:`);
+    console.log(`     ${cyan(`npx ${CLI_NAME} verify --url http://localhost:3000`)}`);
+    console.log('');
+    console.log(`  ${green('5.')} ${bold('Claim the project:')} ${cyan(`npx ${CLI_NAME} login`)}`);
+    console.log('');
+    console.log(dim(`  Stuck? ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} does all of this for you, and ${bold(`npx ${CLI_NAME} reset`)}${'\x1b[2m'} undoes it.`));
     console.log('');
     await debug.flushAndExit(0);
   }
@@ -572,12 +752,13 @@ if (command === '--version' || command === '-v' || command === 'version') {
   if (choice === 0) setProvider('claude');
   else if (choice === 1) setProvider('codex');
 
-  // Manual: not supported yet - punt to Calendly so they can talk to a human.
+  // "Book a quick installation call" - hand off to a human.
   if (choice === 2) {
-    const { execSync } = await import('child_process');
     console.log('');
-    console.log(`  We don't support a manual setup currently, but book time with a`);
-    console.log(`  human if you'd want!`);
+    console.log(`  ${bold("Let's set it up together.")}`);
+    console.log('');
+    console.log(`  Pick a time that works and we'll walk through it with you - bring`);
+    console.log(`  whatever's odd about your setup.`);
     console.log('');
     process.stdout.write(`  ${dim(`Press ENTER to open ${CALENDLY_URL} in your browser`)}`);
     while (true) {
@@ -712,6 +893,257 @@ if (command === '--version' || command === '-v' || command === 'version') {
   });
 
   setupInProgress = false;
+
+} else if (command === 'guide') {
+  // ── npx api guide [oas|sdk|<language>] ────────────────────────────
+  // Hands out the same instruction sets the CLI's own model runs on, so a
+  // calling agent works from the tested wording rather than an improvised
+  // summary of it. Plain markdown on stdout - meant to be read by a model.
+  const topic = (process.argv[3] || '').toLowerCase();
+
+  if (topic === 'oas' || topic === 'spec' || topic === 'openapi') {
+    const { rootDir: guideRoot } = resolveProjectDirs(process.cwd());
+    const guideSettings = loadSettings(guideRoot);
+    const guideApi = guideSettings.apis?.[0];
+    // The prompt is normally rendered with values the guided run has already
+    // worked out. Here the agent is the one who works them out, so the
+    // placeholders that would carry them become instructions instead.
+    const rendered = loadPrompt('generate-oas', {
+      name: guideApi?.name || 'this API',
+      oasFile: path.join(guideRoot, '.restless', 'openapi.json'),
+      domain: guideApi?.baseUrl || "(you determine this - see the servers[0].url note in the plan)",
+      existingOasNote: '',
+      internalNote: '',
+      // The guided run pre-computes a route checklist and pastes it here.
+      // You're the one reading the code, so the instruction takes its place -
+      // otherwise the coverage rule below refers to a checklist that isn't there.
+      endpointChecklist: 'Enumerate the routes yourself from the code first, and treat that list as the coverage checklist referred to below.',
+      frameworkNote: '',
+    });
+    // Belt and braces: never leak raw template syntax into a model's context
+    // if the prompt grows a placeholder this command doesn't know about.
+    console.log(rendered.replace(/\{\{[a-zA-Z]+\}\}/g, '').replace(/\n{3,}/g, '\n\n'));
+    await debug.flushAndExit(0);
+  }
+
+  const langAliases = { sdk: 'javascript', js: 'javascript', node: 'javascript', typescript: 'javascript', ts: 'javascript' };
+  const lang = langAliases[topic] || topic || 'javascript';
+  const guidePath = path.join(PKG_DIR, 'docs', 'sdks', `${lang}.md`);
+  if (!fs.existsSync(guidePath) || lang.startsWith('_')) {
+    // `_`-prefixed files are archived guides, not something to offer.
+    const available = fs.readdirSync(path.join(PKG_DIR, 'docs', 'sdks'))
+      .filter((f) => f.endsWith('.md') && !f.startsWith('_'))
+      .map((f) => f.replace(/\.md$/, ''));
+    console.log(red(`\n  ✗ No guide for "${topic}".\n`));
+    console.log(`  Try: ${cyan(`npx ${CLI_NAME} guide oas`)} or ${cyan(`npx ${CLI_NAME} guide <${available.join('|')}>`)}\n`);
+    await debug.flushAndExit(1);
+  }
+  console.log(fs.readFileSync(guidePath, 'utf8'));
+  await debug.flushAndExit(0);
+
+} else if (command === 'key') {
+  // ── npx api key [--json] [--inline] [--dir <apiRootDir>] ──────────
+  // Mint + register a project and put the key where the SDK will find it.
+  // Ours to own: it generates a credential and registers it server-side,
+  // which is not something a calling agent should improvise.
+  const asJson = process.argv.includes('--json');
+  const inline = process.argv.includes('--inline');
+  const dirFlag = flagValue('--dir');
+  const { rootDir: keyRoot, packageDir: keyPkgDir } = resolveProjectDirs(process.cwd());
+  setGitRoot(findGitRoot(keyRoot) || keyRoot);
+
+  const settingsForKey = loadSettings(keyRoot);
+  const apiRootDir = dirFlag || settingsForKey.apis?.[0]?.rootDir || '.';
+  const apiDir = resolveApiDir(keyPkgDir, apiRootDir);
+
+  // Reuse a key that's already on disk rather than minting a second one for
+  // the same project - a re-run that swaps the key underneath a running
+  // server sends its logs to a project nobody is looking at.
+  const existingEnvFile = findExistingEnvFile(apiDir, keyRoot);
+  const existingKey = existingEnvFile ? existingRestlessKey(existingEnvFile) : null;
+  const apiKey = existingKey || generateWriteKey();
+
+  let projectId, reusedProject;
+  try {
+    ({ projectId, reused: reusedProject } = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey }));
+  } catch (err) {
+    if (asJson) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
+    else console.log(red(`\n  ✗ ${err.message}\n`));
+    await debug.flushAndExit(1);
+  }
+
+  let envFile = null;
+  if (!inline && !existingKey) {
+    envFile = existingEnvFile || path.join(apiDir, '.env');
+    const line = `RESTLESS_KEY=${apiKey}`;
+    if (existingEnvFile) safeAppendFileSync(envFile, `\n${line}\n`);
+    else safeWriteFileSync(envFile, `${line}\n`);
+  } else if (existingKey) {
+    envFile = existingEnvFile;
+  }
+
+  const rel = envFile ? path.relative(keyPkgDir, envFile) : null;
+  if (asJson) {
+    console.log(JSON.stringify({
+      ok: true, apiKey, projectId, envFile: rel, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
+    }, null, 2));
+  } else {
+    console.log('');
+    console.log(`  ${green('✓')} ${reusedProject ? 'Using the project from your last setup' : 'Project registered'} ${dim(`(${projectId})`)}.`);
+    if (rel) console.log(`  ${green('✓')} ${existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to'} ${bold(rel)}.`);
+    else console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    console.log('');
+    console.log(dim(`  Keep this key out of source control. Restart your server so it picks it up.`));
+    console.log('');
+  }
+  await debug.flushAndExit(0);
+
+} else if (command === 'register') {
+  // ── npx api register --oas <file> [--dir <d>] [--name <n>] ────────
+  // Record a spec an agent just wrote into `.restless/settings.json`, which
+  // is what the SDK reads at startup and what later commands look up.
+  const oasFlag = flagValue('--oas');
+  if (!oasFlag) {
+    console.log(red('\n  ✗ Missing --oas <file>.\n'));
+    console.log(`  Usage: ${cyan(`npx ${CLI_NAME} register --oas .restless/openapi.json --dir api --name "My API"`)}\n`);
+    await debug.flushAndExit(1);
+  }
+  const { rootDir: regRoot, packageDir: regPkgDir } = resolveProjectDirs(process.cwd());
+  setGitRoot(findGitRoot(regRoot) || regRoot);
+
+  const oasAbs = path.isAbsolute(oasFlag) ? oasFlag : path.resolve(process.cwd(), oasFlag);
+  if (!fs.existsSync(oasAbs)) {
+    console.log(red(`\n  ✗ No such file: ${oasFlag}\n`));
+    await debug.flushAndExit(1);
+  }
+  let oasDoc;
+  try {
+    oasDoc = JSON.parse(fs.readFileSync(oasAbs, 'utf8'));
+  } catch (err) {
+    console.log(red(`\n  ✗ ${oasFlag} is not valid JSON: ${err.message}\n`));
+    console.log(dim('  Fix the spec and re-run - the SDK and the dashboard both parse this file.\n'));
+    await debug.flushAndExit(1);
+  }
+
+  const apiRootDir = flagValue('--dir') || '.';
+  const name = flagValue('--name') || oasDoc?.info?.title || path.basename(regRoot);
+  const oasRel = path.relative(regRoot, oasAbs);
+  const settings = loadSettings(regRoot);
+  const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
+  upsertApi(settings, {
+    ...(existing || {}),
+    name,
+    rootDir: apiRootDir,
+    oasFile: oasRel,
+    oasSource: existing?.oasSource || { kind: 'agent' },
+    baseUrl: oasDoc?.servers?.[0]?.url || existing?.baseUrl,
+    requestIdPrefix: existing?.requestIdPrefix || generatePrefix(name),
+    lastSyncedAt: new Date().toISOString(),
+  });
+  saveSettings(regRoot, settings);
+
+  const paths = Object.keys(oasDoc?.paths || {}).length;
+  console.log('');
+  console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${paths} path${paths === 1 ? '' : 's'})`)}.`);
+  console.log(`  ${dim(`.restless/settings.json now points at ${oasRel}. Commit .restless/ with your code.`)}`);
+  console.log('');
+  await debug.flushAndExit(0);
+
+} else if (command === 'verify') {
+  // ── npx api verify --url <base> [--path /x] [--json] ──────────────
+  // One real request, then read the response headers. Ours to own because
+  // the verdict comes from headers the SDK sets, not from the status code -
+  // a captured 401 is a pass, and that trips people (and agents) up.
+  const asJson = process.argv.includes('--json');
+  const urlFlag = flagValue('--url') || 'http://localhost:3000';
+  const pathFlag = flagValue('--path') || '/';
+  const base = normalizeBaseUrl(urlFlag) || urlFlag;
+  const target = `${base}${pathFlag.startsWith('/') ? '' : '/'}${pathFlag}`;
+
+  let raw = null;
+  try {
+    raw = execSync(`curl -i -sS --max-time 10 ${JSON.stringify(target)}`, {
+      encoding: 'utf8', timeout: 12000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    raw = null;
+  }
+
+  const result = { url: target };
+  if (raw === null) {
+    result.state = 'unreachable';
+    result.detail = 'Nothing answered at that address.';
+  } else {
+    const { headers } = splitCurlIncludeOutput(raw);
+    const diag = diagnoseFromHeaders(headers);
+    result.state = diag.state;
+    result.status = parseStatus(raw);
+    if (diag.requestId) result.requestId = diag.requestId;
+    const { guidance } = diag.state === 'ok' ? {} : fixContext(diag.state, { localBase: base });
+    if (guidance) result.fix = guidance;
+  }
+  result.ok = result.state === 'ok';
+
+  if (asJson) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    const desc = describeDiagnosis(result.state, { localBase: base, attempt: 99 });
+    console.log('');
+    console.log(`  ${desc.icon}  ${desc.lines[0]}`);
+    for (const l of desc.lines.slice(1)) console.log(`     ${l}`);
+    if (result.status) console.log(dim(`     (HTTP ${result.status} - a rejected request still counts, as long as the SDK saw it.)`));
+    console.log('');
+  }
+  await debug.flushAndExit(result.ok ? 0 : 1);
+
+} else if (command === 'login' || command === 'claim') {
+  // ── npx api login ─────────────────────────────────────────────────
+  // Prints the claim URL. The setup key is handed to the server up front
+  // and keyed by an opaque token, so it never lands in browser history,
+  // an OAuth referer, or a screen share.
+  const asJson = process.argv.includes('--json');
+  const { rootDir: loginRoot } = resolveProjectDirs(process.cwd());
+  const loginSettings = loadSettings(loginRoot);
+  const entry = loginSettings.apis?.find((a) => a.projectId) || null;
+  const creds = entry?.projectId ? loadProjectCreds(entry.projectId) : null;
+
+  if (!creds?.setupKey) {
+    const msg = entry?.projectId
+      ? `No stored setup key for project ${entry.projectId}.`
+      : 'This project has no Restless project yet.';
+    if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+    else {
+      console.log(red(`\n  ✗ ${msg}\n`));
+      console.log(`  Run ${cyan(`npx ${CLI_NAME} key`)} first.\n`);
+    }
+    await debug.flushAndExit(1);
+  }
+
+  const token = crypto.randomBytes(16).toString('hex');
+  try {
+    const res = await fetch(`${SITE_URL}/api/auth/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, projectId: entry.projectId, setupKey: creds.setupKey }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (err) {
+    const msg = `Couldn't prepare the login link (${err.message}).`;
+    if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+    else console.log(red(`\n  ✗ ${msg}\n`));
+    await debug.flushAndExit(1);
+  }
+
+  const loginUrl = `${SITE_URL}/login?token=${token}`;
+  if (asJson) {
+    console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId }, null, 2));
+  } else {
+    console.log('');
+    console.log(`  ${bold('Open this to claim your project:')}`);
+    console.log(`  ${cyan(loginUrl)}`);
+    console.log('');
+  }
+  await debug.flushAndExit(0);
 
 } else if (command === 'reset') {
   const cwd = process.cwd();
@@ -1455,7 +1887,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // previous edits + sub-prompts. Same clear-home sequence the
   // `init` flow uses between screens.
   function repaintHeader() {
-    process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+    clearScreen();
     console.log('');
     printLogo();
     console.log('');
@@ -1752,9 +2184,15 @@ if (command === '--version' || command === '-v' || command === 'version') {
   function saveCachedToken(token, expiresAt) {
     try {
       fs.mkdirSync(credsDir, { recursive: true });
+      // Merge, don't overwrite: this file is shared with the setup key that
+      // `api key` stores for the same project (same path by design - one file
+      // per project). A blind write here would drop it and leave `api login`
+      // unable to prove ownership.
+      let existing = {};
+      try { existing = JSON.parse(fs.readFileSync(credsFile, 'utf8')); } catch {}
       fs.writeFileSync(
         credsFile,
-        JSON.stringify({ token, projectId: projectIdForSync, expiresAt }, null, 2) + '\n',
+        JSON.stringify({ ...existing, token, projectId: projectIdForSync, expiresAt }, null, 2) + '\n',
         { mode: 0o600 },
       );
     } catch (err) {
