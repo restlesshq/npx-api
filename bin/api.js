@@ -845,27 +845,27 @@ if (command === '--version' || command === '-v' || command === 'version') {
     domain: projectApi?.baseUrl || oasResult.domain || null,
   });
 
-  // Step 2 sub 3: Semantic verification of owner.id. Runs an AI pass that
-  // re-reads the wired file, traces the data flow, and confirms the chosen
-  // id is server-verified and immutable. Catches what the static heuristic
-  // in final-checks can't: tenant ids pulled from req.body in a codebase
-  // where the static check sees `req.user.tenantId` but the user object
-  // was attached from unsigned input upstream.
+  // Still part of "Configure SDK" (sub 2), not a row of its own: semantic
+  // verification of owner.id is an AI pass over the block the configure step
+  // just wrote. It catches what the static heuristic in final-checks can't -
+  // a tenant id pulled from req.body in a codebase where the static check
+  // sees `req.user.tenantId` but the user object came from unsigned input
+  // upstream.
   const verifyUpdate = plan.makeUpdater(1);
-  verifyUpdate({ activeSub: 3, sub: { 0: 'done', 1: 'done', 2: 'done' } });
-  await verifyOwnerId({ ctx, update: (msg) => verifyUpdate({ ...msg, activeSub: 3 }), setSpinner });
+  verifyUpdate({ activeSub: 2, sub: { 0: 'done', 1: 'done' } });
+  await verifyOwnerId({ ctx, update: (msg) => verifyUpdate({ ...msg, activeSub: 2 }), setSpinner });
 
-  // Step 2 sub 4: Run final checks. Verifies the install is correct and
+  // Step 2 sub 3: Run final checks. Verifies the install is correct and
   // surfaces issues for the user to opt into fixing - it never edits the
   // SDK init line itself (that's the CLI's responsibility, not the AI's).
   await finalChecks({
     ctx,
     update: plan.makeUpdater(1),
     setSpinner,
-    subIndex: 4,
-    prevSubs: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' },
+    subIndex: 3,
+    prevSubs: { 0: 'done', 1: 'done', 2: 'done' },
   });
-  plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done', 4: 'done' } });
+  plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' } });
 
   // Step 3: Test your setup (auto-detect the server, confirm the SDK sees
   // requests, and offer an AI fix loop when it doesn't).

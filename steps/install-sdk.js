@@ -967,7 +967,9 @@ export default async function installSdk({
   if (inlineMode && canon.mode === 'canonicalized') {
     baseMsg.push(dim(`  Inlined the API key in ${bold(canon.file)} - testing only, don't commit.`));
   }
-  update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, activeSub: 3, message: baseMsg });
+  // Stay on 'Configure SDK' (sub 2) - the owner.id verification the
+  // caller runs next is part of this row, not the next one.
+  update({ sub: { 0: 'done', 1: 'done' }, activeSub: 2, message: baseMsg });
 
   return {
     detectedLanguage,

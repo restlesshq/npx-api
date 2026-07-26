@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, brightGreen, celebrationBanner } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, celebrationBanner } from '../lib/ui.js';
 import { parseOas } from '../lib/oas-parse.js';
 import { loadSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
@@ -284,7 +284,7 @@ export default async function setupAccount({
     '',
     ...recap,
     '',
-    `  ${brightGreen(bold('▶ Press Enter to open your browser and log in'))}`,
+    `  ${green(bold('❯ Press Enter to open your browser and log in'))}`,
     '',
     dim('  Didn’t open? Paste this link instead:'),
     `  ${dim(loginUrl)}`,
@@ -310,7 +310,7 @@ export default async function setupAccount({
     update({ status: 'done', message: [
       ...celebrationBanner(`🎉  ${bold('Setup complete')} — one last step to claim it`),
       '',
-      `  ${brightGreen(bold('▶ Opening your browser…'))}`,
+      `  ${green(bold('❯ Opening your browser…'))}`,
       // No second glyph: a bare ❯ under the line reads as an input prompt
       // waiting on you, when the only thing left is to finish in the browser.
       `  ${dim('You can finish the setup there!')}`,

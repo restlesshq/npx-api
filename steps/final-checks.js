@@ -6,6 +6,8 @@ import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
+import { extractJson } from '../lib/extract-json.js';
+import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
 import * as debug from '../lib/debug.js';
 import * as jsWriter from '../lib/sdk-writers/javascript.js';
@@ -460,6 +462,73 @@ export function runChecks(ctx) {
   return rows;
 }
 
+// The checks an AI pass adds on top of the static ones. Static analysis
+// reads the SDK block; these are questions about the code AROUND it, which
+// is where wiring actually goes wrong.
+const AI_CHECK_LABELS = {
+  order: 'Middleware order',
+  mounted: 'Registered on your app',
+  credential: 'Credential captured',
+  collateral: 'Nothing else touched',
+  runtime: 'File still loads',
+};
+
+/**
+ * Ask the AI to read the wired file and answer a fixed checklist.
+ *
+ * Everything `runChecks` does is a regex over the managed block, so it can
+ * confirm the block is well-formed and say nothing about whether it's in the
+ * right PLACE. Middleware registered below an auth guard passes every static
+ * check and silently drops the 401s the product exists to show - so that
+ * question, and a few others of the same shape, get asked here.
+ *
+ * Read-only by construction: the prompt says report, don't edit, and nothing
+ * here writes. Returns rows in the same shape as the static ones so they
+ * render in the same table. Any failure to run or parse degrades to a single
+ * informational row - a review pass must never block the install.
+ */
+export async function runAiChecks({ ctx, sourceFile, setSpinner, runner = runAI }) {
+  const rel = path.relative(ctx.installDir, sourceFile) || sourceFile;
+  let raw;
+  try {
+    raw = await runner(
+      loadPrompt('verify-wiring', { sourceFile: rel, framework: ctx.framework || ctx.language || 'unknown' }),
+      ctx.installDir,
+      { setSpinner },
+    );
+  } catch (err) {
+    debug.log('final-checks.ai-error', { message: String(err?.message || err).slice(0, 200) });
+    return [{ kind: 'ai-review', ok: true, informational: true, label: 'Deeper review', detail: dim("couldn't run - the static checks above still apply") }];
+  }
+
+  const parsed = extractJson(raw);
+  const checks = Array.isArray(parsed?.checks) ? parsed.checks : null;
+  if (!checks) {
+    debug.log('final-checks.ai-unparseable', { raw: String(raw || '').slice(0, 300) });
+    return [{ kind: 'ai-review', ok: true, informational: true, label: 'Deeper review', detail: dim('no clear verdict - the static checks above still apply') }];
+  }
+
+  const rows = [];
+  for (const check of checks) {
+    const label = AI_CHECK_LABELS[check?.id];
+    if (!label) continue; // ignore anything we didn't ask about
+    const ok = check.ok !== false;
+    const note = typeof check.note === 'string' ? check.note.trim() : '';
+    rows.push({
+      kind: `ai-${check.id}`,
+      ok,
+      // These are reported, not repaired: the fixes are edits to the user's
+      // own middleware order or business logic, which is not something to
+      // apply behind a yes/no prompt.
+      advisory: true,
+      label,
+      detail: ok ? (note ? dim(note) : dim('looks right')) : `${yellow(note || 'needs a look')}`,
+    });
+  }
+  debug.log('final-checks.ai-checks', { rows: rows.map((r) => ({ kind: r.kind, ok: r.ok })) });
+  return rows;
+}
+
 function renderRow(row) {
   const icon = row.ok ? green('✓') : yellow('⚠');
   return `  ${icon} ${bold(row.label.padEnd(22))} ${row.detail}`;
@@ -597,6 +666,23 @@ export default async function finalChecks({
 
   update({ activeSub: subIndex, sub: prevSubs, message: renderReview(rows) });
 
+  // Then the questions static analysis can't answer: is the middleware in
+  // the right PLACE, on the right app, and did anything else get touched.
+  // Skipped when the block is already broken - the repair flows below will
+  // rewrite the file, so a review of the current text would be stale.
+  const aiSourceFile = findWiredSourceFile(ctx.installDir, ctx);
+  const structurallyBroken = rows.some((r) => r.kind === 'no-source' || r.kind === 'old-api');
+  if (aiSourceFile && !structurallyBroken) {
+    update({ activeSub: subIndex, sub: prevSubs, message: [
+      ...renderReview(rows),
+      `  ${orange(ctx.aiTool || 'the AI')} ${dim('is reading the wiring for anything the checks above can’t see…')}`,
+    ]});
+    const aiRows = await runAiChecks({ ctx, sourceFile: aiSourceFile, setSpinner });
+    setSpinner?.('');
+    rows = [...rows, ...aiRows];
+    update({ activeSub: subIndex, sub: prevSubs, message: renderReview(rows) });
+  }
+
   // Walk the failed rows and offer to apply each. Most checks expose a
   // pure `row.fix` thunk; `owner-id` is special - it needs an AI retry
   // plus a user-input fallback. `old-api` is also special - one AI pass
@@ -707,18 +793,30 @@ export default async function finalChecks({
   // passed - earlier versions always wrote `✓ Final checks complete.`
   // and marked the substep done, which gave a green checkmark next to
   // a review block that warned "SDK isn't wired in." Don't do that.
-  const allOk = rows.every((r) => r.ok);
-  const allFixable = rows.every((r) => r.ok || typeof r.fix === 'function' || r.kind === 'owner-id' || r.kind === 'old-api');
+  // Advisory rows (the AI review) are reported, not repaired: their fixes
+  // are edits to the user's own middleware order or business logic. They
+  // colour the header, but they don't paint the step red - nothing is
+  // provably broken, and step 3 tests the same thing empirically with a real
+  // request, where there IS a fix flow.
+  const advisoryFailed = rows.some((r) => !r.ok && r.advisory);
+  const blockingFailed = rows.some((r) => !r.ok && !r.advisory);
+  const allOk = !advisoryFailed && !blockingFailed;
+  const allFixable = rows.every((r) => r.ok || r.advisory || typeof r.fix === 'function' || r.kind === 'owner-id' || r.kind === 'old-api');
   const headerLine = allOk
     ? `  ${green('✓')} Final checks complete.`
-    : `  ${yellow('⚠')} Final checks finished with issues.`;
+    : blockingFailed
+      ? `  ${yellow('⚠')} Final checks finished with issues.`
+      : `  ${yellow('⚠')} Final checks complete - a couple of things worth a look.`;
   update({
-    sub: { ...prevSubs, [subIndex]: allOk ? 'done' : 'failed' },
+    sub: { ...prevSubs, [subIndex]: blockingFailed ? 'failed' : 'done' },
     message: [
       headerLine,
       '',
       ...renderReview(rows),
-      `  ${dim('Press ')}${bold('Enter')}${dim(' to move on.')}`,
+      // Same shape as the other CTAs in the flow (green chevron, bold, a dim
+      // aside) - "Press Enter to move on." in flat gray read like a footnote
+      // rather than the thing the screen is waiting on.
+      `  ${green(bold('❯ Press Enter'))} ${dim(allOk ? "and we'll test it out" : "to keep going - you can fix these later")}`,
     ],
   });
   if (!allOk) {
