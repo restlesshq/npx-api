@@ -20,6 +20,7 @@ import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
+import { isInteractive, detectAgent } from '../lib/env.js';
 import { loadSettings, saveSettings, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
@@ -337,6 +338,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // Clear viewport + scrollback so the welcome starts at the top of the
   // terminal, matching where every subsequent screen lands after each
   // transition clears + homes the cursor.
+  if (isInteractive()) {
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
   console.log('');
   // Swallow keystrokes for the whole animated intro so they don't echo into
@@ -442,6 +444,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // ENTER: continue normal setup.
   // Clear the viewport + scrollback so the welcome doesn't linger.
   process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+  } else {
+    // Non-interactive (agent / CI / pipe): skip the animated welcome and its
+    // ENTER / demo / human-handoff gate entirely - there's no TTY to drive
+    // any of it, and an agent just needs setup to proceed.
+    console.log('');
+    console.log(`  ${bold('Restless')} — setting up in non-interactive mode.`);
+    console.log('');
+  }
   // ──────────────────────────────────────────────────────────────────────
 
   const plan = createPlanManager();
@@ -465,18 +475,35 @@ if (command === '--version' || command === '-v' || command === 'version') {
     ? `Claude ${dim('(Recommended)')}`
     : `${dim('Claude (Recommended)')}`;
   const codexLabel = codexInstalled ? 'Codex' : dim('Codex');
-  const choice = await singleSelect(
-    [
-      { label: claudeLabel, hint: claudeInstalled ? 'Use Claude Code running locally on your machine.' : "Claude Code isn't installed - we'll show you how." },
-      { label: codexLabel, hint: codexInstalled ? 'Use the Codex CLI running locally on your machine.' : "Codex isn't installed - we'll show you how." },
-      { label: 'Manual install', hint: "We'll book a quick call so we can pair on it together." },
-      { label: 'Learn more', hint: "Read about how setup works and what we touch before deciding." },
-    ],
-    { message: 'How would you like to set this up?', defaultIndex: 0 },
-  );
+  let choice;
+  if (!isInteractive()) {
+    // Non-interactive: never offer Manual / Learn-more (both need a human).
+    // Prefer the agent actually driving us - if Codex is running the CLI,
+    // `claude` may not even be installed - then fall back to whatever's
+    // available so we still surface a clear "install X" message if neither is.
+    const agent = detectAgent();
+    if (agent === 'codex' && codexInstalled) choice = 1;
+    else if (agent === 'claude' && claudeInstalled) choice = 0;
+    else if (claudeInstalled) choice = 0;
+    else if (codexInstalled) choice = 1;
+    else choice = 0;
+    console.log(`  ${dim(`Using ${['Claude', 'Codex'][choice]} to run setup.`)}`);
+  } else {
+    choice = await singleSelect(
+      [
+        { label: claudeLabel, hint: claudeInstalled ? 'Use Claude Code running locally on your machine.' : "Claude Code isn't installed - we'll show you how." },
+        { label: codexLabel, hint: codexInstalled ? 'Use the Codex CLI running locally on your machine.' : "Codex isn't installed - we'll show you how." },
+        { label: 'Manual install', hint: "We'll book a quick call so we can pair on it together." },
+        { label: 'Learn more', hint: "Read about how setup works and what we touch before deciding." },
+      ],
+      { message: 'How would you like to set this up?', defaultIndex: 0 },
+    );
+  }
 
   // Clear the viewport so after-selection stuff starts clean at the top.
-  process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
+  // Skip in non-interactive mode - clearing the scrollback just destroys the
+  // output an agent is reading.
+  if (isInteractive()) process.stdout.write('\x1b[3J\x1b[2J\x1b[H');
 
   if (choice === 3) {
     // "Learn more" - explain how it works

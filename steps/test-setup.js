@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey, watchSpinner } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey, watchSpinner } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
@@ -9,6 +9,8 @@ import { runAI, loadPrompt } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
 import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, fixActions, fixContext, portFromPackageJson, portFromSource, portFromUrl, portFromDocker, frameworkDefaultPort } from '../lib/test-diagnosis.js';
 import { loadOas } from '../lib/oas-auth.js';
+import { isInteractive } from '../lib/env.js';
+import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 
 // A bare host[:port] like `api.example.com` or `api.example.com:8080` -
 // a token with a dot before the first slash and no scheme. Used to catch
@@ -253,25 +255,18 @@ export default async function testSetup({
     update,
     stepNum: 3,
     title: 'Test your setup',
-    intro: "Now let's make sure the SDK is picking up your requests.",
+    intro: "Now let's confirm the SDK is picking up your requests.",
     sections: [
       {
-        label: 'Why',
+        label: 'How',
         body:
-          `Before you ship, you want to confirm the SDK is actually seeing your\n` +
-          `traffic. This catches wiring mistakes while they're still cheap to fix.`,
-      },
-      {
-        label: "What we'll do",
-        body:
-          `Start your server in another terminal and we'll watch for it - no\n` +
-          `command to run here, no API key needed. We send a test request in the\n` +
-          `background and confirm it flows through the SDK. A rejected request\n` +
-          `(like a ${bold('401')}) still counts. If something's off, ${orange(aiTool)} can fix it and\n` +
-          `we'll re-check on its own.`,
+          `As soon as your server is up, we detect it, quietly send a few test\n` +
+          `requests, and confirm they flow through the SDK - a rejected request\n` +
+          `(like a ${bold('401')}) still counts. Nothing to run, no key needed. If it's not\n` +
+          `wired right, ${orange(aiTool)} fixes it and we re-check on our own.`,
       },
     ],
-    actionRequired: 'Start your server so we can watch for a request flowing through the SDK.',
+    actionRequired: 'Start your server in another terminal.',
     action: 'start watching',
   });
 
@@ -341,6 +336,91 @@ export default async function testSetup({
     update({ message: msg });
   }
 
+  // ── Visible "test" batch ────────────────────────────────────────────────
+  // A single silent probe reads as "did it even do anything?". Once we know
+  // the server is up and the SDK is wired, we fire a few real requests and
+  // show each one's status code + whether the SDK captured it - so it's
+  // obvious we tested it and it worked, even when the statuses are 401s.
+
+  // Up to 3 safe GET requests from the OAS's ranked test candidates (so we
+  // exercise a few real endpoints). Falls back to the single saved probe curl.
+  function buildTestRequests() {
+    const reqs = [];
+    try {
+      if (oas) {
+        for (const cand of findTestCandidates(oas, { max: 3 })) {
+          let curl = buildCurl(oas, cand, localBase());
+          if (!curlHasIncludeFlag(curl)) curl = curl.replace(/^curl\b/, 'curl -i');
+          if (curlTargetIsLocal(curl)) reqs.push({ method: cand.method, path: cand.path, curl });
+        }
+      }
+    } catch {}
+    if (!reqs.length) {
+      const curl = buildProbeCurl();
+      const method = (curl.match(/(?:-X|--request)\s+(\w+)/)?.[1] || 'GET').toUpperCase();
+      let p = '/';
+      try { const u = new URL(curl.match(/\bhttps?:\/\/[^\s"']+/)?.[0] || ''); p = u.pathname + (u.search || ''); } catch {}
+      reqs.push({ method, path: p, curl });
+    }
+    return reqs.slice(0, 3);
+  }
+
+  function colorStatus(status) {
+    if (status == null) return dim('---');
+    const s = String(status);
+    if (status >= 200 && status < 300) return green(s);
+    if (status >= 500) return red(s);
+    return yellow(s); // 3xx / 4xx (incl. an expected 401) - not an error for us
+  }
+
+  // Render the batch rows as plan-message lines. `done` swaps the spinner
+  // header for a summary of how many the SDK captured.
+  function batchLines(rows, { done = false } = {}) {
+    const captured = rows.filter((r) => r.captured).length;
+    const header = done
+      ? `  ${green('✓')} Sent ${rows.length} test request${rows.length === 1 ? '' : 's'} - the SDK saw ${captured}/${rows.length}.`
+      : `  ${dim('◌')} Sending a few test requests through the SDK…`;
+    const lines = [header, ''];
+    for (const r of rows) {
+      const label = `${r.method} ${r.path}`;
+      const padded = label.length >= 30 ? label : label.padEnd(30);
+      let tail;
+      if (r.state === 'done') {
+        tail = `${colorStatus(r.status)}   ${r.captured ? green('✓ SDK') : yellow('⚠ missed')}`;
+      } else if (r.state === 'running') {
+        tail = dim('sending…');
+      } else {
+        tail = dim('queued');
+      }
+      lines.push(`     ${padded}  ${tail}`);
+    }
+    return lines;
+  }
+
+  // Fire the batch. Interactively we animate it row-by-row (each request flips
+  // from "sending…" to its status code); non-interactively we run them all and
+  // let the caller print the final list once (no per-row redraw spam).
+  async function runTestBatch() {
+    const rows = buildTestRequests().map((r) => ({ ...r, state: 'pending', status: null, captured: false }));
+    const interactive = isInteractive();
+    const draw = () => update({ message: batchLines(rows) });
+    if (interactive) draw();
+    for (const row of rows) {
+      if (interactive) { row.state = 'running'; draw(); await new Promise((r) => setTimeout(r, 250)); }
+      try {
+        const raw = execSync(row.curl, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+        row.status = parseStatus(raw);
+        row.captured = diagnoseFromHeaders(splitCurlIncludeOutput(raw).headers).state !== 'no-sdk';
+      } catch {
+        row.status = null;
+        row.captured = false;
+      }
+      row.state = 'done';
+      if (interactive) draw();
+    }
+    return rows;
+  }
+
   // Poll the dashboard for a log from this run. A landed log (any status,
   // incl. 401) proves RESTLESS_KEY is valid end-to-end; nothing landing
   // after a clean header points at a stale key.
@@ -392,12 +472,6 @@ export default async function testSetup({
     }
   }
 
-  function statusNoteFor(status) {
-    return status && (status < 200 || status >= 300)
-      ? ` ${dim(`(got a ${status} - that's expected, we only needed the SDK to see the request.)`)}`
-      : '';
-  }
-
   function confirmSkip() {
     return askYesNo(`\n  ${yellow("Skip without confirming the SDK is set up?")} `, { defaultValue: false });
   }
@@ -407,6 +481,67 @@ export default async function testSetup({
       `  ${yellow('⚠')} Skipped the setup check - you can run setup again anytime to finish it.`,
     ]});
     debug.log('test-setup.skipped', { lastState });
+  }
+
+  // ── Non-interactive (agent / CI) ───────────────────────────────────────
+  // The interactive loop below relies on a human to press keys, restart the
+  // server on cue, and drive the fix menu - none of which happens under an
+  // agent, so it would hang (the post-fix watch waits forever for a manual
+  // restart). Instead: poll for the server for a bounded window, diagnose,
+  // and on success fire the visible batch and report. Success = the SDK saw
+  // the request (any status, incl. a 401 / `missing-key` - an agent has no
+  // key and doesn't need one). On a real failure we surface the diagnosis +
+  // fix guidance and return, rather than blocking on a restart we can't get.
+  if (!isInteractive()) {
+    const MAX_ATTEMPTS = 15; // ~30s at 2s spacing - room for a dev server to boot
+    let diag = { state: 'unreachable' };
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      diag = probe();
+      if (diag.state !== 'unreachable') break;
+      if (attempt === 1) render('unreachable', { attempt });
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    if (diag.state === 'unreachable') {
+      update({ status: 'done', message: [
+        `  ${yellow('⚠')} Couldn't reach your server at ${bold(localBase())} within the wait window.`,
+        dim(`     Start it (or fix the URL) and run setup again to finish the check.`),
+      ]});
+      debug.log('test-setup.noninteractive', { state: 'unreachable' });
+      return { success: false, diagnostic: 'unreachable' };
+    }
+
+    if (diag.state === 'ok' || diag.state === 'no-key') {
+      const since = new Date(Date.now() - 15000).toISOString();
+      const rows = await runTestBatch();
+      let landed = false;
+      if (diag.state === 'ok' && pollConfig) landed = await dashboardLogged(since);
+      const msg = batchLines(rows, { done: true });
+      msg.push('');
+      if (diag.state === 'no-key') {
+        msg.push(`  ${green('✓')} The SDK is wired up and capturing requests.`);
+        msg.push(dim(`     No ${bold('RESTLESS_KEY')} is set, so nothing was uploaded - set it and restart to stream logs.`));
+      } else {
+        const extra = landed ? ' and logging them to your dashboard' : '';
+        msg.push(`  ${green('✓')} The SDK is picking up your requests${extra}.`);
+        if (!landed && pollConfig) msg.push(dim(`     Header looked good but no log reached the dashboard - double-check ${bold('RESTLESS_KEY')}.`));
+      }
+      update({ status: 'done', message: msg });
+      debug.log('test-setup.noninteractive', { state: diag.state, landed, tested: rows.length });
+      return { success: true, diagnostic: diag.state };
+    }
+
+    // no-sdk / stale-key → a real problem. Report the diagnosis and, when the
+    // state is AI-fixable, the exact guidance so the outer agent can fix it.
+    const desc = describeDiagnosis(diag.state, { status: diag.status, localBase: localBase(), aiTool });
+    const msg = [`  ${desc.icon}  ${desc.lines[0]}`, ...desc.lines.slice(1).map((l) => `     ${l}`)];
+    if (desc.canFix) {
+      const { guidance } = fixContext(diag.state, { localBase: localBase() });
+      if (guidance) msg.push(dim(`     Fix hint: ${guidance}`));
+    }
+    update({ status: 'done', message: msg });
+    debug.log('test-setup.noninteractive', { state: diag.state });
+    return { success: false, diagnostic: diag.state };
   }
 
   // ── Main loop: watch → diagnose → (fix / retry / port / skip) → repeat ──
@@ -434,19 +569,22 @@ export default async function testSetup({
     // dashboard (when we can) to catch a stale key; otherwise the clean
     // header is enough.
     if (diag.state === 'ok') {
-      update({ message: [`  ${green('✓')} The SDK saw your request - confirming it reached your dashboard…`] });
       const since = new Date(Date.now() - 15000).toISOString();
+      // Fire a few real requests, animating each status code as it lands, so
+      // it's visibly clear we tested it and it works.
+      const rows = await runTestBatch();
       const landed = await dashboardLogged(since);
       if (landed) {
         const extra = pollConfig ? ' and logging them to your dashboard' : '';
-        update({ status: 'done', message: [
-          `  ${green('✓')} The SDK is picking up your requests${extra}.${statusNoteFor(diag.status)}`,
-        ]});
-        debug.log('test-setup.done', { state: 'ok', logged: !!pollConfig });
+        const msg = batchLines(rows, { done: true });
+        msg.push('');
+        msg.push(`  ${green('✓')} The SDK is picking up your requests${extra}.`);
+        update({ status: 'done', message: msg });
+        debug.log('test-setup.done', { state: 'ok', logged: !!pollConfig, tested: rows.length });
         return { success: true, diagnostic: 'ok' };
       }
-      // Clean header but nothing landed → stale key. Fall through to the
-      // fix menu with that diagnosis.
+      // Requests were captured but nothing landed upstream → stale key. Fall
+      // through to the fix menu with that diagnosis.
       diag.state = 'stale-key';
       lastState = 'stale-key';
     }

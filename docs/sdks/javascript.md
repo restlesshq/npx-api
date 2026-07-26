@@ -145,26 +145,34 @@ If the credential is missing, return `undefined`. Do NOT substitute a placeholde
 
 ## Setup - Express
 
-Register BEFORE route definitions, but AFTER any middleware that attaches `req.user` / `req.session` / similar:
+Register the SDK **FIRST** - before any auth guard, rate limiter, API-key check, or other middleware that can reject a request, and before the routes. The SDK must see *every* request, including ones a guard rejects with a `401`/`403`/`429`; a middleware that responds and `return`s without calling `next()` prevents anything registered after it from running.
+
+The setup callback fires at middleware-entry (before `next()`), so it runs BEFORE your auth middleware has attached `req.user` / `req.session`. **Do not read the owner off `req.user` here - it isn't populated yet.** Resolve the owner from the **credential itself** inside the callback (the callback is async, so a lookup is fine):
 
 ```js
 const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 
-app.use(authMiddleware);  // sets req.user; must run first
-app.use(sdk.setup((req) => ({
-  apiKey: sdk.mask(extractApiKey(req)),
-  owner: req.user ? {
-    id: req.user.workspaceId,
-    enrich: async (id) => {
-      const ws = await db.workspaces.findById(id);
-      return { label: ws.name, email: ws.adminEmails };
-    },
-  } : undefined,
-})));
+app.use(express.json());
+// SDK first, so it captures every request - even the ones auth rejects below.
+app.use(sdk.setup(async (req) => {
+  const token = extractApiKey(req);                       // the same credential your auth reads
+  const ws = token ? await db.workspaces.findByApiKey(token) : null;  // resolve owner FROM the credential
+  return {
+    apiKey: sdk.mask(token),
+    owner: ws ? {
+      id: ws.id,
+      enrich: async (id) => {
+        const full = await db.workspaces.findById(id);
+        return { label: full.name, email: full.adminEmails };
+      },
+    } : undefined,   // no valid credential → anonymous, which is correct for a rejected request
+  };
+}));
+app.use(authMiddleware);   // may reject with 401 - the SDK above already logged the request
 app.use('/api', routes);
 ```
 
-Express middleware runs in registration order and the setup callback fires at middleware-entry, so anything attached by middleware registered AFTER the SDK won't be visible. The trade-off: requests that auth rejects before the SDK middleware runs won't be logged. If you need to capture those too, register the SDK first and accept that authenticated requests will log without owner data.
+Why not put the SDK after the auth guard so you can read `req.user`? Because then every request the guard rejects (every `401`) is dropped before the SDK ever runs - and those failures are exactly what Restless exists to surface. Resolving the owner from the credential yourself captures both: authenticated requests get their owner, rejected ones log as anonymous (which is correct). `owner.id` resolution and `enrich` are cached per id, so the extra lookup is amortized, not per-request.
 
 ## Setup - Fastify
 
@@ -197,22 +205,27 @@ The SDK plugin is marked `skip-override` so its hooks attach to the parent conte
 
 ## Setup - Koa
 
-Same rule as Express: register AFTER any middleware that attaches `ctx.state`. The setup callback fires before `await next()`, so it only sees state attached by earlier middleware.
+Same rule as Express: register the SDK **FIRST**, before any auth guard or other middleware that can reject a request. The setup callback fires before `await next()`, so `ctx.state.user` isn't populated yet - resolve the owner from the **credential** in the callback instead:
 
 ```js
 const sdk = require('@restlessai/sdk')(process.env.RESTLESS_KEY);
 
-app.use(authMiddleware);  // attaches ctx.state.user
-app.use(sdk.setup((ctx) => ({
-  apiKey: sdk.mask(extractApiKey(ctx.request)),
-  owner: ctx.state.user ? {
-    id: ctx.state.user.workspaceId,
-    enrich: async (id) => {
-      const ws = await db.workspaces.findById(id);
-      return { label: ws.name, email: ws.adminEmails };
-    },
-  } : undefined,
-})));
+// SDK first, so it captures every request - even ones auth rejects below.
+app.use(sdk.setup(async (ctx) => {
+  const token = extractApiKey(ctx.request);              // the same credential your auth reads
+  const ws = token ? await db.workspaces.findByApiKey(token) : null;  // resolve owner FROM the credential
+  return {
+    apiKey: sdk.mask(token),
+    owner: ws ? {
+      id: ws.id,
+      enrich: async (id) => {
+        const full = await db.workspaces.findById(id);
+        return { label: full.name, email: full.adminEmails };
+      },
+    } : undefined,
+  };
+}));
+app.use(authMiddleware);   // may reject with 401 - the SDK above already logged the request
 ```
 
 ## Setup - Next.js (App Router) - single config, zero route changes

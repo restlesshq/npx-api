@@ -13,6 +13,7 @@ import { parseOas } from '../lib/oas-parse.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
+import { isInteractive } from '../lib/env.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
@@ -806,6 +807,11 @@ function inferApiName({ rootDir, finalOasFile }) {
  */
 async function adoptExistingOas({ rootDir, packageDir, update, setSpinner }) {
   const apiDir = path.join(rootDir, '.restless');
+
+  // Non-interactive (agent / CI): there's no one to paste a file path or
+  // URL, and the loop below `continue`s forever on empty input. Fall
+  // straight through to AI generation, which needs no typed input.
+  if (!isInteractive()) return { fallbackToGenerate: true };
 
   while (true) {
     console.log('');

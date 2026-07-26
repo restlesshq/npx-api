@@ -5,6 +5,8 @@ import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan } from '../lib/ui.js';
 import { loadSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
+import { isInteractive } from '../lib/env.js';
+import * as debug from '../lib/debug.js';
 
 function openBrowser(url) {
   try {
@@ -216,6 +218,24 @@ export default async function setupAccount({
   const uploadDoneLine = hasLocalOas
     ? `  ${green('✓')} Uploaded ${bold(oasFile)}.`
     : null;
+
+  // Non-interactive (agent / CI): claiming the project is a human action -
+  // it needs a browser login that no one is here to complete, and the auth
+  // poll below is unbounded, so racing it would hang forever. The OAS +
+  // settings are already uploaded, so the project is fully staged; hand back
+  // the claim URL and finish cleanly instead of blocking.
+  if (!isInteractive()) {
+    update({ status: 'done', sub: { 0: 'done', 1: 'done' }, message: [
+      uploadDoneLine,
+      uploadDoneLine ? '' : null,
+      `  ${green('✓')} SDK is installed and your spec is uploaded.`,
+      `  Claim your project on Restless when you're ready (opens a browser login):`,
+      '',
+      `    ${cyan(loginUrl)}`,
+    ].filter((l) => l !== null) });
+    debug.log('setup-account.noninteractive', { claimed: false });
+    return { apiKey };
+  }
 
   update({ sub: { 0: 'done' }, activeSub: 1, message: [
     uploadDoneLine,
