@@ -230,25 +230,18 @@ export default async function testSetup({
     update,
     stepNum: 3,
     title: 'Test your setup',
-    intro: "Now let's make sure the SDK is picking up your requests.",
+    intro: "One last check: confirm the SDK is actually seeing your traffic.",
     sections: [
       {
-        label: 'Why',
+        label: 'How',
         body:
-          `Before you ship, you want to confirm the SDK is actually seeing your\n` +
-          `traffic. This catches wiring mistakes while they're still cheap to fix.`,
-      },
-      {
-        label: "What we'll do",
-        body:
-          `Start your server in another terminal and we'll watch for it - no\n` +
-          `command to run here, no API key needed. We send a test request in the\n` +
-          `background and confirm it flows through the SDK. A rejected request\n` +
-          `(like a ${bold('401')}) still counts. If something's off, ${orange(aiTool)} can fix it and\n` +
-          `we'll re-check on its own.`,
+          `Start your server and we'll detect it, quietly send a test request, and\n` +
+          `confirm it flows through the SDK - a rejected request (like a ${bold('401')}) still\n` +
+          `counts. Nothing to run, no key needed. If it's not wired right, ${orange(aiTool)}\n` +
+          `fixes it and we re-check on our own.`,
       },
     ],
-    actionRequired: 'Start your server so we can watch for a request flowing through the SDK.',
+    actionRequired: 'Start your server in another terminal.',
     action: 'start watching',
   });
 
