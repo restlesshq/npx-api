@@ -2,7 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { runAI, loadPrompt } from '../lib/ai.js';
-import { bold, dim, green, red, yellow, orange, ask, singleSelect, waitForKey } from '../lib/ui.js';
+import { bold, dim, green, red, yellow, cyan, ask, askWithPreview, singleSelect } from '../lib/ui.js';
+import { guessBaseUrl } from '../lib/base-url.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/settings.js';
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
@@ -14,6 +15,7 @@ import { loadOas } from '../lib/oas-auth.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 import { isInteractive } from '../lib/env.js';
+import * as debug from '../lib/debug.js';
 
 const MAX_OAS_FIX_ATTEMPTS = 2;
 
@@ -415,8 +417,12 @@ async function finalizeApi({
   replacePlaceholderDomain = false,
   oasSource = null,
 }) {
-  // Heuristic default for visibility - bias toward "internal" if the name,
-  // framework, or routes look service-y.
+  // Visibility (external vs internal) is recorded, not asked. Nothing in
+  // setup branches on it and the dashboard doesn't read it yet, so the
+  // question was spending one of the user's few decisions on a field only
+  // `npx api update` touches. The heuristic below fills it in: it biases
+  // toward "internal" when the name, framework, or routes look service-y,
+  // and is wrong cheaply - `npx api update` flips it in one keystroke.
   const nameLower = (name || '').toLowerCase();
   const frameworkLower = (framework || '').toLowerCase();
   const endpointsLower = (endpoints || []).map((e) => e.toLowerCase());
@@ -442,30 +448,40 @@ async function finalizeApi({
     frameworkLower.includes('grpc'),
     frameworkLower.includes('trpc'),
   ].filter(Boolean).length;
-  const looksInternal = internalSignals >= 2;
+  const isInternal = internalSignals >= 2;
 
   const firstEndpoint = endpoints?.[0]?.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '/example';
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    '  Two quick things before we wrap up the spec.',
-  ]});
 
-  const visibilityIndex = await singleSelect(
-    [
-      { label: 'External', hint: 'Public-facing, used by your API consumers.' },
-      { label: 'Internal', hint: 'Private, only your own services or staff hit it.' },
-    ],
-    {
-      message: `Is ${name} external or internal?`,
-      defaultIndex: looksInternal ? 1 : 0,
+  // Look for the answer before asking for it. Deploy manifests, env
+  // templates, and the README usually already say where this API lives, and
+  // the base URL is the one thing in setup the user has to go look up.
+  let oasDoc = null;
+  try { if (finalOasFile) oasDoc = loadOas(path.join(rootDir, finalOasFile)); } catch {}
+  const apiDirAbs = path.resolve(packageDir, apiRootDir || '.');
+  const guess = guessBaseUrl({ dirs: [apiDirAbs, packageDir, rootDir], oas: oasDoc });
+  debug.log('generate-oas.base-url-guess', guess || { url: null });
+
+  update({ sub: { 0: 'done' }, activeSub: 1, message: [
+    `  ${bold("What's your API's base URL in production?")}`,
+    '',
+    guess
+      ? `  ${dim(`We found this in ${guess.source} - press enter to keep it, or edit it.`)}`
+      : `  ${dim(`So we know ${firstEndpoint} lives at <base-url>${firstEndpoint}.`)}`,
+  ]});
+  // The guess is prefilled into the line editor, not just accepted for them:
+  // backspace / arrows work, so a near-miss is a quick fix rather than a
+  // retype from scratch. The line underneath shows a real request URL built
+  // from whatever is currently typed, so a missing scheme or a stray
+  // trailing path is obvious before they hit enter.
+  const domain = (await askWithPreview(`\n  ${cyan('❯')} `, {
+    defaultValue: guess?.url || '',
+    // What they typed stays solid; the example path is dim, since it's the
+    // illustrative half of the line.
+    preview: (value) => {
+      const base = value.trim().replace(/\/+$/, '');
+      return `  ${dim('Your requests:')} ${base || dim('<base-url>')}${dim(firstEndpoint)}`;
     },
-  );
-  const isInternal = visibilityIndex === 1;
-
-  update({ sub: { 0: 'done' }, activeSub: 1, message: [
-    '  And the base URL of your API in production:',
-    `  ${dim(`So we know that ${firstEndpoint} lives at <base_url>${firstEndpoint}.`)}`,
-  ]});
-  const domain = await ask(`\n  ${bold('Base URL:')} `);
+  })).trim();
 
   // Replace placeholder domain in the AI-generated OAS file only when we
   // actually generated one (not when we're reusing a user's existing file).
@@ -540,6 +556,7 @@ async function finalizeApi({
 
   update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
     `  ${green('✓')} OpenAPI spec ready at ${bold(finalOasFile)}${isInternal ? dim(' (internal)') : ''}.`,
+    `  ${dim("Commit .restless/ along with your code, it's meant to live there.")}`,
   ]});
 
   return {
@@ -805,7 +822,7 @@ function inferApiName({ rootDir, finalOasFile }) {
  * shared finalize. If the user can't point us at a spec, returns
  * { fallbackToGenerate: true } so the caller drops into the AI generate flow.
  */
-async function adoptExistingOas({ rootDir, packageDir, update, setSpinner }) {
+async function adoptExistingOas({ rootDir, packageDir, update, setSpinner, known = null }) {
   const apiDir = path.join(rootDir, '.restless');
 
   // Non-interactive (agent / CI): there's no one to paste a file path or
@@ -814,13 +831,24 @@ async function adoptExistingOas({ rootDir, packageDir, update, setSpinner }) {
   if (!isInteractive()) return { fallbackToGenerate: true };
 
   while (true) {
+    // This screen REPLACES the yes/no picker rather than printing under it.
+    // Pushing the question into the plan message re-renders the frame (which
+    // clears everything below it), so the user sees one question at a time
+    // instead of an answered one stacked above a live one. It also means the
+    // re-prompt on a failed lookup redraws cleanly instead of accumulating.
+    update({ status: 'active', activeSub: 0, message: [
+      `  ${bold('Where is your OpenAPI spec?')}`,
+      '',
+      `  ${dim('A file path, a URL, or just tell us where to look:')}`,
+      `  ${dim('  docs/openapi.yaml')}`,
+      `  ${dim('  https://api.acme.com/openapi.json')}`,
+      `  ${dim("  it's served at /docs-json")}`,
+      `  ${dim('  run npm run openapi')}`,
+    ]});
     console.log('');
-    console.log(`  ${dim('Paste a file path, a URL, or describe where your spec is. For example:')}`);
-    console.log(`  ${dim('• "docs/openapi.yaml"')}`);
-    console.log(`  ${dim('• "https://api.acme.com/openapi.json"')}`);
-    console.log(`  ${dim('• "it\'s served at /docs-json" or "run npm run openapi"')}`);
-    console.log('');
-    const input = (await ask('  Where is it? ')).trim();
+    // No second question here - the prompt glyph is enough once the question
+    // is the heading.
+    const input = (await ask(`  ${cyan('❯')} `)).trim();
     if (!input) continue;
 
     let finalOasFile = null;
@@ -843,16 +871,24 @@ async function adoptExistingOas({ rootDir, packageDir, update, setSpinner }) {
     }
 
     if (finalOasFile) {
-      // Recover where the API lives (which package to install the SDK into)
-      // and a best-effort framework/language, from one deterministic scan.
-      let signals = [];
-      try { signals = scanCodebase(packageDir).frameworkSignals; } catch {}
-      const apiRootDir = await chooseApiRootDir(signals);
-      const { framework, language } = guessShape(signals, packageDir, apiRootDir);
-
-      const { name, source } = inferApiName({ rootDir, finalOasFile });
-      console.log('');
-      console.log(`  ${green('✓')} Calling it ${bold(name)} ${dim(`(from ${source}).`)}`);
+      // The caller usually already knows which API this spec belongs to (the
+      // scan ran first), so take its identity rather than re-deriving a
+      // second, differently-named one for the same code.
+      let name, apiRootDir, framework, language;
+      if (known) {
+        ({ name, apiRootDir, framework, language } = known);
+      } else {
+        // Standalone use: recover where the API lives (which package to
+        // install the SDK into) and a best-effort framework/language.
+        let signals = [];
+        try { signals = scanCodebase(packageDir).frameworkSignals; } catch {}
+        apiRootDir = await chooseApiRootDir(signals);
+        ({ framework, language } = guessShape(signals, packageDir, apiRootDir));
+        const inferred = inferApiName({ rootDir, finalOasFile });
+        name = inferred.name;
+        console.log('');
+        console.log(`  ${green('✓')} Calling it ${bold(name)} ${dim(`(from ${inferred.source}).`)}`);
+      }
       return await finalizeApi({
         rootDir,
         packageDir,
@@ -897,93 +933,161 @@ function describeOasSource(src) {
   }
 }
 
+const HTTP_METHODS = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']);
+
 /**
- * If a prior run already recorded where this project's spec came from
- * (`oasSource`) and that spec is still on disk, reuse it instead of asking
- * again. Only fires when there's exactly one such remembered API, so a
- * monorepo with several set-up APIs still goes through the picker. Returns the
- * shape generateOas hands downstream, or null to fall through to the prompts.
+ * Count operations in a spec, so the confirm screen can say "23 endpoints" -
+ * the fastest way for someone to tell whether a remembered spec is the one
+ * they meant. Returns null when the file won't parse.
  */
-function reuseRememberedOas({ rootDir }) {
+function countOasEndpoints(absPath) {
+  try {
+    const oas = loadOas(absPath);
+    let n = 0;
+    for (const ops of Object.values(oas?.paths || {})) {
+      for (const method of Object.keys(ops || {})) {
+        if (HTTP_METHODS.has(method.toLowerCase())) n++;
+      }
+    }
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * APIs a previous run already mapped: an `oasSource` recorded in settings and
+ * a spec still on disk that still parses. A spec we can't read is dropped
+ * from the list rather than offered, so the caller falls through to the normal
+ * flow and re-maps it instead of carrying a broken file forward.
+ */
+function rememberedApis({ rootDir }) {
   const settings = loadSettings(rootDir);
-  const remembered = (settings.apis || []).filter(
-    (a) => a.oasSource && a.oasFile && fs.existsSync(path.join(rootDir, a.oasFile)),
-  );
-  if (remembered.length !== 1) return null;
-  const api = remembered[0];
+  const out = [];
+  for (const api of settings.apis || []) {
+    if (!api.oasSource || !api.oasFile) continue;
+    const abs = path.join(rootDir, api.oasFile);
+    if (!fs.existsSync(abs)) continue;
+    const endpoints = countOasEndpoints(abs);
+    if (endpoints === null) {
+      debug.log('generate-oas.remembered-unparseable', { oasFile: api.oasFile });
+      continue;
+    }
+    out.push({ api, endpoints });
+  }
+  return out;
+}
+
+/** The shape generateOas hands downstream, built from a settings entry. */
+function shapeFromRemembered(api) {
   return {
     detectedLanguage: api.language ? api.language.toLowerCase() : null,
     detectedFramework: api.framework || null,
     apiRootDir: api.rootDir || '.',
     domain: api.baseUrl || null,
-    _reused: api,
   };
 }
 
+/**
+ * Re-run path: one or more APIs in this repo are already mapped. Rather than
+ * flashing a "reusing your spec" line and jumping straight to step 2 (which
+ * read as a flicker - you couldn't tell what got picked, or that a choice had
+ * even been made), show what we found and have the user confirm it.
+ *
+ * With several mapped APIs this is the picker - previously more than one fell
+ * through to a full re-scan, throwing away specs we already had.
+ *
+ * Returns the chosen `{ api, endpoints }`, or null to fall through to the
+ * scan / adopt flow. Non-interactive runs take the first entry (the picker's
+ * default), which keeps the old silent-reuse behaviour for agents.
+ */
+/**
+ * The one-line summary this screen leads with. Exposed separately so the
+ * step intro can render it as its own body: `startStep` reveals the intro
+ * line by line, and having this function repaint the block right afterwards
+ * meant the intro visibly typed itself in and was then wiped - a flicker
+ * that read as the CLI changing its mind.
+ */
+function rememberedSummary(remembered) {
+  return remembered.length === 1
+    ? `${green('✓')} ${bold(remembered[0].api.name)} is already mapped ${dim(`(${describeOasSource(remembered[0].api.oasSource)})`)}.`
+    : `${green('✓')} Found ${bold(String(remembered.length))} APIs in this repo that are already mapped.`;
+}
+
+async function confirmRememberedOas({ remembered }) {
+  const one = remembered.length === 1;
+  // One plain line, no ANSI: the picker renders a hint as a single dim row
+  // (`linesPerItem` counts exactly one), so a newline here would desync its
+  // redraw math, and a nested bold/dim would cancel the dim mid-line.
+  const describe = ({ api, endpoints }) => [
+    api.oasFile,
+    `${endpoints} endpoint${endpoints === 1 ? '' : 's'}`,
+    api.framework || api.language || null,
+    api.rootDir && api.rootDir !== '.' ? `./${api.rootDir}` : './',
+  ].filter(Boolean).join(' · ');
+
+  const options = one
+    ? [
+        { label: 'Yes, use this spec', hint: describe(remembered[0]) },
+        { label: 'No, map a different API', hint: "We'll look at your code again, or you can point us at another spec." },
+      ]
+    : [
+        ...remembered.map((r) => ({ label: r.api.name, hint: describe(r) })),
+        { label: 'Something else', hint: "Map an API we haven't set up yet." },
+      ];
+
+  const picked = await singleSelect(options, {
+    message: one ? 'Is this the API you want to set up?' : 'Which API do you want to set up?',
+    defaultIndex: 0,
+  });
+
+  if (one) return picked === 0 ? remembered[0] : null;
+  return picked < remembered.length ? remembered[picked] : null;
+}
+
 export default async function generateOas({ packageDir, rootDir, update, setSpinner, aiTool = 'Claude Code' }) {
+  // Work out what this step is about BEFORE drawing anything. On a re-run the
+  // answer is "you already have a spec", and the generic explainer would be
+  // revealed and then immediately overwritten by that - a flash of text that
+  // reads like the CLI changing its mind mid-thought.
+  const remembered = rememberedApis({ rootDir });
+
   await startStep({
     update,
     stepNum: 1,
     title: 'Map your API',
-    intro: "Alright, let's get your API's OpenAPI spec.",
-    sections: [
-      {
-        label: 'Why',
-        body:
-          `An OpenAPI spec is the shape of your API, every endpoint, parameter,\n` +
-          `and response. Later steps use it to install the right adapter and wire up\n` +
-          `the middleware exactly.`,
-      },
-      {
-        label: "What we'll do",
-        body:
-          `If you already have an OpenAPI or Swagger spec, point us at it, a file, a\n` +
-          `URL, or just a description of where it is. If you don't, ${orange(aiTool)} (running\n` +
-          `locally) reads your routes and writes one. Either way it lands in a new\n` +
-          `${bold('.restless/')} folder, commit that along with your code, it's meant to live there.`,
-      },
-      {
-        label: 'Privacy',
-        body:
-          `Anything we read or generate happens on your machine via your own\n` +
-          `${orange(aiTool)} install. We don't see a single line of your code, and nothing\n` +
-          `gets sent to our servers at this step.`,
-      },
-    ],
-    action: 'map your API',
+    // No Privacy block: the welcome screen already promised the agent is
+    // local and nothing uploads until the end, and repeating it at every
+    // step reads as protesting too much.
+    intro: remembered.length
+      ? rememberedSummary(remembered)
+      : `An OpenAPI spec is the map of your API - every endpoint, parameter,\n` +
+        `and response. The next steps wire the SDK up from it.`,
+    sections: [],
+    // The question below is the gate - no separate keypress, so the intro
+    // stays on screen with the question under it.
+    skipWait: true,
   });
 
-  // Re-run shortcut: if we already recorded where this project's spec came
-  // from and it's still on disk, reuse it without re-asking.
-  const reused = reuseRememberedOas({ rootDir });
-  if (reused) {
-    const api = reused._reused;
-    update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
-      `  ${green('✓')} Reusing the spec from your last setup ${dim(`(${describeOasSource(api.oasSource)})`)}: ${bold(api.oasFile)}.`,
-    ]});
-    delete reused._reused;
-    return reused;
+  // Re-run path: anything already mapped gets confirmed (or picked, with
+  // several) rather than silently reused.
+  if (remembered.length) {
+    const chosen = await confirmRememberedOas({ remembered });
+    if (chosen) {
+      update({ sub: { 0: 'done', 1: 'done', 2: 'done' }, status: 'done', message: [
+        `  ${green('✓')} Using ${bold(chosen.api.name)}: ${bold(chosen.api.oasFile)} ${dim(`(${chosen.endpoints} endpoint${chosen.endpoints === 1 ? '' : 's'})`)}.`,
+      ]});
+      debug.log('generate-oas.reused', { oasFile: chosen.api.oasFile, endpoints: chosen.endpoints });
+      return shapeFromRemembered(chosen.api);
+    }
   }
 
-  // Up front: does the user already have a spec? If so, take it directly
-  // (file, URL, or a description the AI resolves) and skip AI detection
-  // entirely. Only fall through to the scan-and-generate flow when they don't,
-  // or when adoptExistingOas couldn't get a spec and they chose to generate.
-  update({ status: 'active', activeSub: 0, message: [
-    `  Let's get the OpenAPI spec that describes your API.`,
-  ]});
-  const haveSpec = await singleSelect(
-    [
-      { label: 'Yes, I already have an OpenAPI spec', hint: 'Point us at a file, a URL, or describe where it is.' },
-      { label: 'No, generate one with AI', hint: "We'll scan your code and write the spec." },
-    ],
-    { message: 'Do you already have an OpenAPI / Swagger spec?', defaultIndex: 0 },
-  );
-  if (haveSpec === 0) {
-    const res = await adoptExistingOas({ rootDir, packageDir, update, setSpinner });
-    if (!res.fallbackToGenerate) return res;
-  }
-
+  // Find the API BEFORE asking about specs. Asking first meant answering
+  // "do you have a spec?" with no shared idea of which API we meant - and it
+  // threw away what the scan knows: whether a spec is already sitting in the
+  // repo, and whether the framework can emit one itself. Both become options
+  // once we ask second.
+  //
   // Detect APIs in the repo and let the user pick one.
   //
   // Loop: detect → (optionally cross-reference with .restless/settings.json for
@@ -1041,13 +1145,18 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
 
     // "Other" - prompt for a plain-English hint, then loop and re-detect.
     if (chosenIdx === labels.length - 1) {
+      // Same shape as the spec question: replace the picker with the prompt
+      // rather than printing beneath the choice they just made.
+      update({ status: 'active', activeSub: 0, message: [
+        `  ${bold('Where should we look?')}`,
+        '',
+        `  ${dim('Point us at it however you like:')}`,
+        `  ${dim("  it's a Python FastAPI in backend/api")}`,
+        `  ${dim("  look in services/gateway - it's a Go server")}`,
+        `  ${dim('  three workers in packages/, I want the one named billing')}`,
+      ]});
       console.log('');
-      console.log(`  ${dim('Tell us where to look. For example:')}`);
-      console.log(`  ${dim('• "it\'s a Python FastAPI in backend/api"')}`);
-      console.log(`  ${dim('• "look in services/gateway - it\'s a Go server"')}`);
-      console.log(`  ${dim('• "there are three workers in packages/, I want the one named billing"')}`);
-      console.log('');
-      const newHint = (await ask('  Where should we look? ')).trim();
+      const newHint = (await ask(`  ${cyan('❯')} `)).trim();
       if (!newHint) {
         console.log('');
         console.log(`  ${dim('No hint given. Exiting.')}`);
@@ -1089,27 +1198,80 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     update({ sub: { 0: 'done' }, activeSub: 1, message: lines });
   }
 
-  // === Detection: can we skip OAS generation? ===
-  // We skip generation ONLY when the user already has an OAS file on disk -
-  // we point at theirs and don't overwrite it. A framework that CAN generate
-  // OAS natively (e.g. @fastify/swagger) is NOT a skip: we still produce a
-  // `.restless/openapi.json`, but the AI is told (via `frameworkNote`) to
-  // prefer the framework's own generation. "Skipping" on can-generate used to
-  // leave the project with no spec at all - nothing captured the runtime one,
-  // and the upload step had nothing to send.
+  // === Where should the spec come from? ===
+  // Now that we know which API we're talking about, the scan's findings turn
+  // into offers: a spec it already found in the repo, and native generation
+  // when the framework supports it (@fastify/swagger, @nestjs/swagger, tsoa,
+  // …). Both used to be applied silently or buried in a prompt note.
   const existingOasPath = selectedApi.existingOasFile
     ? path.join(rootDir, selectedApi.existingOasFile)
     : null;
   const hasExistingOas = existingOasPath && fs.existsSync(existingOasPath);
+  const canGenerateNatively = !!selectedApi.frameworkCanGenerateOas;
 
   const oasFile = OAS_FILE;
   let skipReason = null;
   let finalOasFile = oasFile;
+  let preferNativeGeneration = canGenerateNatively;
 
-  if (hasExistingOas) {
-    // Point settings at their file - don't overwrite their work.
-    finalOasFile = selectedApi.existingOasFile;
-    skipReason = `found OAS at ${bold(selectedApi.existingOasFile)}`;
+  {
+    const options = [];
+    const kinds = [];
+    if (hasExistingOas) {
+      options.push({
+        label: `Use the spec we found`,
+        hint: `${selectedApi.existingOasFile} - we point at it and never overwrite it.`,
+      });
+      kinds.push('found');
+    }
+    if (canGenerateNatively) {
+      options.push({
+        label: `Generate it with ${framework}`,
+        hint: `${framework} can emit its own spec - usually the most accurate option.`,
+      });
+      kinds.push('native');
+    }
+    options.push({
+      label: 'Generate one with AI',
+      hint: `${aiTool} reads your routes and writes it, locally.`,
+    });
+    kinds.push('ai');
+    options.push({
+      label: hasExistingOas ? 'Use a different spec' : 'I already have a spec',
+      hint: 'Point us at a file, a URL, or describe where it is.',
+    });
+    kinds.push('adopt');
+
+    const picked = kinds[await singleSelect(options, {
+      // Plain text - the picker bolds the whole message itself.
+      message: `Where should the spec for ${selectedApi.name} come from?`,
+      defaultIndex: 0,
+    })];
+    debug.log('generate-oas.spec-source', { picked, hasExistingOas, canGenerateNatively });
+
+    if (picked === 'found') {
+      // Point settings at their file - don't overwrite their work.
+      finalOasFile = selectedApi.existingOasFile;
+      skipReason = `using ${bold(selectedApi.existingOasFile)}`;
+    } else if (picked === 'adopt') {
+      // Hand the detected API's identity over so the adopted spec lands on
+      // the same settings entry instead of a second, re-inferred one.
+      const res = await adoptExistingOas({
+        rootDir, packageDir, update, setSpinner,
+        known: {
+          name: selectedApi.name,
+          apiRootDir: selectedApi.rootDir || '.',
+          framework: selectedApi.framework,
+          language: selectedApi.language,
+        },
+      });
+      if (!res.fallbackToGenerate) return res;
+      preferNativeGeneration = canGenerateNatively;
+    } else {
+      // 'ai' means write it from the routes even if the framework could have
+      // emitted one; 'native' means try the framework's generator first.
+      preferNativeGeneration = picked === 'native';
+    }
   }
 
   if (skipReason) {
@@ -1127,8 +1289,12 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     const existingOasNote = selectedApi.existingOasFile
       ? `An existing OAS file was found at ${selectedApi.existingOasFile}. Use it as a starting point - update it if the code has diverged, but preserve any hand-written descriptions or examples.`
       : '';
-    const frameworkNote = selectedApi.frameworkCanGenerateOas
-      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively. Try using the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps manually.`
+    // Only when the user actually chose native generation. Previously this
+    // note went out whenever the framework *could* generate, so someone who
+    // wanted the routes read directly still got a spec assembled from the
+    // framework's output.
+    const frameworkNote = preferNativeGeneration
+      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively, and the user asked for that. Use the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps from the routes.`
       : '';
     const internalNote = selectedApi.internalEndpoints?.length
       ? `The following endpoints were detected as internal/admin and should be marked as such:\n${selectedApi.internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`

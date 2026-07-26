@@ -4,7 +4,6 @@ import {
   validatePort,
   normalizeBaseUrl,
   basePathFromServers,
-  statusNote,
   describeDiagnosis,
   fixActions,
   fixContext,
@@ -193,24 +192,19 @@ describe('basePathFromServers', () => {
   });
 });
 
-describe('statusNote', () => {
-  it('is empty for 2xx and non-statuses', () => {
-    expect(statusNote(200)).toBe('');
-    expect(statusNote(204)).toBe('');
-    expect(statusNote(null)).toBe('');
-  });
-  it('reassures for non-2xx', () => {
-    expect(strip(statusNote(401))).toContain('401');
-    expect(strip(statusNote(401))).toContain("that's expected");
-  });
-});
-
 describe('describeDiagnosis', () => {
-  it('ok is a non-fixable green success and folds in the status note', () => {
+  it('ok is a non-fixable green success', () => {
     const r = describeDiagnosis('ok', { status: 401 });
     expect(r.canFix).toBe(false);
     expect(text(r)).toContain('picking up your requests');
-    expect(text(r)).toContain('401');
+  });
+
+  // The status code is shown per-request in the batch table, so the panel
+  // copy no longer explains it ("got a 401 - that's expected" read as noise).
+  it('never editorializes about the status code', () => {
+    for (const state of ['ok', 'no-sdk', 'stale-key']) {
+      expect(text(describeDiagnosis(state, { status: 401 }))).not.toContain('401');
+    }
   });
 
   it('no-sdk and no-key are fixable failures', () => {
@@ -227,22 +221,41 @@ describe('describeDiagnosis', () => {
     expect(text(r)).toContain('.env');
   });
 
-  it('unreachable leads with an action imperative and demotes the poll', () => {
-    const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api' });
+  // Phase 1: the first few probes are just "connecting" - no amber, no
+  // escape-hatch footer (`waiting` tells the caller to hold it back), because
+  // a server that's merely slow to boot is not an error.
+  it('unreachable starts as a quiet gray connecting line', () => {
+    for (const attempt of [1, 2, 3]) {
+      const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api', attempt });
+      expect(r.waiting).toBe(true);
+      expect(r.lines.length).toBe(1);
+      expect(text(r)).toContain('Connecting to your API to test');
+      expect(text(r)).not.toContain('Action needed');
+      // Nothing amber in the panel while we're still just connecting.
+      expect(r.lines.join('') + r.icon).not.toContain('\x1b[33m');
+    }
+  });
+
+  it('unreachable turns into the amber call to action once probes keep failing', () => {
+    const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api', attempt: 4 });
+    expect(r.waiting).toBeFalsy();
     expect(r.canFix).toBe(false);
     // Lead with an imperative that makes clear the user has to act...
-    expect(text(r)).toContain('start your dev server');
+    expect(text(r)).toContain('Action needed: start your dev server');
     // ...and tell them to run it in another terminal (the biggest confusion).
     expect(text(r)).toContain('another terminal');
-    // The passive "checking" poll is demoted to a small sub-line under the CTA.
-    expect(text(r)).toContain('checking localhost:3002');
+    // ...with a still-polling line under it so they know we haven't given up.
+    expect(text(r)).toContain('still looking for your API on localhost:3002');
     expect(r.lines.length).toBe(3);
   });
 
-  it('unreachable escalates the copy after several silent probes', () => {
-    const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002/api', attempt: 8 });
-    expect(text(r)).toContain('Still nothing on :3002');
-    expect(text(r)).toContain('have you started your server yet?');
+  it('the still-looking glyph animates and is not the concentric spinner', () => {
+    const glyphs = [0, 1, 2, 3].map((frame) => {
+      const r = describeDiagnosis('unreachable', { localBase: 'http://localhost:3002', attempt: 9, frame });
+      return strip(r.lines[2]).trim()[0];
+    });
+    expect(new Set(glyphs).size).toBeGreaterThan(1);
+    for (const g of glyphs) expect('◌○◎●').not.toContain(g);
   });
 });
 

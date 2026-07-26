@@ -1,16 +1,19 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
-import { bold, dim, green, red, yellow, cyan, orange, actionPicker, ask, askYesNo, waitForServerOrKey, watchSpinner } from '../lib/ui.js';
+import { execSync, exec } from 'child_process';
+import { promisify } from 'util';
+import { bold, dim, green, red, yellow, cyan, orange, singleSelect, ask, askYesNo, waitForServerOrKey, watchSpinner, planSpinner, terminalPreview } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
-import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, fixActions, fixContext, portFromPackageJson, portFromSource, portFromUrl, portFromDocker, frameworkDefaultPort } from '../lib/test-diagnosis.js';
+import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromUrl, portFromDocker, frameworkDefaultPort } from '../lib/test-diagnosis.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { isInteractive } from '../lib/env.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
+
+const execAsync = promisify(exec);
 
 // A bare host[:port] like `api.example.com` or `api.example.com:8080` -
 // a token with a dot before the first slash and no scheme. Used to catch
@@ -92,56 +95,6 @@ function curlHasIncludeFlag(curl) {
  * Each HTTP exchange ends in a blank line; the body follows the LAST
  * header block (anything before is from a redirect we don't care about).
  */
-function splitCurlIncludeOutput(text) {
-  const sep = text.match(/\r?\n\r?\n/g);
-  if (!sep) return { headers: {}, body: text };
-
-  // Walk header blocks from the start. As long as the next block looks
-  // like more HTTP headers (starts with `HTTP/`), keep going. Once it
-  // doesn't, that block is the body.
-  let cursor = 0;
-  let lastHeaderBlock = '';
-  while (cursor < text.length) {
-    const next = text.slice(cursor).search(/\r?\n\r?\n/);
-    if (next === -1) break;
-    const block = text.slice(cursor, cursor + next);
-    cursor += next;
-    cursor += text.slice(cursor).match(/^\r?\n\r?\n/)?.[0].length || 0;
-    if (/^HTTP\//i.test(block)) {
-      lastHeaderBlock = block;
-    } else {
-      // Wasn't a header block - rewind so it ends up in the body.
-      cursor = text.indexOf(block);
-      break;
-    }
-  }
-
-  const headers = {};
-  for (const line of lastHeaderBlock.split(/\r?\n/)) {
-    const idx = line.indexOf(':');
-    if (idx <= 0) continue;
-    headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
-  }
-  return { headers, body: text.slice(cursor) };
-}
-
-/**
- * Categorize an outcome based on response headers:
- *
- *   - 'no-sdk'  → response had neither x-request-id nor x-restless-id,
- *                 so the SDK middleware never ran in the request path
- *   - 'no-key'  → SDK ran but RESTLESS_KEY isn't set in process.env;
- *                 the SDK marks this by emitting `missing-key` as the
- *                 header value (see node-sdk/src/adapters/_shared.ts)
- *   - 'ok'      → SDK ran with a key, header carries a real request ID
- */
-function diagnoseFromHeaders(headers) {
-  const idValue = headers['x-restless-id'] || headers['x-request-id'];
-  if (!idValue) return { state: 'no-sdk' };
-  if (idValue === 'missing-key') return { state: 'no-key' };
-  return { state: 'ok', requestId: idValue };
-}
-
 /**
  * Best-effort detection of the port the dev server runs on. The port is
  * almost always either declared explicitly (package.json / .env / code) or
@@ -251,25 +204,6 @@ export default async function testSetup({
 }) {
   const aiTool = ctx.aiTool || 'the AI';
 
-  await startStep({
-    update,
-    stepNum: 3,
-    title: 'Test your setup',
-    intro: "Now let's confirm the SDK is picking up your requests.",
-    sections: [
-      {
-        label: 'How',
-        body:
-          `As soon as your server is up, we detect it, quietly send a few test\n` +
-          `requests, and confirm they flow through the SDK - a rejected request\n` +
-          `(like a ${bold('401')}) still counts. Nothing to run, no key needed. If it's not\n` +
-          `wired right, ${orange(aiTool)} fixes it and we re-check on our own.`,
-      },
-    ],
-    actionRequired: 'Start your server in another terminal.',
-    action: 'start watching',
-  });
-
   const searchDir = apiRootDir && apiRootDir !== '.' ? path.resolve(packageDir, apiRootDir) : packageDir;
   // The SDK was wired into this same directory by the install step, so
   // that's where the fix AI should run.
@@ -304,6 +238,38 @@ export default async function testSetup({
 
   const pollConfig = projectId ? { url: `${SITE_URL}/api/logs/poll`, projectId, setupKey } : null;
 
+  // The intro waits until here on purpose: the command box below shows the
+  // real curl we're about to send, which needs the detected port and the
+  // test endpoint picked back in step 1.
+  await startStep({
+    update,
+    stepNum: 3,
+    title: 'Test your setup',
+    // The old "How:" paragraph, as bullets - same facts, but you can find
+    // the one you care about without reading the whole thing.
+    intro:
+      "Now let's confirm the SDK is picking up your requests.\n" +
+      '\n' +
+      `  ${dim('·')} We'll watch for your server to start\n` +
+      `  ${dim('·')} We'll send a few real requests through the SDK\n` +
+      `  ${dim('·')} If something's wrong, ${orange(aiTool)} will fix it and recheck`,
+    // The dim follow-on says WHY they're being asked to go start a server -
+    // the ask lands better with the reason attached, and it's wrapped by
+    // hand so it can't reflow into the amber line above it on a narrow term.
+    actionRequired:
+      'Start your server in another terminal.\n' +
+      dim("We're going to make a request to your dev server to confirm") + '\n' +
+      dim("it's wired up properly!"),
+    // The command box below is the gate - no separate keypress question.
+    skipWait: true,
+  });
+
+  // Read-only: this is what we're about to run, not something to edit.
+  await terminalPreview(buildProbeCurl(), {
+    cta: 'Press ENTER to run it',
+    note: "we'll keep trying until your server answers",
+  });
+
   // Fire one request at the local server and classify from the response
   // headers. A connection error → 'unreachable' (server down / wrong port);
   // otherwise the SDK's `x-restless-id` header tells us the rest. We pipe
@@ -327,9 +293,11 @@ export default async function testSetup({
   // Render a diagnosis into the plan step message. The waiting state also
   // gets a footer advertising the escape-hatch keys.
   function render(state, { status, attempt, frame } = {}) {
-    const { icon, lines } = describeDiagnosis(state, { status, localBase: localBase(), aiTool, attempt, frame });
+    const { icon, lines, waiting } = describeDiagnosis(state, { status, localBase: localBase(), aiTool, attempt, frame });
     const msg = [`  ${icon}  ${lines[0]}`, ...lines.slice(1).map((l) => `     ${l}`)];
-    if (state === 'unreachable') {
+    // `waiting` = we haven't reported a problem yet (still just connecting),
+    // so the change-the-URL / skip escape hatches would read as one.
+    if (state === 'unreachable' && !waiting) {
       msg.push('');
       msg.push(dim(`     Not the right address? Press ${bold('p')} to change the URL · ${bold('Tab')} to skip`));
     }
@@ -374,12 +342,14 @@ export default async function testSetup({
   }
 
   // Render the batch rows as plan-message lines. `done` swaps the spinner
-  // header for a summary of how many the SDK captured.
-  function batchLines(rows, { done = false } = {}) {
+  // header for a summary of how many the SDK captured. While it's running the
+  // header carries the same breathing spinner the plan draws (`planSpinner`),
+  // so this screen reads as "working" like every other waiting screen.
+  function batchLines(rows, { done = false, frame = 0 } = {}) {
     const captured = rows.filter((r) => r.captured).length;
     const header = done
       ? `  ${green('✓')} Sent ${rows.length} test request${rows.length === 1 ? '' : 's'} - the SDK saw ${captured}/${rows.length}.`
-      : `  ${dim('◌')} Sending a few test requests through the SDK…`;
+      : `  ${planSpinner(frame)} Sending a few test requests through the SDK…`;
     const lines = [header, ''];
     for (const r of rows) {
       const label = `${r.method} ${r.path}`;
@@ -403,20 +373,36 @@ export default async function testSetup({
   async function runTestBatch() {
     const rows = buildTestRequests().map((r) => ({ ...r, state: 'pending', status: null, captured: false }));
     const interactive = isInteractive();
-    const draw = () => update({ message: batchLines(rows) });
-    if (interactive) draw();
-    for (const row of rows) {
-      if (interactive) { row.state = 'running'; draw(); await new Promise((r) => setTimeout(r, 250)); }
-      try {
-        const raw = execSync(row.curl, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
-        row.status = parseStatus(raw);
-        row.captured = diagnoseFromHeaders(splitCurlIncludeOutput(raw).headers).state !== 'no-sdk';
-      } catch {
-        row.status = null;
-        row.captured = false;
-      }
-      row.state = 'done';
+    let frame = 0;
+    const draw = () => update({ message: batchLines(rows, { frame }) });
+    // The curls run async (not execSync) so the event loop stays free and the
+    // header spinner keeps breathing while a request is in flight.
+    const ticker = interactive ? setInterval(() => { frame++; draw(); }, 180) : null;
+    try {
       if (interactive) draw();
+      for (const row of rows) {
+        if (interactive) { row.state = 'running'; draw(); await new Promise((r) => setTimeout(r, 250)); }
+        let raw = null;
+        try {
+          raw = (await execAsync(row.curl, { encoding: 'utf8', timeout: 10000 })).stdout;
+        } catch (err) {
+          // curl exits non-zero on a transport failure (connection refused,
+          // timeout). An HTTP error status is still exit 0, so anything we get
+          // on stdout is worth parsing.
+          raw = err?.stdout || null;
+        }
+        if (raw) {
+          row.status = parseStatus(raw);
+          row.captured = diagnoseFromHeaders(splitCurlIncludeOutput(raw).headers).state !== 'no-sdk';
+        } else {
+          row.status = null;
+          row.captured = false;
+        }
+        row.state = 'done';
+        if (interactive) draw();
+      }
+    } finally {
+      if (ticker) clearInterval(ticker);
     }
     return rows;
   }
@@ -591,11 +577,14 @@ export default async function testSetup({
 
     // Failing path: show the diagnosis, then offer the fix loop.
     render(diag.state, { status: diag.status });
-    const choice = await actionPicker([], {
-      message: 'What would you like to do?',
-      actions: fixActions(diag.state, { aiTool }),
-    });
-    const action = choice.key;
+    // Same picker as every other question in the flow - the fix menu used to
+    // draw its own variant, which read as a different kind of prompt.
+    const actions = fixActions(diag.state, { aiTool });
+    const picked = await singleSelect(
+      actions.map((a) => ({ label: a.label, hint: a.hint })),
+      { message: 'What would you like to do?', defaultIndex: 0 },
+    );
+    const action = actions[picked].key;
     if (action === 'skip') {
       if (await confirmSkip()) { finishSkipped(lastState); return { success: false, diagnostic: lastState }; }
       continue;

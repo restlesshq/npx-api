@@ -366,30 +366,16 @@ export default async function installSdk({
     update,
     stepNum: 2,
     title: 'Install the SDK',
-    intro: `Now let's drop the Restless SDK into your ${bold(frameworkLabel)} project.`,
-    sections: [
-      {
-        label: 'Why',
-        body:
-          `The SDK captures each request, masks sensitive data, and ships logs to\n` +
-          `Restless. It's the thing that turns your API into an observable one.`,
-      },
-      {
-        label: "What we'll do",
-        body:
-          `Install ${bold('@restlessai/sdk')} with your package manager, then point ${orange(aiTool)}\n` +
-          `at your server file to wire the middleware in before your routes. We'll also make\n` +
-          `one call to our server to generate an API key and setup token. No personal data\n` +
-          `or code is sent in that call, just the public-key-style hash we use to identify\n` +
-          `your project later.`,
-      },
-      {
-        label: 'Privacy',
-        body:
-          `The SDK runs in your process. ${orange(aiTool)} only reads the files it needs to\n` +
-          `wire things up, and we never touch ${bold('.env')}.`,
-      },
-    ],
+    // Three bullets, no Why / Privacy essay: what the step is about to do to
+    // their project, in the order it does it. The welcome screen already
+    // covered where the AI runs and what leaves the machine.
+    intro:
+      `Now let's drop the Restless SDK into your ${bold(frameworkLabel)} project.\n` +
+      '\n' +
+      `  ${dim('·')} We'll wire up the SDK in your codebase\n` +
+      `  ${dim('·')} We'll generate a Restless API key\n` +
+      `  ${dim('·')} We'll upload a test log to our servers`,
+    sections: [],
     // The terminal prompt below is the action - no separate keypress gate.
     skipWait: true,
   });
@@ -790,23 +776,23 @@ export default async function installSdk({
   if (preExistingWiring) {
     update({ activeSub: 2, message: [
       `  Re-checking the ${bold('@restlessai/sdk')} wiring in your ${bold(detectedFramework || detectedLanguage)} code.`,
-      dim(`  ${orange(aiTool)} is looking at what's there and adding anything missing.`),
+      `  ${orange(aiTool)} ${dim("is looking at what's there and adding anything missing.")}`,
     ]});
   } else if (isNext && nextStyle === 'plugin') {
     update({ activeSub: 2, message: [
       `  Wiring ${bold('@restlessai/sdk/next')} into your ${bold(detectedFramework || 'Next.js')} config.`,
-      dim(`  ${orange(aiTool)} is adding ${bold('withRestless')} to your Next config and creating ${bold(restlessConfigName)}.`),
+      `  ${orange(aiTool)} ${dim(`is adding ${bold('withRestless')} to your Next config and creating ${bold(restlessConfigName)}.`)}`,
       dim(`  Your route files stay untouched - the SDK wraps them at build time.`),
     ]});
   } else if (isNext) {
     update({ activeSub: 2, message: [
       `  Wiring ${bold('@restlessai/sdk/next')} into your ${bold(detectedFramework || 'Next.js')} routes.`,
-      dim(`  ${orange(aiTool)} is wrapping your route handlers - it won't touch middleware.`),
+      `  ${orange(aiTool)} ${dim("is wrapping your route handlers - it won't touch middleware.")}`,
     ]});
   } else {
     update({ activeSub: 2, message: [
       `  Wiring ${bold('@restlessai/sdk')} into your ${bold(detectedFramework || detectedLanguage)} code.`,
-      dim(`  ${orange(aiTool)} is reading your server file and registering the middleware before routes.`),
+      `  ${orange(aiTool)} ${dim('is reading your server file and registering the middleware before routes.')}`,
     ]});
   }
 

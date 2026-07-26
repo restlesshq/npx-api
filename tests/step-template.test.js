@@ -60,11 +60,14 @@ describe('startStep template', () => {
     });
     const all = cap.message.map(strip).join('\n');
     expect(all).toContain('▸ Action required: Make sure your server is running.');
-    // Glyph is rendered cyan, not yellow (used to feel too "warning"-ish).
-    const raw = cap.message.join('\n');
+    // The only line on the screen addressed to the user rather than
+    // describing what we'll do, so it's amber and bold - in cyan it read as
+    // just more prose and people missed that a server had to be started.
     const glyphLine = cap.message.find((l) => l.includes('Action required'));
-    expect(glyphLine).toContain('\x1b[36m'); // cyan SGR
-    expect(raw).not.toMatch(/\x1b\[33m⚠/);
+    expect(glyphLine).toContain('\x1b[38;2;255;190;0m'); // amber
+    expect(glyphLine).toContain('\x1b[1m');              // bold
+    // Still not the ⚠ treatment - nothing has gone wrong yet.
+    expect(glyphLine).not.toContain('⚠');
   });
 
   it('places actionRequired AFTER all sections (so it sits next to "Ready to ...")', async () => {

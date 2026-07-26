@@ -30,10 +30,10 @@ describe('resolveProjectDirs', () => {
     expect(packageDir).toBe('/some/path');
   });
 
-  it('uses cwd as rootDir when cwd has its own package.json (monorepo subpackage)', () => {
-    // Simulates running `npx api init` inside a monorepo subpackage:
-    // even though git root is the monorepo, `.restless/` should live next to
-    // the subpackage's own package.json, not at the monorepo root.
+  // One repo, one `.restless/`. Running from a workspace package used to put
+  // it next to that package's package.json, so the same repo ended up with a
+  // different settings file depending on where you invoked the CLI.
+  it('puts rootDir at the git root even when cwd is a package with its own package.json', () => {
     const monorepo = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
     execSync('git init', { cwd: monorepo, stdio: 'pipe' });
     const sub = path.join(monorepo, 'packages', 'sub');
@@ -42,21 +42,23 @@ describe('resolveProjectDirs', () => {
 
     const { packageDir, rootDir } = resolveProjectDirs(sub);
     expect(packageDir).toBe(sub);
-    expect(rootDir).toBe(sub);
+    expect(rootDir).toBe(monorepo);
 
     execSync(`rm -rf "${monorepo}"`);
   });
 
-  it('walks up from cwd to find the closest package.json', () => {
+  it('resolves to the same rootDir from anywhere in the repo', () => {
     const monorepo = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
     execSync('git init', { cwd: monorepo, stdio: 'pipe' });
     const pkg = path.join(monorepo, 'packages', 'app');
     const leaf = path.join(pkg, 'src', 'routes');
     execSync(`mkdir -p "${leaf}"`);
     fs.writeFileSync(path.join(pkg, 'package.json'), '{}');
+    fs.writeFileSync(path.join(monorepo, 'package.json'), '{}');
 
-    const { rootDir } = resolveProjectDirs(leaf);
-    expect(rootDir).toBe(pkg);
+    for (const from of [monorepo, pkg, leaf]) {
+      expect(resolveProjectDirs(from).rootDir).toBe(monorepo);
+    }
 
     execSync(`rm -rf "${monorepo}"`);
   });

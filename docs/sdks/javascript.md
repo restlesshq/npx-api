@@ -347,6 +347,7 @@ Read the credential off `req.headers.authorization` (Pages Router hands you Node
 - **Never read files inside `node_modules/`.** The SDK is a black box.
 - **`sdk.mask()` gotcha:** always pass the raw value. If it's missing, `mask()` returns `undefined` and that is fine. Do NOT write `sdk.mask(value || 'anonymous')`: the string `'anonymous'` would get hashed and its last 4 characters (`mous`) would appear as the tail of every anonymous log's mask, defeating the purpose.
 - **`.restless/settings.json` is read automatically by the SDK at startup.** You do NOT need to read it yourself, the SDK walks up from cwd to find it.
+- **`.restless/` gets committed with the code.** It is configuration the SDK reads at runtime, not a generated cache, so leaving it out of git changes how the SDK behaves for everyone else. Never `.gitignore` it, and include it in any commit you make for the user. It holds no secrets; the key lives in `.env`.
 - **Obsolete fields:** `setupMode`, `apiId`, `email` (top-level), `project: { id, name }`, top-level `projectId`, top-level `enrich`, inline `owner.label` / `owner.email`, and `hooks.getUser` are all ignored. Use only the `{ apiKey, owner: { id, enrich } }` shape - all owner display info comes from `enrich`.
 
 ## Verify
