@@ -957,6 +957,19 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const asJson = process.argv.includes('--json');
   const inline = process.argv.includes('--inline');
   const dirFlag = flagValue('--dir');
+
+  // --inline exists so a HUMAN can place the key themselves. An agent has
+  // no use for the plaintext (the key goes into .env and the SDK reads it
+  // from there), so printing it just parks a live credential in the agent's
+  // transcript. Refuse by default; a human driving from inside an agent
+  // shell can override with RESTLESS_INTERACTIVE=1.
+  if (inline && isAgent() && process.env.RESTLESS_INTERACTIVE !== '1') {
+    const msg = 'Refusing to print the key to an agent - it is written to .env and the SDK reads it from there. '
+      + 'Nothing in setup needs it on stdout. (Human at the keyboard? Re-run with RESTLESS_INTERACTIVE=1.)';
+    if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+    else console.log(red(`\n  ✗ ${msg}\n`));
+    await debug.flushAndExit(1);
+  }
   const { rootDir: keyRoot, packageDir: keyPkgDir } = resolveProjectDirs(process.cwd());
   setGitRoot(findGitRoot(keyRoot) || keyRoot);
 

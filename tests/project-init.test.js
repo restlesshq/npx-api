@@ -69,7 +69,22 @@ describe('registerProject', () => {
 describe('project credentials', () => {
   it('round-trips the setup key so a later process can still claim the project', () => {
     mod.saveProjectCreds({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_k' });
-    expect(mod.loadProjectCreds('p1')).toMatchObject({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_k' });
+    expect(mod.loadProjectCreds('p1')).toMatchObject({ projectId: 'p1', setupKey: 's1' });
+  });
+
+  it('persists only a hash of the write key, never the plaintext', () => {
+    const file = mod.saveProjectCreds({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_secret' });
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw).not.toContain('rstlss_secret');
+    expect(mod.loadProjectCreds('p1').apiKeyHash).toBe(mod.hashWriteKey('rstlss_secret'));
+  });
+
+  it('scrubs legacy plaintext keys on the next save', () => {
+    const file = mod.credsPath('p-legacy');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ projectId: 'p-legacy', setupKey: 's', apiKey: 'rstlss_old' }));
+    mod.saveProjectCreds({ projectId: 'p-legacy', setupKey: 's2', apiKey: 'rstlss_old' });
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('rstlss_old');
   });
 
   it('keeps credentials out of the repo and readable only by the user', () => {
