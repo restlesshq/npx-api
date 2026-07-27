@@ -25,7 +25,7 @@ import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
-import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog } from '../lib/project-init.js';
+import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
 import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-url.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
@@ -1219,6 +1219,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
+  // Stage the spec + settings BEFORE minting the login token. The claim
+  // flow attaches whatever is pending at claim time - a login link handed
+  // out without this upload claims an empty project (no endpoints, no
+  // settings), which is exactly how the agent flow used to end.
+  const artifacts = await uploadPendingArtifacts({
+    rootDir: loginRoot, projectId: entry.projectId, setupKey: creds.setupKey,
+  });
+
   const token = crypto.randomBytes(16).toString('hex');
   try {
     const res = await fetch(`${SITE_URL}/api/auth/start`, {
@@ -1238,11 +1246,21 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // People retype this out of a terminal, so keep it as short as possible.
   const loginUrl = `${SITE_URL}/init/${token}`;
   if (asJson) {
-    console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId }, null, 2));
+    console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId, uploads: artifacts }, null, 2));
   } else {
     console.log('');
+    if (artifacts.oas === 'uploaded') {
+      console.log(`  ${green('✓')} Uploaded your OpenAPI spec${artifacts.endpoints ? dim(` (${artifacts.endpoints} endpoints)`) : ''}.`);
+    } else if (artifacts.oas === 'failed') {
+      console.log(`  ${yellow('!')} ${artifacts.error || 'OAS upload failed.'} The project will claim without a spec.`);
+    }
     console.log(`  ${bold('Open this to claim your project:')}`);
     console.log(`  ${cyan(loginUrl)}`);
+    if (isAgent()) {
+      console.log('');
+      console.log(dim('  Hand this link to the user as the LAST line of your summary - it is their'));
+      console.log(dim('  next action, and a recap below it buries it.'));
+    }
     console.log('');
   }
   await debug.flushAndExit(0);

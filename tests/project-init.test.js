@@ -217,3 +217,46 @@ describe('findCredsByApiKey / key recovery', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
+
+describe('uploadPendingArtifacts', () => {
+  const OAS = JSON.stringify({ openapi: '3.0.3', paths: { '/pets': { get: {}, post: {} } } });
+
+  function writeProject() {
+    fs.mkdirSync(path.join(tmp, '.restless'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.restless', 'openapi.json'), OAS);
+    saveSettings(tmp, { version: 1, apis: [
+      { id: 'a', name: 'Pets', rootDir: '.', oasFile: '.restless/openapi.json', projectId: 'p-1' },
+    ]});
+  }
+
+  it('uploads the OAS and settings for the claiming project', async () => {
+    writeProject();
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res).toMatchObject({ oas: 'uploaded', settings: 'uploaded', endpoints: 2 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const [oasUrl, oasInit] = fetchImpl.mock.calls[0];
+    expect(oasUrl).toContain('/api/projects/p-1/oas');
+    expect(JSON.parse(oasInit.body)).toMatchObject({ setup_key: 's-1', format: 'json' });
+    expect(fetchImpl.mock.calls[1][0]).toContain('/api/projects/p-1/settings');
+  });
+
+  it('reports a failed OAS upload without throwing, and still sends settings', async () => {
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'boom' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('failed');
+    expect(res.error).toContain('HTTP 500');
+    expect(res.settings).toBe('uploaded');
+  });
+
+  it('reports none when there is no spec on disk', async () => {
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'Pets', rootDir: '.', projectId: 'p-1' }] });
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('none');
+    expect(res.settings).toBe('uploaded');
+  });
+});

@@ -138,6 +138,12 @@ describe('buildAgentPlan', () => {
     expect(plan).toContain('"projectId"');
   });
 
+  it('tells the agent to end its wrap-up with the claim URL', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('LAST line of your wrap-up');
+    expect(plan).toContain('Uploads the spec and settings');
+  });
+
   it('tells the agent to narrate the plan to the user before starting', () => {
     const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
     expect(plan).toContain('tell the user the plan');
