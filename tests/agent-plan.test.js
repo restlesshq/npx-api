@@ -148,7 +148,7 @@ describe('buildAgentPlan', () => {
     const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
     expect(plan).toContain('finish line, not a footnote');
     expect(plan).toContain('Last step: open this link');
-    expect(plan).toContain('the one step you cannot do for them');
+    expect(plan.replace(/\s+/g, ' ')).toContain('the one step you cannot do for them');
   });
 
   it('tells the agent to narrate the plan to the user before starting', () => {
