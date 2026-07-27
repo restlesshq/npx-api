@@ -26,7 +26,7 @@ that shouldn't be improvised:
 | ------- | ------------ |
 | `npx api guide [oas\|sdk]` | Prints the spec-writing / SDK-wiring instructions |
 | `npx api key` | Registers the project and writes `RESTLESS_KEY` to `.env` |
-| `npx api register --oas <file>` | Records a spec in `.restless/settings.json` |
+| `npx api register --oas <file>` | Records a spec in `.restless/settings.json` (rejects localhost servers) |
 | `npx api verify --url <url>` | Sends one request, confirms the SDK saw it and the log landed |
 | `npx api login` | Prints the URL you open to claim the project |
 

@@ -148,6 +148,14 @@ describe('buildAgentPlan', () => {
     expect(plan).toContain('`stale-key`');
   });
 
+  it('demands a public servers[0].url and bans local addresses from the spec', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('PUBLIC base URL');
+    expect(plan).toContain('localhost, 127.0.0.1');
+    expect(plan).toContain('relative mount path');
+    expect(plan).toContain('never in the spec');
+  });
+
   it('forbids committing .env and wires the envIgnoredByGit signal', () => {
     const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
     expect(plan).toContain('never stage or commit it');

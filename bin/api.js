@@ -27,6 +27,7 @@ import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId,
 import { findExistingEnvFile, existingRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
+import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-url.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
@@ -903,16 +904,23 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const topic = (process.argv[3] || '').toLowerCase();
 
   if (topic === 'oas' || topic === 'spec' || topic === 'openapi') {
-    const { rootDir: guideRoot } = resolveProjectDirs(process.cwd());
+    const { rootDir: guideRoot, packageDir: guidePkgDir } = resolveProjectDirs(process.cwd());
     const guideSettings = loadSettings(guideRoot);
     const guideApi = guideSettings.apis?.[0];
+    // Same deterministic base-URL guess the guided flow prefolds into its
+    // user prompt - deploy manifests, env templates, the README. Handing the
+    // agent a vetted candidate is what keeps localhost out of servers[0].url.
+    const guess = guideApi?.baseUrl ? null : guessBaseUrl({ dirs: [guidePkgDir, guideRoot] });
+    const domainInstruction = guess
+      ? `${guess.url} (deterministic guess from ${guess.source} - verify it against the code; if it's wrong and you can't confirm the real public URL, ask the user)`
+      : '(unknown. Ask the user for the API\'s PUBLIC base URL - never put localhost, 127.0.0.1, or a dev port in servers[0].url. If the user confirms no public URL exists, use a relative mount path like "/" instead)';
     // The prompt is normally rendered with values the guided run has already
     // worked out. Here the agent is the one who works them out, so the
     // placeholders that would carry them become instructions instead.
     const rendered = loadPrompt('generate-oas', {
       name: guideApi?.name || path.basename(guideRoot),
       oasFile: path.join(guideRoot, '.restless', 'openapi.json'),
-      domain: guideApi?.baseUrl || "(you determine this - see the servers[0].url note in the plan)",
+      domain: guideApi?.baseUrl || domainInstruction,
       existingOasNote: '',
       internalNote: '',
       // The guided run pre-computes a route checklist and pastes it here.
@@ -1037,18 +1045,39 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
+  // The spec's servers[0].url becomes the API's public base URL on the
+  // dashboard, and the spec itself gets uploaded. Localhost and dev ports
+  // must not ship - refuse here, where the agent still has to fix it before
+  // the flow can continue, rather than warn and hope.
+  const serverCheck = checkOasServers(oasDoc);
+  if (!serverCheck.ok && !process.argv.includes('--allow-local-servers')) {
+    console.log(red(`\n  ✗ servers[0].url is ${bold(serverCheck.url)} - a local/dev address, not a public base URL.`));
+    console.log(`  This spec gets uploaded to the dashboard, so localhost and dev ports can't ship in it.`);
+    console.log(`  Set ${cyan('servers[0].url')} to the API's real public URL - ask your user if you can't`);
+    console.log(`  confirm it - or use a relative mount path like ${cyan('"/"')} if no public URL exists.`);
+    console.log(dim(`  Intentional? Re-run with --allow-local-servers.\n`));
+    await debug.flushAndExit(1);
+  }
+
   const apiRootDir = flagValue('--dir') || '.';
   const name = flagValue('--name') || oasDoc?.info?.title || path.basename(regRoot);
   const oasRel = path.relative(regRoot, oasAbs);
   const settings = loadSettings(regRoot);
   const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
+  // Only a plausible public URL is worth recording as baseUrl. Relative
+  // servers and --allow-local-servers overrides keep whatever was there -
+  // and a local address recorded by an older CLI gets scrubbed rather than
+  // carried forward. A local URL never becomes the dashboard's idea of
+  // this API.
+  const publicBaseUrl = serverCheck.ok && !serverCheck.relative ? serverCheck.url : null;
+  const keptBaseUrl = isPlausibleBaseUrl(existing?.baseUrl) ? existing.baseUrl : undefined;
   upsertApi(settings, {
     ...(existing || {}),
     name,
     rootDir: apiRootDir,
     oasFile: oasRel,
     oasSource: existing?.oasSource || { kind: 'agent' },
-    baseUrl: oasDoc?.servers?.[0]?.url || existing?.baseUrl,
+    baseUrl: publicBaseUrl || keptBaseUrl,
     requestIdPrefix: existing?.requestIdPrefix || generatePrefix(name),
     lastSyncedAt: new Date().toISOString(),
   });
