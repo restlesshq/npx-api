@@ -286,3 +286,17 @@ describe('fixContext', () => {
     expect(c.evidence).toContain('not actually intercepting');
   });
 });
+
+describe('fixContext stale-key', () => {
+  it('names the reconcile command and forbids code edits', () => {
+    const c = fixContext('stale-key', { localBase: 'http://localhost:3001', cli: 'api-beta' });
+    expect(c.evidence).toContain('no log arrived');
+    expect(c.guidance).toContain('npx api-beta key');
+    expect(c.guidance).toContain("don't edit the wiring");
+  });
+
+  it('defaults the CLI name to api', () => {
+    const c = fixContext('stale-key', { localBase: 'http://localhost:3001' });
+    expect(c.guidance).toContain('npx api key');
+  });
+});

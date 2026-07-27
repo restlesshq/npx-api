@@ -9,7 +9,8 @@ import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
-import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
+import { resolveProjectDirs, findGitRoot, isGitIgnored } from '../lib/project.js';
+import { countOperations } from '../lib/oas-parse.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 import generateOas from '../steps/generate-oas.js';
 import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
@@ -23,12 +24,13 @@ import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
-import { findExistingEnvFile, existingRestlessKey } from '../steps/prepare-account.js';
-import { generateWriteKey, ensureProject, loadProjectCreds } from '../lib/project-init.js';
+import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
+import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
+import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-url.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
+import { findSdkReferences, findOwnerIdPlaceholders } from '../lib/grep-sdk.js';
 import * as debug from '../lib/debug.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
@@ -354,7 +356,6 @@ function printHelp() {
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Edit project settings and sync them to the dashboard'],
     ['skill <docs-url>', 'Install an API skill into Claude Code'],
-    ['reset', 'Remove Restless from this project'],
     ['help', 'Show this help'],
     ['--version', 'Print the installed CLI version'],
   ];
@@ -371,7 +372,7 @@ function printHelp() {
     ['guide [oas|sdk]', 'Print the instructions for writing the spec / wiring the SDK'],
     ['key', 'Register the project and put RESTLESS_KEY in .env'],
     ['register --oas <f>', 'Record a spec in .restless/settings.json'],
-    ['verify --url <u>', 'Send one request and report whether the SDK saw it'],
+    ['verify --url <u>', 'Send one request, confirm the SDK saw it and the log landed'],
     ['login', 'Print the URL the user opens to claim the project'],
   ];
   const agentWidth = Math.max(...agentRows.map(([name]) => name.length));
@@ -635,7 +636,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       console.log('');
       console.log(`  The short version: we read your code locally to write an OpenAPI spec and`);
       console.log(`  wire in the SDK. Nothing is uploaded until the last step, when you sign in`);
-      console.log(`  to claim the project. ${bold(`npx ${CLI_NAME} reset`)} undoes all of it.`);
+      console.log(`  to claim the project.`);
       console.log('');
       await debug.flushAndExit(0);
     }
@@ -710,7 +711,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log('');
     console.log(`  ${green('5.')} ${bold('Claim the project:')} ${cyan(`npx ${CLI_NAME} login`)}`);
     console.log('');
-    console.log(dim(`  Stuck? ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} does all of this for you, and ${bold(`npx ${CLI_NAME} reset`)}${'\x1b[2m'} undoes it.`));
+    console.log(dim(`  Stuck? ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} does all of this for you.`));
     console.log('');
     await debug.flushAndExit(0);
   }
@@ -902,16 +903,23 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const topic = (process.argv[3] || '').toLowerCase();
 
   if (topic === 'oas' || topic === 'spec' || topic === 'openapi') {
-    const { rootDir: guideRoot } = resolveProjectDirs(process.cwd());
+    const { rootDir: guideRoot, packageDir: guidePkgDir } = resolveProjectDirs(process.cwd());
     const guideSettings = loadSettings(guideRoot);
     const guideApi = guideSettings.apis?.[0];
+    // Same deterministic base-URL guess the guided flow prefolds into its
+    // user prompt - deploy manifests, env templates, the README. Handing the
+    // agent a vetted candidate is what keeps localhost out of servers[0].url.
+    const guess = guideApi?.baseUrl ? null : guessBaseUrl({ dirs: [guidePkgDir, guideRoot] });
+    const domainInstruction = guess
+      ? `${guess.url} (deterministic guess from ${guess.source} - verify it against the code; if it's wrong and you can't confirm the real public URL, ask the user)`
+      : '(unknown. Ask the user for the API\'s PUBLIC base URL - never put localhost, 127.0.0.1, or a dev port in servers[0].url. If the user confirms no public URL exists, use a relative mount path like "/" instead)';
     // The prompt is normally rendered with values the guided run has already
     // worked out. Here the agent is the one who works them out, so the
     // placeholders that would carry them become instructions instead.
     const rendered = loadPrompt('generate-oas', {
-      name: guideApi?.name || 'this API',
+      name: guideApi?.name || path.basename(guideRoot),
       oasFile: path.join(guideRoot, '.restless', 'openapi.json'),
-      domain: guideApi?.baseUrl || "(you determine this - see the servers[0].url note in the plan)",
+      domain: guideApi?.baseUrl || domainInstruction,
       existingOasNote: '',
       internalNote: '',
       // The guided run pre-computes a route checklist and pastes it here.
@@ -949,6 +957,19 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const asJson = process.argv.includes('--json');
   const inline = process.argv.includes('--inline');
   const dirFlag = flagValue('--dir');
+
+  // --inline exists so a HUMAN can place the key themselves. An agent has
+  // no use for the plaintext (the key goes into .env and the SDK reads it
+  // from there), so printing it just parks a live credential in the agent's
+  // transcript. Refuse by default; a human driving from inside an agent
+  // shell can override with RESTLESS_INTERACTIVE=1.
+  if (inline && isAgent() && process.env.RESTLESS_INTERACTIVE !== '1') {
+    const msg = 'Refusing to print the key to an agent - it is written to .env and the SDK reads it from there. '
+      + 'Nothing in setup needs it on stdout. (Human at the keyboard? Re-run with RESTLESS_INTERACTIVE=1.)';
+    if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+    else console.log(red(`\n  ✗ ${msg}\n`));
+    await debug.flushAndExit(1);
+  }
   const { rootDir: keyRoot, packageDir: keyPkgDir } = resolveProjectDirs(process.cwd());
   setGitRoot(findGitRoot(keyRoot) || keyRoot);
 
@@ -961,19 +982,36 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // server sends its logs to a project nobody is looking at.
   const existingEnvFile = findExistingEnvFile(apiDir, keyRoot);
   const existingKey = existingEnvFile ? existingRestlessKey(existingEnvFile) : null;
-  const apiKey = existingKey || generateWriteKey();
+  let apiKey = existingKey || generateWriteKey();
 
-  let projectId, reusedProject;
+  // An on-disk key is only reusable when we can prove which project it
+  // belongs to - settings, or the creds this machine saved when it first
+  // registered it. Re-registering an unproven key mints a project that
+  // ingress will never route the key's uploads to (the unrecoverable
+  // stale-key state), so an unrecognized key gets replaced instead.
+  let result = null;
+  let replacedStaleKey = false;
   try {
-    ({ projectId, reused: reusedProject } = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey }));
+    if (existingKey) {
+      result = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey, registerUnknown: false });
+      if (!result) {
+        apiKey = generateWriteKey();
+        replacedStaleKey = true;
+      }
+    }
+    if (!result) result = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey });
   } catch (err) {
     if (asJson) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
     else console.log(red(`\n  ✗ ${err.message}\n`));
     await debug.flushAndExit(1);
   }
+  const { projectId, reused: reusedProject, recovered: recoveredProject } = result;
 
   let envFile = null;
-  if (!inline && !existingKey) {
+  if (!inline && replacedStaleKey) {
+    envFile = existingEnvFile;
+    replaceRestlessKey(existingEnvFile, apiKey);
+  } else if (!inline && !existingKey) {
     envFile = existingEnvFile || path.join(apiDir, '.env');
     const line = `RESTLESS_KEY=${apiKey}`;
     if (existingEnvFile) safeAppendFileSync(envFile, `\n${line}\n`);
@@ -983,15 +1021,42 @@ if (command === '--version' || command === '-v' || command === 'version') {
   }
 
   const rel = envFile ? path.relative(keyPkgDir, envFile) : null;
+  // Whether a naive `git add -A` would stage the key. true = safe, false =
+  // it would, null = no git here so the question doesn't apply.
+  const envIgnoredByGit = envFile ? isGitIgnored(envFile, keyRoot) : null;
   if (asJson) {
-    console.log(JSON.stringify({
-      ok: true, apiKey, projectId, envFile: rel, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
-    }, null, 2));
+    const payload = {
+      ok: true, projectId, envFile: rel, envIgnoredByGit,
+      reusedExistingKey: !!existingKey && !replacedStaleKey,
+      reusedProject: !!reusedProject,
+      ...(recoveredProject && { recoveredProject: true }),
+      ...(replacedStaleKey && { replacedStaleKey: true }),
+    };
+    // The plaintext key reaches stdout only when --inline asked for exactly
+    // that. In the default flow it's already in .env; echoing it again would
+    // put a live credential in agent transcripts and shell history.
+    if (inline) payload.apiKey = apiKey;
+    console.log(JSON.stringify(payload, null, 2));
   } else {
     console.log('');
-    console.log(`  ${green('✓')} ${reusedProject ? 'Using the project from your last setup' : 'Project registered'} ${dim(`(${projectId})`)}.`);
-    if (rel) console.log(`  ${green('✓')} ${existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to'} ${bold(rel)}.`);
-    else console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    if (replacedStaleKey) {
+      console.log(`  ${yellow('!')} The RESTLESS_KEY already in ${bold(rel || '.env')} doesn't match any project this`);
+      console.log(`    machine set up, and re-registering an old key splits logs across projects.`);
+    }
+    const projectLine = recoveredProject
+      ? 'Re-adopted the project this key was first registered to'
+      : reusedProject ? 'Using the project from your last setup' : 'Project registered';
+    console.log(`  ${green('✓')} ${projectLine} ${dim(`(${projectId})`)}.`);
+    if (rel) {
+      const keyLine = replacedStaleKey ? 'Minted a fresh key and updated'
+        : existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to';
+      console.log(`  ${green('✓')} ${keyLine} ${bold(rel)}.`);
+    } else {
+      console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    }
+    if (envIgnoredByGit === false) {
+      console.log(`  ${yellow('!')} ${bold(rel)} is ${bold('not')} ignored by git - add it to ${bold('.gitignore')} before you commit.`);
+    }
     console.log('');
     console.log(dim(`  Keep this key out of source control. Restart your server so it picks it up.`));
     console.log('');
@@ -1025,26 +1090,47 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
+  // The spec's servers[0].url becomes the API's public base URL on the
+  // dashboard, and the spec itself gets uploaded. Localhost and dev ports
+  // must not ship - refuse here, where the agent still has to fix it before
+  // the flow can continue, rather than warn and hope.
+  const serverCheck = checkOasServers(oasDoc);
+  if (!serverCheck.ok && !process.argv.includes('--allow-local-servers')) {
+    console.log(red(`\n  ✗ servers[0].url is ${bold(serverCheck.url)} - a local/dev address, not a public base URL.`));
+    console.log(`  This spec gets uploaded to the dashboard, so localhost and dev ports can't ship in it.`);
+    console.log(`  Set ${cyan('servers[0].url')} to the API's real public URL - ask your user if you can't`);
+    console.log(`  confirm it - or use a relative mount path like ${cyan('"/"')} if no public URL exists.`);
+    console.log(dim(`  Intentional? Re-run with --allow-local-servers.\n`));
+    await debug.flushAndExit(1);
+  }
+
   const apiRootDir = flagValue('--dir') || '.';
   const name = flagValue('--name') || oasDoc?.info?.title || path.basename(regRoot);
   const oasRel = path.relative(regRoot, oasAbs);
   const settings = loadSettings(regRoot);
   const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
+  // Only a plausible public URL is worth recording as baseUrl. Relative
+  // servers and --allow-local-servers overrides keep whatever was there -
+  // and a local address recorded by an older CLI gets scrubbed rather than
+  // carried forward. A local URL never becomes the dashboard's idea of
+  // this API.
+  const publicBaseUrl = serverCheck.ok && !serverCheck.relative ? serverCheck.url : null;
+  const keptBaseUrl = isPlausibleBaseUrl(existing?.baseUrl) ? existing.baseUrl : undefined;
   upsertApi(settings, {
     ...(existing || {}),
     name,
     rootDir: apiRootDir,
     oasFile: oasRel,
     oasSource: existing?.oasSource || { kind: 'agent' },
-    baseUrl: oasDoc?.servers?.[0]?.url || existing?.baseUrl,
+    baseUrl: publicBaseUrl || keptBaseUrl,
     requestIdPrefix: existing?.requestIdPrefix || generatePrefix(name),
     lastSyncedAt: new Date().toISOString(),
   });
   saveSettings(regRoot, settings);
 
-  const paths = Object.keys(oasDoc?.paths || {}).length;
+  const ops = countOperations(oasDoc);
   console.log('');
-  console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${paths} path${paths === 1 ? '' : 's'})`)}.`);
+  console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${ops} endpoint${ops === 1 ? '' : 's'})`)}.`);
   console.log(`  ${dim(`.restless/settings.json now points at ${oasRel}. Commit .restless/ with your code.`)}`);
   console.log('');
   await debug.flushAndExit(0);
@@ -1059,6 +1145,10 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const pathFlag = flagValue('--path') || '/';
   const base = normalizeBaseUrl(urlFlag) || urlFlag;
   const target = `${base}${pathFlag.startsWith('/') ? '' : '/'}${pathFlag}`;
+
+  // Taken before the probe fires; the 15s back-window absorbs clock skew and
+  // the SDK's upload batching, same as the guided test step.
+  const since = new Date(Date.now() - 15000).toISOString();
 
   let raw = null;
   try {
@@ -1079,10 +1169,47 @@ if (command === '--version' || command === '-v' || command === 'version') {
     result.state = diag.state;
     result.status = parseStatus(raw);
     if (diag.requestId) result.requestId = diag.requestId;
-    const { guidance } = diag.state === 'ok' ? {} : fixContext(diag.state, { localBase: base });
-    if (guidance) result.fix = guidance;
+
+    // Second half of the verdict. A clean header only proves the SDK
+    // captured the request; a log arriving in the registered project proves
+    // the key maps where this setup thinks it does. Nothing landing after a
+    // clean header is the stale-key signature - the exact failure that used
+    // to sail through this command and surface as an empty dashboard.
+    // `landed: null` = no registered project to poll, header is all we have.
+    if (diag.state === 'ok') {
+      const { rootDir: verifyRoot } = resolveProjectDirs(process.cwd());
+      const entry = loadSettings(verifyRoot).apis?.find((a) => a.projectId) || null;
+      const creds = entry?.projectId ? loadProjectCreds(entry.projectId) : null;
+      if (creds?.setupKey) {
+        result.landed = await pollForLandedLog({ projectId: entry.projectId, setupKey: creds.setupKey, since });
+        if (!result.landed) result.state = 'stale-key';
+      } else {
+        result.landed = null;
+      }
+    }
+
+    if (result.state !== 'ok') {
+      const { guidance } = fixContext(result.state, { localBase: base, cli: CLI_NAME });
+      if (guidance) result.fix = guidance;
+    }
   }
-  result.ok = result.state === 'ok';
+
+  // The SDK guide tells installers who can't find a stable owner id to
+  // leave the 'NEEDS_CONFIGURATION' placeholder, and promises "the CLI
+  // greps for them and asks the user." This is that grep for the agent
+  // flow: capture can pass while the setup is still unfinished, so the
+  // check fails until a real owner id replaces the placeholder.
+  const placeholderFiles = findOwnerIdPlaceholders(resolveProjectDirs(process.cwd()).rootDir);
+  if (placeholderFiles.length) {
+    result.ownerIdNeedsConfiguration = true;
+    result.ownerIdFiles = placeholderFiles;
+    result.ownerIdFix =
+      "owner.id is still the 'NEEDS_CONFIGURATION' placeholder. Ask the user which field in " +
+      'their data model is the permanent, immutable owner id (a database primary key or ' +
+      'workspace/tenant UUID - never an email, username, or API key), update the owner block ' +
+      'in the setup callback, restart the server, and re-run this check.';
+  }
+  result.ok = result.state === 'ok' && !result.ownerIdNeedsConfiguration;
 
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
@@ -1091,7 +1218,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log('');
     console.log(`  ${desc.icon}  ${desc.lines[0]}`);
     for (const l of desc.lines.slice(1)) console.log(`     ${l}`);
+    if (result.landed) console.log(`     ${green('✓')} The log landed in your project too.`);
     if (result.status) console.log(dim(`     (HTTP ${result.status} - a rejected request still counts, as long as the SDK saw it.)`));
+    if (result.ownerIdNeedsConfiguration) {
+      console.log('');
+      console.log(`  ${yellow('⚠')}  owner.id is still ${bold("'NEEDS_CONFIGURATION'")} in ${result.ownerIdFiles.join(', ')}.`);
+      console.log(`     Ask the user which field is the permanent owner id (a db primary key or`);
+      console.log(`     workspace UUID), update the setup callback, restart, and re-run this check.`);
+    }
     console.log('');
   }
   await debug.flushAndExit(result.ok ? 0 : 1);
@@ -1119,6 +1253,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
+  // Stage the spec + settings BEFORE minting the login token. The claim
+  // flow attaches whatever is pending at claim time - a login link handed
+  // out without this upload claims an empty project (no endpoints, no
+  // settings), which is exactly how the agent flow used to end.
+  const artifacts = await uploadPendingArtifacts({
+    rootDir: loginRoot, projectId: entry.projectId, setupKey: creds.setupKey,
+  });
+
   const token = crypto.randomBytes(16).toString('hex');
   try {
     const res = await fetch(`${SITE_URL}/api/auth/start`, {
@@ -1138,11 +1280,23 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // People retype this out of a terminal, so keep it as short as possible.
   const loginUrl = `${SITE_URL}/init/${token}`;
   if (asJson) {
-    console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId }, null, 2));
+    console.log(JSON.stringify({ ok: true, loginUrl, projectId: entry.projectId, uploads: artifacts }, null, 2));
   } else {
     console.log('');
+    if (artifacts.oas === 'uploaded') {
+      console.log(`  ${green('✓')} Uploaded your OpenAPI spec${artifacts.endpoints ? dim(` (${artifacts.endpoints} endpoints)`) : ''}.`);
+    } else if (artifacts.oas === 'failed') {
+      console.log(`  ${yellow('!')} ${artifacts.error || 'OAS upload failed.'} The project will claim without a spec.`);
+    }
     console.log(`  ${bold('Open this to claim your project:')}`);
     console.log(`  ${cyan(loginUrl)}`);
+    if (isAgent()) {
+      console.log('');
+      console.log(dim('  Setup finishes when your user opens this link: it connects the project to'));
+      console.log(dim('  their account, which is where their logs become visible. It goes stale'));
+      console.log(dim('  after a few hours. Pass that along plainly, and make the link the LAST'));
+      console.log(dim('  line of your summary - it is their one next action.'));
+    }
     console.log('');
   }
   await debug.flushAndExit(0);

@@ -69,7 +69,22 @@ describe('registerProject', () => {
 describe('project credentials', () => {
   it('round-trips the setup key so a later process can still claim the project', () => {
     mod.saveProjectCreds({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_k' });
-    expect(mod.loadProjectCreds('p1')).toMatchObject({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_k' });
+    expect(mod.loadProjectCreds('p1')).toMatchObject({ projectId: 'p1', setupKey: 's1' });
+  });
+
+  it('persists only a hash of the write key, never the plaintext', () => {
+    const file = mod.saveProjectCreds({ projectId: 'p1', setupKey: 's1', apiKey: 'rstlss_secret' });
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw).not.toContain('rstlss_secret');
+    expect(mod.loadProjectCreds('p1').apiKeyHash).toBe(mod.hashWriteKey('rstlss_secret'));
+  });
+
+  it('scrubs legacy plaintext keys on the next save', () => {
+    const file = mod.credsPath('p-legacy');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ projectId: 'p-legacy', setupKey: 's', apiKey: 'rstlss_old' }));
+    mod.saveProjectCreds({ projectId: 'p-legacy', setupKey: 's2', apiKey: 'rstlss_old' });
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('rstlss_old');
   });
 
   it('keeps credentials out of the repo and readable only by the user', () => {
@@ -127,5 +142,136 @@ describe('ensureProject', () => {
     const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
     expect(saved.apis.find((a) => a.rootDir === 'svc-b').projectId).toBe('project-1');
     expect(saved.apis.find((a) => a.rootDir === 'svc-a').projectId).toBeUndefined();
+  });
+});
+
+describe('pollForLandedLog', () => {
+  const okResponse = (logs) => ({ ok: true, json: async () => ({ logs }) });
+
+  it('returns true as soon as a log lands', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse([{ id: 'log-1' }]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(body).toMatchObject({ projectId: 'p', setupKey: 's', since: 'now' });
+  });
+
+  it('keeps polling past empty responses, then reports the landing', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(okResponse([]))
+      .mockResolvedValueOnce(okResponse([{ id: 'log-1' }]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 10000, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns false when nothing lands before the deadline', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse([]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 0, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(false);
+  });
+
+  it('treats network errors as not-landed-yet rather than throwing', async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error('boom'));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 0, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(false);
+  });
+});
+
+describe('findCredsByApiKey / key recovery', () => {
+  it('finds the creds this machine saved for a key', () => {
+    mod.saveProjectCreds({ projectId: 'p-1', setupKey: 's-1', apiKey: 'rstlss_a' });
+    expect(mod.findCredsByApiKey('rstlss_a')).toMatchObject({ projectId: 'p-1', setupKey: 's-1' });
+    expect(mod.findCredsByApiKey('rstlss_other')).toBe(null);
+    expect(mod.findCredsByApiKey(null)).toBe(null);
+  });
+
+  it('prefers the OLDEST registration when one key maps to several projects', () => {
+    // The duplicate mapping is exactly the orphan bug: ingress routes the
+    // key's uploads to the first project registered for it.
+    const dir = path.join(home, '.restless', 'projects');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'p-old.json'), JSON.stringify({
+      projectId: 'p-old', setupKey: 's-old', apiKey: 'rstlss_dup', savedAt: '2026-07-25T00:00:00.000Z',
+    }));
+    fs.writeFileSync(path.join(dir, 'p-new.json'), JSON.stringify({
+      projectId: 'p-new', setupKey: 's-new', apiKey: 'rstlss_dup', savedAt: '2026-07-26T00:00:00.000Z',
+    }));
+    expect(mod.findCredsByApiKey('rstlss_dup')).toMatchObject({ projectId: 'p-old' });
+  });
+
+  it('ensureProject adopts local creds when settings has no projectId', async () => {
+    // The Greg scenario: key on disk from an earlier run, fresh settings.
+    mod.saveProjectCreds({ projectId: 'p-orig', setupKey: 's-orig', apiKey: 'rstlss_k' });
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'One', rootDir: '.' }] });
+
+    const fetchImpl = vi.fn(); // must never be called - recovery is local
+    const res = await mod.ensureProject({ rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_k', fetchImpl });
+    expect(res).toMatchObject({ projectId: 'p-orig', setupKey: 's-orig', reused: true, recovered: true });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis[0].projectId).toBe('p-orig');
+  });
+
+  it('ensureProject returns null for an unknown key when registerUnknown is false', async () => {
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'One', rootDir: '.' }] });
+    const fetchImpl = vi.fn();
+    const res = await mod.ensureProject({
+      rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_mystery', registerUnknown: false, fetchImpl,
+    });
+    expect(res).toBe(null);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('uploadPendingArtifacts', () => {
+  const OAS = JSON.stringify({ openapi: '3.0.3', paths: { '/pets': { get: {}, post: {} } } });
+
+  function writeProject() {
+    fs.mkdirSync(path.join(tmp, '.restless'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.restless', 'openapi.json'), OAS);
+    saveSettings(tmp, { version: 1, apis: [
+      { id: 'a', name: 'Pets', rootDir: '.', oasFile: '.restless/openapi.json', projectId: 'p-1' },
+    ]});
+  }
+
+  it('uploads the OAS and settings for the claiming project', async () => {
+    writeProject();
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res).toMatchObject({ oas: 'uploaded', settings: 'uploaded', endpoints: 2 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const [oasUrl, oasInit] = fetchImpl.mock.calls[0];
+    expect(oasUrl).toContain('/api/projects/p-1/oas');
+    expect(JSON.parse(oasInit.body)).toMatchObject({ setup_key: 's-1', format: 'json' });
+    expect(fetchImpl.mock.calls[1][0]).toContain('/api/projects/p-1/settings');
+  });
+
+  it('reports a failed OAS upload without throwing, and still sends settings', async () => {
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'boom' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('failed');
+    expect(res.error).toContain('HTTP 500');
+    expect(res.settings).toBe('uploaded');
+  });
+
+  it('reports none when there is no spec on disk', async () => {
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'Pets', rootDir: '.', projectId: 'p-1' }] });
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('none');
+    expect(res.settings).toBe('uploaded');
   });
 });

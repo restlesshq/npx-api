@@ -489,7 +489,10 @@ async function finalizeApi({
     const oasFullPath = path.join(rootDir, finalOasFile);
     try {
       const oasContent = fs.readFileSync(oasFullPath, 'utf8');
-      const updated = oasContent.replaceAll(PLACEHOLDER_DOMAIN, domain || 'http://localhost:3000');
+      // A blank answer means "no public URL confirmed". A relative server is
+      // the honest spelling of that - this file gets uploaded, and a made-up
+      // localhost:3000 would ship to the dashboard as the API's base URL.
+      const updated = oasContent.replaceAll(PLACEHOLDER_DOMAIN, domain || '/');
       safeWriteFileSync(oasFullPath, updated);
     } catch {}
   }

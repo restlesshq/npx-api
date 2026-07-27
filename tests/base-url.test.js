@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   guessBaseUrl,
   isPlausibleBaseUrl,
+  checkOasServers,
   normalize,
   fromOas,
   fromFlyToml,
@@ -175,5 +176,37 @@ describe('guessBaseUrl', () => {
   it('never reads a real .env', () => {
     write('.env', 'API_BASE_URL=https://secret.acme.com\n');
     expect(guessBaseUrl({ dirs: [tmp] })).toBeNull();
+  });
+});
+
+describe('checkOasServers', () => {
+  it('accepts a public URL and normalizes it', () => {
+    const r = checkOasServers({ servers: [{ url: 'https://api.example.dev/v1/' }] });
+    expect(r).toEqual({ ok: true, url: 'https://api.example.dev/v1' });
+  });
+
+  it('accepts relative servers as the honest no-public-URL form', () => {
+    expect(checkOasServers({ servers: [{ url: '/v1' }] })).toMatchObject({ ok: true, relative: true });
+  });
+
+  it('accepts missing or empty servers', () => {
+    expect(checkOasServers({}).ok).toBe(true);
+    expect(checkOasServers({ servers: [] }).ok).toBe(true);
+    expect(checkOasServers({ servers: [{ url: '' }] }).ok).toBe(true);
+  });
+
+  it('rejects localhost, loopback, private IPs, and container hosts', () => {
+    for (const url of [
+      'http://localhost:3002',
+      'http://127.0.0.1:8080',
+      'http://0.0.0.0:3000',
+      'http://192.168.1.20:3000',
+      'http://10.0.0.5',
+      'http://172.16.0.2:9000',
+      'http://api-container:8080',
+      'http://myapp.internal',
+    ]) {
+      expect(checkOasServers({ servers: [{ url }] }).ok).toBe(false);
+    }
   });
 });

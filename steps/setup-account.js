@@ -3,10 +3,10 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan, celebrationBanner } from '../lib/ui.js';
-import { parseOas } from '../lib/oas-parse.js';
 import { loadSettings } from '../lib/settings.js';
 import { SITE_URL } from '../lib/config.js';
 import { isInteractive } from '../lib/env.js';
+import { uploadPendingArtifacts } from '../lib/project-init.js';
 import * as debug from '../lib/debug.js';
 
 function openBrowser(url) {
@@ -78,22 +78,6 @@ function waitForEnter() {
   return { promise, cancel: () => cancel() };
 }
 
-// Count operations (method entries under each path) in a parsed OAS, so the
-// completion recap can show a concrete "Mapped N endpoints" number.
-const OAS_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace']);
-function countEndpoints(oas) {
-  if (!oas || typeof oas.paths !== 'object' || !oas.paths) return 0;
-  let n = 0;
-  for (const item of Object.values(oas.paths)) {
-    if (item && typeof item === 'object') {
-      for (const method of Object.keys(item)) {
-        if (OAS_METHODS.has(method.toLowerCase())) n++;
-      }
-    }
-  }
-  return n;
-}
-
 // Find the API entry whose rootDir matches apiRootDir, falling back to the
 // first one if there's no match (typical single-API setup).
 function pickApiEntry(settings, apiRootDir) {
@@ -114,7 +98,10 @@ export default async function setupAccount({
   // Stage everything the server needs BEFORE the user logs in, so the
   // claim flow has nothing left to do but mark the project as theirs.
   // The OAS lands in `PendingOAS` keyed by setupKeyHash; the claim
-  // route picks it up after auth completes.
+  // route picks it up after auth completes. The uploads themselves are
+  // shared with `api login` (uploadPendingArtifacts): the whole
+  // settings.json goes up alongside the spec, and a settings failure is
+  // non-fatal - the project still claims, just without the blob.
   const settings = loadSettings(rootDir);
   const apiEntry = pickApiEntry(settings, apiRootDir);
   const oasFile = apiEntry?.oasFile;
@@ -126,84 +113,21 @@ export default async function setupAccount({
     : [dim('  No local OpenAPI spec found to upload.')],
   });
 
-  let endpointCount = 0;
-  if (hasLocalOas) {
-    setSpinner?.('Uploading OpenAPI spec');
-    try {
-      const oasRaw = fs.readFileSync(oasPath, 'utf8');
-      const isJson = oasPath.endsWith('.json');
-      // Count endpoints off the same bytes we're uploading, for the recap.
-      try {
-        const parsed = parseOas(oasRaw, isJson ? 'json' : 'yaml');
-        if (parsed.ok) endpointCount = countEndpoints(parsed.oas);
-      } catch {}
-      const uploadRes = await fetch(`${SITE_URL}/api/projects/${projectId}/oas`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          setup_key: setupKey,
-          oas_raw: oasRaw,
-          format: isJson ? 'json' : 'yaml',
-        }),
-        signal: AbortSignal.timeout(10000),
-      });
-      setSpinner?.('');
-      if (!uploadRes.ok) {
-        const errText = await uploadRes.text().catch(() => '');
-        update({ status: 'failed', message: [
-          `  ${red('✗')} OAS upload failed (HTTP ${uploadRes.status}).`,
-          errText ? dim(`  ${errText.slice(0, 200)}`) : null,
-          dim(`  Endpoint: ${SITE_URL}/api/projects/${projectId}/oas`),
-        ].filter(Boolean) });
-        return { apiKey };
-      }
-    } catch (err) {
-      setSpinner?.('');
-      update({ status: 'failed', message: [
-        `  ${red('✗')} OAS upload error: ${err.message}`,
-      ]});
-      return { apiKey };
-    }
-  }
+  setSpinner?.('Uploading OpenAPI spec');
+  const artifacts = await uploadPendingArtifacts({ rootDir, apiRootDir, projectId, setupKey });
+  setSpinner?.('');
 
-  // Upload the FULL `.restless/settings.json`. We send the whole
-  // file (not just this api's entry) so the server has the full
-  // workspace context - other apis in the file, top-level
-  // version/config, etc. The UI cherry-picks the entry matching
-  // this projectId (by its `id` in the apis[] array - though for
-  // request-id-prefix display, the matching apiEntry suffices).
-  // Non-fatal on failure: the project still claims, just without
-  // the settings blob attached. We log + warn rather than abort.
-  if (settings && Array.isArray(settings.apis) && settings.apis.length) {
-    setSpinner?.('Uploading project settings');
-    try {
-      const settingsRes = await fetch(
-        `${SITE_URL}/api/projects/${projectId}/settings`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            setup_key: setupKey,
-            settings,
-          }),
-          signal: AbortSignal.timeout(10000),
-        },
-      );
-      setSpinner?.('');
-      if (!settingsRes.ok) {
-        const errText = await settingsRes.text().catch(() => '');
-        update({ message: [
-          `  ${dim('!')} Settings upload skipped (HTTP ${settingsRes.status}).`,
-          errText ? dim(`    ${errText.slice(0, 200)}`) : null,
-        ].filter(Boolean) });
-      }
-    } catch (err) {
-      setSpinner?.('');
-      update({ message: [
-        `  ${dim('!')} Settings upload skipped: ${err.message}`,
-      ]});
-    }
+  if (artifacts.oas === 'failed') {
+    update({ status: 'failed', message: [
+      `  ${red('✗')} ${artifacts.error || 'OAS upload failed.'}`,
+      dim(`  Endpoint: ${SITE_URL}/api/projects/${projectId}/oas`),
+    ]});
+    return { apiKey };
   }
+  if (artifacts.settings === 'failed') {
+    update({ message: [`  ${dim('!')} ${artifacts.settingsError || 'Settings upload skipped.'}`] });
+  }
+  const endpointCount = artifacts.endpoints;
 
   // ── Sub 1: Log in to claim the project ──────────────────────────
   // Hand the project + setupKey to the server up front, keyed by an

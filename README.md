@@ -26,12 +26,19 @@ that shouldn't be improvised:
 | ------- | ------------ |
 | `npx api guide [oas\|sdk]` | Prints the spec-writing / SDK-wiring instructions |
 | `npx api key` | Registers the project and writes `RESTLESS_KEY` to `.env` |
-| `npx api register --oas <file>` | Records a spec in `.restless/settings.json` |
-| `npx api verify --url <url>` | Sends one request, reports whether the SDK saw it |
+| `npx api register --oas <file>` | Records a spec in `.restless/settings.json` (rejects localhost servers) |
+| `npx api verify --url <url>` | Sends one request, confirms the SDK saw it, the log landed, and no owner-id placeholder remains |
 | `npx api login` | Prints the URL you open to claim the project |
 
 Re-running is safe: an unchanged key keeps its existing project rather than
-registering a new one.
+registering a new one - even when `.restless/` is gone, `npx api key` re-adopts
+the project this machine first registered the key to, and if the key on disk
+can't be matched to any known project it mints a fresh key (replacing the `.env`
+line) instead of re-registering the old one into a project its logs would never
+reach. It writes the key straight to `.env` and never echoes it into the agent's
+transcript; `--inline` prints it on stdout instead, but only for humans - under
+a coding agent it refuses. It also reports whether git ignores that env file
+(`envIgnoredByGit`), so the key can't slip into a commit unnoticed.
 
 Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set

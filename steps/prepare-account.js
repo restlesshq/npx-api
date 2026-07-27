@@ -81,6 +81,25 @@ export function existingRestlessKey(envPath) {
 }
 
 /**
+ * Swap the value of an existing `RESTLESS_KEY=` line in place, leaving
+ * every other line untouched. Used when a key on disk turns out to be
+ * unrecoverable (no project this machine knows about) and the fix is a
+ * fresh key rather than re-registering the old one. Returns false when
+ * the file has no RESTLESS_KEY line to replace.
+ */
+export function replaceRestlessKey(envPath, newKey) {
+  try {
+    const content = fs.readFileSync(envPath, 'utf8');
+    if (!/^(?:export\s+)?RESTLESS_KEY\s*=/m.test(content)) return false;
+    const updated = content.replace(/^((?:export\s+)?RESTLESS_KEY\s*=\s*).*$/m, `$1${newKey}`);
+    safeWriteFileSync(envPath, updated);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Sub 0 of Step 2. Generates the project's write key, registers the
  * project with the metrics/site backend, and writes `RESTLESS_KEY` to
  * `.env`. The OAS upload is deferred to step 4 (Set up account → Upload
