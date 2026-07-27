@@ -31,7 +31,9 @@ that shouldn't be improvised:
 | `npx api login` | Prints the URL you open to claim the project |
 
 Re-running is safe: an unchanged key keeps its existing project rather than
-registering a new one.
+registering a new one. `npx api key` writes the key straight to `.env` and never
+echoes it into the agent's transcript; pass `--inline` if you explicitly want it
+on stdout instead.
 
 Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set

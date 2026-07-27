@@ -909,7 +909,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     // worked out. Here the agent is the one who works them out, so the
     // placeholders that would carry them become instructions instead.
     const rendered = loadPrompt('generate-oas', {
-      name: guideApi?.name || 'this API',
+      name: guideApi?.name || path.basename(guideRoot),
       oasFile: path.join(guideRoot, '.restless', 'openapi.json'),
       domain: guideApi?.baseUrl || "(you determine this - see the servers[0].url note in the plan)",
       existingOasNote: '',
@@ -984,9 +984,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   const rel = envFile ? path.relative(keyPkgDir, envFile) : null;
   if (asJson) {
-    console.log(JSON.stringify({
-      ok: true, apiKey, projectId, envFile: rel, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
-    }, null, 2));
+    const payload = {
+      ok: true, projectId, envFile: rel, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
+    };
+    // The plaintext key reaches stdout only when --inline asked for exactly
+    // that. In the default flow it's already in .env; echoing it again would
+    // put a live credential in agent transcripts and shell history.
+    if (inline) payload.apiKey = apiKey;
+    console.log(JSON.stringify(payload, null, 2));
   } else {
     console.log('');
     console.log(`  ${green('✓')} ${reusedProject ? 'Using the project from your last setup' : 'Project registered'} ${dim(`(${projectId})`)}.`);
