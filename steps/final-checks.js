@@ -508,25 +508,43 @@ export async function runAiChecks({ ctx, sourceFile, setSpinner, runner = runAI 
     return [{ kind: 'ai-review', ok: true, informational: true, label: 'Deeper review', detail: dim('no clear verdict - the static checks above still apply') }];
   }
 
-  const rows = [];
+  const known = [];
   for (const check of checks) {
     const label = AI_CHECK_LABELS[check?.id];
     if (!label) continue; // ignore anything we didn't ask about
-    const ok = check.ok !== false;
-    const note = typeof check.note === 'string' ? check.note.trim() : '';
-    rows.push({
-      kind: `ai-${check.id}`,
-      ok,
-      // These are reported, not repaired: the fixes are edits to the user's
-      // own middleware order or business logic, which is not something to
-      // apply behind a yes/no prompt.
-      advisory: true,
+    known.push({
+      id: check.id,
       label,
-      detail: ok ? (note ? dim(note) : dim('looks right')) : `${yellow(note || 'needs a look')}`,
+      ok: check.ok !== false,
+      note: typeof check.note === 'string' ? check.note.trim() : '',
     });
   }
-  debug.log('final-checks.ai-checks', { rows: rows.map((r) => ({ kind: r.kind, ok: r.ok })) });
-  return rows;
+  debug.log('final-checks.ai-checks', { checks: known.map((c) => ({ id: c.id, ok: c.ok })) });
+
+  if (!known.length) {
+    return [{ kind: 'ai-review', ok: true, informational: true, label: 'Deeper review', detail: dim('no clear verdict - the static checks above still apply') }];
+  }
+
+  // One row, not one per check. Itemizing five green "looks right" lines
+  // reads as five more things the user has to review, when the only
+  // takeaway is "nothing wrong around the wiring". Failures still get
+  // their specifics, listed under the single row.
+  const failed = known.filter((c) => !c.ok);
+  if (!failed.length) {
+    return [{ kind: 'ai-review', ok: true, informational: true, label: 'Deeper review', detail: dim('looks good') }];
+  }
+  return [{
+    kind: 'ai-review',
+    ok: false,
+    // Reported, not repaired: the fixes are edits to the user's own
+    // middleware order or business logic, which is not something to
+    // apply behind a yes/no prompt.
+    advisory: true,
+    label: 'Deeper review',
+    detail: failed
+      .map((c) => yellow(`${c.label}: ${c.note || 'needs a look'}`))
+      .join('\n      '),
+  }];
 }
 
 function renderRow(row) {
@@ -813,10 +831,15 @@ export default async function finalChecks({
       headerLine,
       '',
       ...renderReview(rows),
+      ...(allOk ? [
+        `  ${bold("Everything looks like it's set up correctly!")}`,
+        `  ${dim("Let's make some test calls locally to confirm it's actually working")}`,
+        '',
+      ] : []),
       // Same shape as the other CTAs in the flow (green chevron, bold, a dim
       // aside) - "Press Enter to move on." in flat gray read like a footnote
       // rather than the thing the screen is waiting on.
-      `  ${green(bold('❯ Press Enter'))} ${dim(allOk ? "and we'll test it out" : "to keep going - you can fix these later")}`,
+      `  ${green(bold('❯ Press Enter'))} ${dim(allOk ? "when you're ready" : "to keep going - you can fix these later")}`,
     ],
   });
   if (!allOk) {

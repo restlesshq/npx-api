@@ -9,34 +9,48 @@ const ctx = { installDir: '/repo/api', framework: 'Express', language: 'javascri
 const reply = (obj) => vi.fn(async () => '```json\n' + JSON.stringify(obj) + '\n```');
 
 describe('runAiChecks', () => {
-  it('turns the checklist into rows, in the order the model answered', async () => {
+  // The whole checklist collapses into a single row. Itemizing five green
+  // "looks right" lines reads as five more things the user has to review;
+  // the only takeaway on a clean pass is "nothing wrong around the wiring".
+  it('collapses an all-pass checklist into one "looks good" row', async () => {
     const runner = reply({ checks: [
-      { id: 'order', ok: true, note: '' },
+      { id: 'order', ok: true, note: 'registered on line 27, above the auth guard' },
       { id: 'mounted', ok: true, note: '' },
-      { id: 'credential', ok: true, note: '' },
+      { id: 'credential', ok: true, note: 'extracts the same authorization token' },
       { id: 'collateral', ok: true, note: '' },
       { id: 'runtime', ok: true, note: '' },
     ]});
     const rows = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
-    expect(rows.map((r) => r.kind)).toEqual([
-      'ai-order', 'ai-mounted', 'ai-credential', 'ai-collateral', 'ai-runtime',
-    ]);
-    expect(rows.every((r) => r.ok)).toBe(true);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('ai-review');
+    expect(rows[0].ok).toBe(true);
+    expect(rows[0].label).toBe('Deeper review');
+    expect(strip(rows[0].detail)).toContain('looks good');
+    // Notes on passing checks stay out of the render - they were the noise.
+    expect(strip(rows[0].detail)).not.toContain('auth guard');
+    expect(strip(rows[0].detail)).not.toContain('authorization token');
   });
 
-  it('surfaces the note on a failure', async () => {
+  it('surfaces only the failures, labeled, under the single row', async () => {
     const runner = reply({ checks: [
       { id: 'order', ok: false, note: 'sits below requireApiKey on line 42' },
+      { id: 'mounted', ok: true, note: 'fine' },
+      { id: 'runtime', ok: false, note: '' },
     ]});
-    const [row] = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
+    const rows = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
+    expect(rows).toHaveLength(1);
+    const [row] = rows;
     expect(row.ok).toBe(false);
-    expect(strip(row.detail)).toContain('sits below requireApiKey');
-    expect(row.label).toBe('Middleware order');
+    expect(row.label).toBe('Deeper review');
+    const detail = strip(row.detail);
+    expect(detail).toContain('Middleware order: sits below requireApiKey on line 42');
+    expect(detail).toContain('File still loads: needs a look');
+    expect(detail).not.toContain('fine');
   });
 
   // These get reported, never auto-repaired - the fix is an edit to the
   // user's own middleware order, not to the block we manage.
-  it('marks every row advisory and offers no fix thunk', async () => {
+  it('marks a failing review advisory and offers no fix thunk', async () => {
     const runner = reply({ checks: [{ id: 'order', ok: false, note: 'wrong place' }] });
     const [row] = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
     expect(row.advisory).toBe(true);
@@ -50,7 +64,18 @@ describe('runAiChecks', () => {
     ]});
     const rows = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
     expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('ai-order');
+    expect(rows[0].ok).toBe(true);
+    expect(strip(rows[0].detail)).not.toContain('hallucinated');
+  });
+
+  // An empty checklist is not a pass - don't claim "looks good" when the
+  // model answered nothing we asked about.
+  it('does not claim "looks good" on an empty checklist', async () => {
+    const runner = reply({ checks: [] });
+    const [row] = await runAiChecks({ ctx, sourceFile: '/repo/api/index.js', runner });
+    expect(row.ok).toBe(true);
+    expect(row.informational).toBe(true);
+    expect(strip(row.detail)).toContain('no clear verdict');
   });
 
   // A review pass must never block the install, so both failure modes
