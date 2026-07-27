@@ -154,6 +154,13 @@ describe('buildAgentPlan', () => {
     expect(plan).toContain('`stale-key`');
   });
 
+  it('makes the NEEDS_CONFIGURATION placeholder a blocking ask-the-user step', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('NEEDS_CONFIGURATION');
+    expect(plan).toContain('ask the user which field is the');
+    expect(plan).toContain('ownerIdNeedsConfiguration: true');
+  });
+
   it('demands a public servers[0].url and bans local addresses from the spec', () => {
     const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
     expect(plan).toContain('PUBLIC base URL');

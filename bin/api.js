@@ -30,7 +30,7 @@ import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, 
 import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-url.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
+import { findSdkReferences, findOwnerIdPlaceholders } from '../lib/grep-sdk.js';
 import * as debug from '../lib/debug.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
@@ -1193,7 +1193,23 @@ if (command === '--version' || command === '-v' || command === 'version') {
       if (guidance) result.fix = guidance;
     }
   }
-  result.ok = result.state === 'ok';
+
+  // The SDK guide tells installers who can't find a stable owner id to
+  // leave the 'NEEDS_CONFIGURATION' placeholder, and promises "the CLI
+  // greps for them and asks the user." This is that grep for the agent
+  // flow: capture can pass while the setup is still unfinished, so the
+  // check fails until a real owner id replaces the placeholder.
+  const placeholderFiles = findOwnerIdPlaceholders(resolveProjectDirs(process.cwd()).rootDir);
+  if (placeholderFiles.length) {
+    result.ownerIdNeedsConfiguration = true;
+    result.ownerIdFiles = placeholderFiles;
+    result.ownerIdFix =
+      "owner.id is still the 'NEEDS_CONFIGURATION' placeholder. Ask the user which field in " +
+      'their data model is the permanent, immutable owner id (a database primary key or ' +
+      'workspace/tenant UUID - never an email, username, or API key), update the owner block ' +
+      'in the setup callback, restart the server, and re-run this check.';
+  }
+  result.ok = result.state === 'ok' && !result.ownerIdNeedsConfiguration;
 
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
@@ -1204,6 +1220,12 @@ if (command === '--version' || command === '-v' || command === 'version') {
     for (const l of desc.lines.slice(1)) console.log(`     ${l}`);
     if (result.landed) console.log(`     ${green('✓')} The log landed in your project too.`);
     if (result.status) console.log(dim(`     (HTTP ${result.status} - a rejected request still counts, as long as the SDK saw it.)`));
+    if (result.ownerIdNeedsConfiguration) {
+      console.log('');
+      console.log(`  ${yellow('⚠')}  owner.id is still ${bold("'NEEDS_CONFIGURATION'")} in ${result.ownerIdFiles.join(', ')}.`);
+      console.log(`     Ask the user which field is the permanent owner id (a db primary key or`);
+      console.log(`     workspace UUID), update the setup callback, restart, and re-run this check.`);
+    }
     console.log('');
   }
   await debug.flushAndExit(result.ok ? 0 : 1);
