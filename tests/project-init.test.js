@@ -129,3 +129,45 @@ describe('ensureProject', () => {
     expect(saved.apis.find((a) => a.rootDir === 'svc-a').projectId).toBeUndefined();
   });
 });
+
+describe('pollForLandedLog', () => {
+  const okResponse = (logs) => ({ ok: true, json: async () => ({ logs }) });
+
+  it('returns true as soon as a log lands', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse([{ id: 'log-1' }]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(body).toMatchObject({ projectId: 'p', setupKey: 's', since: 'now' });
+  });
+
+  it('keeps polling past empty responses, then reports the landing', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(okResponse([]))
+      .mockResolvedValueOnce(okResponse([{ id: 'log-1' }]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 10000, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns false when nothing lands before the deadline', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse([]));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 0, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(false);
+  });
+
+  it('treats network errors as not-landed-yet rather than throwing', async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error('boom'));
+    const landed = await mod.pollForLandedLog({
+      projectId: 'p', setupKey: 's', since: 'now', timeoutMs: 0, fetchImpl, sleep: async () => {},
+    });
+    expect(landed).toBe(false);
+  });
+});

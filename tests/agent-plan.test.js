@@ -137,4 +137,22 @@ describe('buildAgentPlan', () => {
     expect(plan).not.toContain('"apiKey"');
     expect(plan).toContain('"projectId"');
   });
+
+  it('tells the agent to narrate the plan to the user before starting', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('tell the user the plan');
+  });
+
+  it('documents the stale-key verdict in step 3', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('`stale-key`');
+  });
+
+  it('forbids committing .env and wires the envIgnoredByGit signal', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('never stage or commit it');
+    expect(plan).toContain('"envIgnoredByGit": false');
+    expect(plan).toContain('do not edit `.gitignore` yourself');
+    expect(plan).not.toContain('Keep the diff small');
+  });
 });

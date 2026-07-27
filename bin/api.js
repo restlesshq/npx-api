@@ -9,7 +9,8 @@ import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
-import { resolveProjectDirs, findGitRoot } from '../lib/project.js';
+import { resolveProjectDirs, findGitRoot, isGitIgnored } from '../lib/project.js';
+import { countOperations } from '../lib/oas-parse.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 import generateOas from '../steps/generate-oas.js';
 import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
@@ -24,7 +25,7 @@ import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey } from '../steps/prepare-account.js';
-import { generateWriteKey, ensureProject, loadProjectCreds } from '../lib/project-init.js';
+import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
@@ -371,7 +372,7 @@ function printHelp() {
     ['guide [oas|sdk]', 'Print the instructions for writing the spec / wiring the SDK'],
     ['key', 'Register the project and put RESTLESS_KEY in .env'],
     ['register --oas <f>', 'Record a spec in .restless/settings.json'],
-    ['verify --url <u>', 'Send one request and report whether the SDK saw it'],
+    ['verify --url <u>', 'Send one request, confirm the SDK saw it and the log landed'],
     ['login', 'Print the URL the user opens to claim the project'],
   ];
   const agentWidth = Math.max(...agentRows.map(([name]) => name.length));
@@ -983,9 +984,12 @@ if (command === '--version' || command === '-v' || command === 'version') {
   }
 
   const rel = envFile ? path.relative(keyPkgDir, envFile) : null;
+  // Whether a naive `git add -A` would stage the key. true = safe, false =
+  // it would, null = no git here so the question doesn't apply.
+  const envIgnoredByGit = envFile ? isGitIgnored(envFile, keyRoot) : null;
   if (asJson) {
     const payload = {
-      ok: true, projectId, envFile: rel, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
+      ok: true, projectId, envFile: rel, envIgnoredByGit, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
     };
     // The plaintext key reaches stdout only when --inline asked for exactly
     // that. In the default flow it's already in .env; echoing it again would
@@ -997,6 +1001,9 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log(`  ${green('✓')} ${reusedProject ? 'Using the project from your last setup' : 'Project registered'} ${dim(`(${projectId})`)}.`);
     if (rel) console.log(`  ${green('✓')} ${existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to'} ${bold(rel)}.`);
     else console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    if (envIgnoredByGit === false) {
+      console.log(`  ${yellow('!')} ${bold(rel)} is ${bold('not')} ignored by git - add it to ${bold('.gitignore')} before you commit.`);
+    }
     console.log('');
     console.log(dim(`  Keep this key out of source control. Restart your server so it picks it up.`));
     console.log('');
@@ -1047,9 +1054,9 @@ if (command === '--version' || command === '-v' || command === 'version') {
   });
   saveSettings(regRoot, settings);
 
-  const paths = Object.keys(oasDoc?.paths || {}).length;
+  const ops = countOperations(oasDoc);
   console.log('');
-  console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${paths} path${paths === 1 ? '' : 's'})`)}.`);
+  console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${ops} endpoint${ops === 1 ? '' : 's'})`)}.`);
   console.log(`  ${dim(`.restless/settings.json now points at ${oasRel}. Commit .restless/ with your code.`)}`);
   console.log('');
   await debug.flushAndExit(0);
@@ -1064,6 +1071,10 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const pathFlag = flagValue('--path') || '/';
   const base = normalizeBaseUrl(urlFlag) || urlFlag;
   const target = `${base}${pathFlag.startsWith('/') ? '' : '/'}${pathFlag}`;
+
+  // Taken before the probe fires; the 15s back-window absorbs clock skew and
+  // the SDK's upload batching, same as the guided test step.
+  const since = new Date(Date.now() - 15000).toISOString();
 
   let raw = null;
   try {
@@ -1084,8 +1095,29 @@ if (command === '--version' || command === '-v' || command === 'version') {
     result.state = diag.state;
     result.status = parseStatus(raw);
     if (diag.requestId) result.requestId = diag.requestId;
-    const { guidance } = diag.state === 'ok' ? {} : fixContext(diag.state, { localBase: base });
-    if (guidance) result.fix = guidance;
+
+    // Second half of the verdict. A clean header only proves the SDK
+    // captured the request; a log arriving in the registered project proves
+    // the key maps where this setup thinks it does. Nothing landing after a
+    // clean header is the stale-key signature - the exact failure that used
+    // to sail through this command and surface as an empty dashboard.
+    // `landed: null` = no registered project to poll, header is all we have.
+    if (diag.state === 'ok') {
+      const { rootDir: verifyRoot } = resolveProjectDirs(process.cwd());
+      const entry = loadSettings(verifyRoot).apis?.find((a) => a.projectId) || null;
+      const creds = entry?.projectId ? loadProjectCreds(entry.projectId) : null;
+      if (creds?.setupKey) {
+        result.landed = await pollForLandedLog({ projectId: entry.projectId, setupKey: creds.setupKey, since });
+        if (!result.landed) result.state = 'stale-key';
+      } else {
+        result.landed = null;
+      }
+    }
+
+    if (result.state !== 'ok') {
+      const { guidance } = fixContext(result.state, { localBase: base, cli: CLI_NAME });
+      if (guidance) result.fix = guidance;
+    }
   }
   result.ok = result.state === 'ok';
 
@@ -1096,6 +1128,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log('');
     console.log(`  ${desc.icon}  ${desc.lines[0]}`);
     for (const l of desc.lines.slice(1)) console.log(`     ${l}`);
+    if (result.landed) console.log(`     ${green('✓')} The log landed in your project too.`);
     if (result.status) console.log(dim(`     (HTTP ${result.status} - a rejected request still counts, as long as the SDK saw it.)`));
     console.log('');
   }

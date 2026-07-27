@@ -27,13 +27,14 @@ that shouldn't be improvised:
 | `npx api guide [oas\|sdk]` | Prints the spec-writing / SDK-wiring instructions |
 | `npx api key` | Registers the project and writes `RESTLESS_KEY` to `.env` |
 | `npx api register --oas <file>` | Records a spec in `.restless/settings.json` |
-| `npx api verify --url <url>` | Sends one request, reports whether the SDK saw it |
+| `npx api verify --url <url>` | Sends one request, confirms the SDK saw it and the log landed |
 | `npx api login` | Prints the URL you open to claim the project |
 
 Re-running is safe: an unchanged key keeps its existing project rather than
 registering a new one. `npx api key` writes the key straight to `.env` and never
 echoes it into the agent's transcript; pass `--inline` if you explicitly want it
-on stdout instead.
+on stdout instead. It also reports whether git ignores that env file
+(`envIgnoredByGit`), so the key can't slip into a commit unnoticed.
 
 Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set

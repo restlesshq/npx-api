@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { findGitRoot, resolveProjectDirs, relativePackagePath } from '../lib/project.js';
+import { findGitRoot, resolveProjectDirs, relativePackagePath, isGitIgnored } from '../lib/project.js';
 
 describe('findGitRoot', () => {
   it('finds the git root when inside a git repo', () => {
@@ -101,5 +101,30 @@ describe('relativePackagePath', () => {
 
   it('returns relative path from root to package', () => {
     expect(relativePackagePath('/foo', '/foo/packages/api')).toBe('packages/api');
+  });
+});
+
+describe('isGitIgnored', () => {
+  it('distinguishes ignored from unignored files in a repo', () => {
+    const tmpDir = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
+    execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+    // Neutralize any global excludes file - a developer machine that
+    // globally ignores `.env*` would otherwise flip the .env.local case.
+    execSync('git config core.excludesFile /dev/null', { cwd: tmpDir, stdio: 'pipe' });
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), '.env\n');
+    fs.writeFileSync(path.join(tmpDir, '.env'), 'RESTLESS_KEY=x\n');
+    fs.writeFileSync(path.join(tmpDir, '.env.local'), 'RESTLESS_KEY=x\n');
+
+    expect(isGitIgnored(path.join(tmpDir, '.env'), tmpDir)).toBe(true);
+    expect(isGitIgnored(path.join(tmpDir, '.env.local'), tmpDir)).toBe(false);
+
+    execSync(`rm -rf "${tmpDir}"`);
+  });
+
+  it('returns null outside a git repo', () => {
+    const tmpDir = fs.realpathSync(execSync('mktemp -d', { encoding: 'utf8' }).trim());
+    fs.writeFileSync(path.join(tmpDir, '.env'), 'x\n');
+    expect(isGitIgnored(path.join(tmpDir, '.env'), tmpDir)).toBe(null);
+    execSync(`rm -rf "${tmpDir}"`);
   });
 });
