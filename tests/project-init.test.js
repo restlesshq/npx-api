@@ -171,3 +171,49 @@ describe('pollForLandedLog', () => {
     expect(landed).toBe(false);
   });
 });
+
+describe('findCredsByApiKey / key recovery', () => {
+  it('finds the creds this machine saved for a key', () => {
+    mod.saveProjectCreds({ projectId: 'p-1', setupKey: 's-1', apiKey: 'rstlss_a' });
+    expect(mod.findCredsByApiKey('rstlss_a')).toMatchObject({ projectId: 'p-1', setupKey: 's-1' });
+    expect(mod.findCredsByApiKey('rstlss_other')).toBe(null);
+    expect(mod.findCredsByApiKey(null)).toBe(null);
+  });
+
+  it('prefers the OLDEST registration when one key maps to several projects', () => {
+    // The duplicate mapping is exactly the orphan bug: ingress routes the
+    // key's uploads to the first project registered for it.
+    const dir = path.join(home, '.restless', 'projects');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'p-old.json'), JSON.stringify({
+      projectId: 'p-old', setupKey: 's-old', apiKey: 'rstlss_dup', savedAt: '2026-07-25T00:00:00.000Z',
+    }));
+    fs.writeFileSync(path.join(dir, 'p-new.json'), JSON.stringify({
+      projectId: 'p-new', setupKey: 's-new', apiKey: 'rstlss_dup', savedAt: '2026-07-26T00:00:00.000Z',
+    }));
+    expect(mod.findCredsByApiKey('rstlss_dup')).toMatchObject({ projectId: 'p-old' });
+  });
+
+  it('ensureProject adopts local creds when settings has no projectId', async () => {
+    // The Greg scenario: key on disk from an earlier run, fresh settings.
+    mod.saveProjectCreds({ projectId: 'p-orig', setupKey: 's-orig', apiKey: 'rstlss_k' });
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'One', rootDir: '.' }] });
+
+    const fetchImpl = vi.fn(); // must never be called - recovery is local
+    const res = await mod.ensureProject({ rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_k', fetchImpl });
+    expect(res).toMatchObject({ projectId: 'p-orig', setupKey: 's-orig', reused: true, recovered: true });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis[0].projectId).toBe('p-orig');
+  });
+
+  it('ensureProject returns null for an unknown key when registerUnknown is false', async () => {
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'One', rootDir: '.' }] });
+    const fetchImpl = vi.fn();
+    const res = await mod.ensureProject({
+      rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_mystery', registerUnknown: false, fetchImpl,
+    });
+    expect(res).toBe(null);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});

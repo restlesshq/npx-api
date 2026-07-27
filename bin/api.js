@@ -24,7 +24,7 @@ import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
-import { findExistingEnvFile, existingRestlessKey } from '../steps/prepare-account.js';
+import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
 import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-url.js';
@@ -970,19 +970,36 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // server sends its logs to a project nobody is looking at.
   const existingEnvFile = findExistingEnvFile(apiDir, keyRoot);
   const existingKey = existingEnvFile ? existingRestlessKey(existingEnvFile) : null;
-  const apiKey = existingKey || generateWriteKey();
+  let apiKey = existingKey || generateWriteKey();
 
-  let projectId, reusedProject;
+  // An on-disk key is only reusable when we can prove which project it
+  // belongs to - settings, or the creds this machine saved when it first
+  // registered it. Re-registering an unproven key mints a project that
+  // ingress will never route the key's uploads to (the unrecoverable
+  // stale-key state), so an unrecognized key gets replaced instead.
+  let result = null;
+  let replacedStaleKey = false;
   try {
-    ({ projectId, reused: reusedProject } = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey }));
+    if (existingKey) {
+      result = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey, registerUnknown: false });
+      if (!result) {
+        apiKey = generateWriteKey();
+        replacedStaleKey = true;
+      }
+    }
+    if (!result) result = await ensureProject({ rootDir: keyRoot, apiRootDir, apiKey });
   } catch (err) {
     if (asJson) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
     else console.log(red(`\n  ✗ ${err.message}\n`));
     await debug.flushAndExit(1);
   }
+  const { projectId, reused: reusedProject, recovered: recoveredProject } = result;
 
   let envFile = null;
-  if (!inline && !existingKey) {
+  if (!inline && replacedStaleKey) {
+    envFile = existingEnvFile;
+    replaceRestlessKey(existingEnvFile, apiKey);
+  } else if (!inline && !existingKey) {
     envFile = existingEnvFile || path.join(apiDir, '.env');
     const line = `RESTLESS_KEY=${apiKey}`;
     if (existingEnvFile) safeAppendFileSync(envFile, `\n${line}\n`);
@@ -997,7 +1014,11 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const envIgnoredByGit = envFile ? isGitIgnored(envFile, keyRoot) : null;
   if (asJson) {
     const payload = {
-      ok: true, projectId, envFile: rel, envIgnoredByGit, reusedExistingKey: !!existingKey, reusedProject: !!reusedProject,
+      ok: true, projectId, envFile: rel, envIgnoredByGit,
+      reusedExistingKey: !!existingKey && !replacedStaleKey,
+      reusedProject: !!reusedProject,
+      ...(recoveredProject && { recoveredProject: true }),
+      ...(replacedStaleKey && { replacedStaleKey: true }),
     };
     // The plaintext key reaches stdout only when --inline asked for exactly
     // that. In the default flow it's already in .env; echoing it again would
@@ -1006,9 +1027,21 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log(JSON.stringify(payload, null, 2));
   } else {
     console.log('');
-    console.log(`  ${green('✓')} ${reusedProject ? 'Using the project from your last setup' : 'Project registered'} ${dim(`(${projectId})`)}.`);
-    if (rel) console.log(`  ${green('✓')} ${existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to'} ${bold(rel)}.`);
-    else console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    if (replacedStaleKey) {
+      console.log(`  ${yellow('!')} The RESTLESS_KEY already in ${bold(rel || '.env')} doesn't match any project this`);
+      console.log(`    machine set up, and re-registering an old key splits logs across projects.`);
+    }
+    const projectLine = recoveredProject
+      ? 'Re-adopted the project this key was first registered to'
+      : reusedProject ? 'Using the project from your last setup' : 'Project registered';
+    console.log(`  ${green('✓')} ${projectLine} ${dim(`(${projectId})`)}.`);
+    if (rel) {
+      const keyLine = replacedStaleKey ? 'Minted a fresh key and updated'
+        : existingKey ? 'Using the key already in' : 'Wrote RESTLESS_KEY to';
+      console.log(`  ${green('✓')} ${keyLine} ${bold(rel)}.`);
+    } else {
+      console.log(`  ${bold('RESTLESS_KEY')}=${apiKey}`);
+    }
     if (envIgnoredByGit === false) {
       console.log(`  ${yellow('!')} ${bold(rel)} is ${bold('not')} ignored by git - add it to ${bold('.gitignore')} before you commit.`);
     }

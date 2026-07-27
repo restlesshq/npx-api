@@ -175,3 +175,30 @@ describe('resolveApiDir', () => {
     expect(resolveApiDir(root, 'src')).toBe(root);
   });
 });
+
+describe('replaceRestlessKey', () => {
+  it('swaps only the RESTLESS_KEY line, preserving the rest', async () => {
+    const { replaceRestlessKey } = await import('../steps/prepare-account.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replace-key-'));
+    const { setGitRoot } = await import('../lib/pathGuard.js');
+    setGitRoot(dir);
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'PORT=3001\nRESTLESS_KEY=rstlss_old\nOTHER=1\n');
+
+    expect(replaceRestlessKey(envPath, 'rstlss_new')).toBe(true);
+    expect(fs.readFileSync(envPath, 'utf8')).toBe('PORT=3001\nRESTLESS_KEY=rstlss_new\nOTHER=1\n');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns false when no RESTLESS_KEY line exists', async () => {
+    const { replaceRestlessKey } = await import('../steps/prepare-account.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replace-key-'));
+    const { setGitRoot } = await import('../lib/pathGuard.js');
+    setGitRoot(dir);
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'PORT=3001\n');
+    expect(replaceRestlessKey(envPath, 'rstlss_new')).toBe(false);
+    expect(fs.readFileSync(envPath, 'utf8')).toBe('PORT=3001\n');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

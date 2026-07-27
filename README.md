@@ -31,10 +31,14 @@ that shouldn't be improvised:
 | `npx api login` | Prints the URL you open to claim the project |
 
 Re-running is safe: an unchanged key keeps its existing project rather than
-registering a new one. `npx api key` writes the key straight to `.env` and never
-echoes it into the agent's transcript; pass `--inline` if you explicitly want it
-on stdout instead. It also reports whether git ignores that env file
-(`envIgnoredByGit`), so the key can't slip into a commit unnoticed.
+registering a new one - even when `.restless/` is gone, `npx api key` re-adopts
+the project this machine first registered the key to, and if the key on disk
+can't be matched to any known project it mints a fresh key (replacing the `.env`
+line) instead of re-registering the old one into a project its logs would never
+reach. It writes the key straight to `.env` and never echoes it into the agent's
+transcript; pass `--inline` if you explicitly want it on stdout instead. It also
+reports whether git ignores that env file (`envIgnoredByGit`), so the key can't
+slip into a commit unnoticed.
 
 Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set
