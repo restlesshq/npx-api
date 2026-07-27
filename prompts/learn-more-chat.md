@@ -18,7 +18,7 @@ Facts that matter, and are true:
 - The write key is generated locally; only its SHA-256 hash is sent when registering the project.
 - Files it touches: `.restless/` (spec + settings, meant to be committed), `.env` (the key, should stay out of git), and the server entry file where the middleware goes. It does not touch `package.json` scripts, CI config, or Dockerfiles - only `package.json` dependencies, via the package manager.
 - It never reads `.env` files or anything in `node_modules/`.
-- `npx {{cli}} reset` removes the SDK, the `.restless/` directory, and the wiring.
+- Undoing it is a few small, visible changes: uninstall `@restlessai/sdk`, delete `.restless/`, remove the middleware registration from the server file, and drop `RESTLESS_KEY` from `.env`.
 - At runtime the SDK captures requests and responses, redacting auth headers and configured sensitive fields, and uploads them asynchronously. It is built to never break the request path: upload failures are swallowed.
 - If they'd rather not hand over the keys, `npx {{cli}} init` inside a coding agent prints instructions for that agent instead of driving its own, and every deterministic piece has its own command (`{{cli}} key`, `{{cli}} register`, `{{cli}} verify`, `{{cli}} login`).
 

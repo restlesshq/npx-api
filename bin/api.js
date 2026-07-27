@@ -356,7 +356,6 @@ function printHelp() {
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Edit project settings and sync them to the dashboard'],
     ['skill <docs-url>', 'Install an API skill into Claude Code'],
-    ['reset', 'Remove Restless from this project'],
     ['help', 'Show this help'],
     ['--version', 'Print the installed CLI version'],
   ];
@@ -637,7 +636,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       console.log('');
       console.log(`  The short version: we read your code locally to write an OpenAPI spec and`);
       console.log(`  wire in the SDK. Nothing is uploaded until the last step, when you sign in`);
-      console.log(`  to claim the project. ${bold(`npx ${CLI_NAME} reset`)} undoes all of it.`);
+      console.log(`  to claim the project.`);
       console.log('');
       await debug.flushAndExit(0);
     }
@@ -712,7 +711,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log('');
     console.log(`  ${green('5.')} ${bold('Claim the project:')} ${cyan(`npx ${CLI_NAME} login`)}`);
     console.log('');
-    console.log(dim(`  Stuck? ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} does all of this for you, and ${bold(`npx ${CLI_NAME} reset`)}${'\x1b[2m'} undoes it.`));
+    console.log(dim(`  Stuck? ${bold(`npx ${CLI_NAME} init`)}${'\x1b[2m'} does all of this for you.`));
     console.log('');
     await debug.flushAndExit(0);
   }
