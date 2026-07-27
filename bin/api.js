@@ -1292,8 +1292,10 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log(`  ${cyan(loginUrl)}`);
     if (isAgent()) {
       console.log('');
-      console.log(dim('  Hand this link to the user as the LAST line of your summary - it is their'));
-      console.log(dim('  next action, and a recap below it buries it.'));
+      console.log(dim('  Setup is NOT finished until your user opens this link. The project stays'));
+      console.log(dim('  unclaimed and invisible to them until then, and the link goes stale after a'));
+      console.log(dim('  few hours. Tell them that in plain words, and make the link the LAST line'));
+      console.log(dim('  of your summary - it is their one next action, and a recap below buries it.'));
     }
     console.log('');
   }

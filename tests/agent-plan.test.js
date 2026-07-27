@@ -144,6 +144,13 @@ describe('buildAgentPlan', () => {
     expect(plan).toContain('Uploads the spec and settings');
   });
 
+  it('makes the claim step non-optional in plain words', () => {
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
+    expect(plan).toContain('Nothing you did counts until the user opens that link');
+    expect(plan).toContain('You must open this link to finish the');
+    expect(plan).toContain('the one step');
+  });
+
   it('tells the agent to narrate the plan to the user before starting', () => {
     const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'Claude Code' });
     expect(plan).toContain('tell the user the plan');
