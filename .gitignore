@@ -4,5 +4,8 @@ node_modules/
 # Internal backlog
 TODO.md
 
+# Claude-only notes, never shipped
+.local/
+
 # Local publish helper
 publish.sh
