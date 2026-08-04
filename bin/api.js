@@ -6,13 +6,13 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen, setLogoSubtitle, isAbortKey } from '../lib/ui.js';
 import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs, findGitRoot, isGitIgnored } from '../lib/project.js';
 import { countOperations } from '../lib/oas-parse.js';
 import { setGitRoot } from '../lib/pathGuard.js';
-import { setLogoSubtitle, withSuppressedOutput, isAbortKey } from '../lib/ui.js';
+import { flagValue, positionalArg } from '../lib/args.js';
 import generateOas from '../steps/generate-oas.js';
 import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
 import installSdk, { resolveInstallDir } from '../steps/install-sdk.js';
@@ -21,30 +21,12 @@ import verifyOwnerId from '../steps/verify-owner-id.js';
 import finalChecks from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
-import updateOas, {
-  AUTO_CHECK_KINDS,
-  applySpecChange,
-  checkForSpecChanges,
-  cleanRefreshTemp,
-  compareWithDashboard,
-  guardRefreshTemp,
-  releaseRefreshTemp,
-  describeCheck,
-  describeDashboardGap,
-  fetchDashboardSpec,
-  pushOas,
-  pushSettings,
-  readCurrentSpec,
-  recordPushedFingerprint,
-  recordSpec,
-} from '../steps/update-oas.js';
-import { describeOasSource, hashOasFile } from '../lib/oas-source.js';
+import runInteractiveUpdate from '../steps/update-interactive.js';
 import runFlagUpdate, { parseUpdateFlags, UPDATE_FLAGS } from '../steps/update-flags.js';
-import { getCliToken, clearCachedToken, loadCachedToken } from '../lib/cli-token.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
-import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix, validateApiField, REQUEST_PREFIX_RE } from '../lib/settings.js';
+import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
@@ -338,19 +320,6 @@ function copyToClipboard(text) {
     } catch {}
   }
   return false;
-}
-
-/**
- * Read `--flag value` off argv. Returns null when the flag is absent or is
- * the last argument (so `--dir` with nothing after it doesn't swallow the
- * next flag as its value).
- */
-function flagValue(flag) {
-  const i = process.argv.indexOf(flag);
-  if (i === -1) return null;
-  const val = process.argv[i + 1];
-  if (!val || val.startsWith('--')) return null;
-  return val;
 }
 
 function readVersion() {
@@ -985,7 +954,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // which is not something a calling agent should improvise.
   const asJson = process.argv.includes('--json');
   const inline = process.argv.includes('--inline');
-  const dirFlag = flagValue('--dir');
+  const dirFlag = flagValue(process.argv, '--dir');
 
   // --inline exists so a HUMAN can place the key themselves. An agent has
   // no use for the plaintext (the key goes into .env and the SDK reads it
@@ -1096,7 +1065,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // ── npx api register --oas <file> [--dir <d>] [--name <n>] ────────
   // Record a spec an agent just wrote into `.restless/settings.json`, which
   // is what the SDK reads at startup and what later commands look up.
-  const oasFlag = flagValue('--oas');
+  const oasFlag = flagValue(process.argv, '--oas');
   if (!oasFlag) {
     console.log(red('\n  ✗ Missing --oas <file>.\n'));
     console.log(`  Usage: ${cyan(`npx ${CLI_NAME} register --oas .restless/openapi.json --dir api --name "My API"`)}\n`);
@@ -1133,8 +1102,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
-  const apiRootDir = flagValue('--dir') || '.';
-  const name = flagValue('--name') || oasDoc?.info?.title || path.basename(regRoot);
+  const apiRootDir = flagValue(process.argv, '--dir') || '.';
+  const name = flagValue(process.argv, '--name') || oasDoc?.info?.title || path.basename(regRoot);
   const oasRel = path.relative(regRoot, oasAbs);
   const settings = loadSettings(regRoot);
   const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
@@ -1170,8 +1139,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // the verdict comes from headers the SDK sets, not from the status code -
   // a captured 401 is a pass, and that trips people (and agents) up.
   const asJson = process.argv.includes('--json');
-  const urlFlag = flagValue('--url') || 'http://localhost:3000';
-  const pathFlag = flagValue('--path') || '/';
+  const urlFlag = flagValue(process.argv, '--url') || 'http://localhost:3000';
+  const pathFlag = flagValue(process.argv, '--path') || '/';
   const base = normalizeBaseUrl(urlFlag) || urlFlag;
   const target = `${base}${pathFlag.startsWith('/') ? '' : '/'}${pathFlag}`;
 
@@ -2000,21 +1969,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
 } else if (command === 'update') {
   // ── npx api update [projectId] ────────────────────────────────────
-  // Post-claim editor. Lets the user edit a handful of safe fields
-  // (name, base URL, visibility, request-id prefix) via the same
-  // input helpers the setup flow uses, then uploads the resulting
-  // `.restless/settings.json` blob to the site so the dashboard's
-  // "settings last synced" timestamp + any UI that reads from the
-  // blob stay current.
+  // Post-claim editor. Refreshes the spec (from wherever it came from)
+  // and edits a handful of safe fields, then pushes both to the
+  // dashboard.
   //
-  // The optional positional argument scopes the run to one project
-  // by its `projectId` so multi-API repos can skip the picker.
-  //
-  // Auth: hashes RESTLESS_KEY from .env and sends the digest to
-  // `POST /api/projects/<projectId>/sync`. First sync per project
-  // stamps `Project.writeKeyHash`; every later sync must match.
+  // This block only resolves WHICH project and WHO is driving; the
+  // flows themselves live in steps/, like every other command's do.
   const cwd = process.cwd();
-  const { rootDir: updateRoot } = resolveProjectDirs(cwd);
+  const { rootDir: updateRoot, packageDir: updatePkgDir } = resolveProjectDirs(cwd);
   // Every screen below is drawn with the logo, whose second row names the
   // running command. Left unset it claimed to be `init`.
   setLogoSubtitle(`npx ${CLI_NAME} update`);
@@ -2030,17 +1992,27 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
-  // Optional positional arg: `npx api update <projectId>`. When
-  // present, we skip the picker - useful for multi-API repos where
-  // someone already knows which one they're editing (e.g. the
-  // dashboard's settings page deep-links a copy command with the
-  // project id baked in).
-  // Positional, or `--project <id>`. The positional must not swallow a flag:
-  // `update --base-url https://x` would otherwise look up a project called
-  // "--base-url" and fail with a confusing "no API with that projectId".
-  const positionalProjectId =
-    process.argv[3] && !process.argv[3].startsWith('-') ? process.argv[3] : null;
-  const requestedProjectId = flagValue('--project') || positionalProjectId;
+  // How the flags were given, read once. `errors` means a flag was given
+  // wrongly - a value flag with nothing after it used to be silently
+  // indistinguishable from not passing it at all, so `update --base-url`
+  // reported success having changed nothing.
+  const parsedFlags = parseUpdateFlags(process.argv);
+  if (parsedFlags.errors) {
+    console.log('');
+    for (const err of parsedFlags.errors) console.log(red(`  ✗ ${err}`));
+    console.log('');
+    console.log(dim(`  Run ${cyan(`npx ${CLI_NAME} help`)} for the full flag list.`));
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+  const updateFlags = parsedFlags.flags;
+
+  // Which project. Positional, or `--project <id>`. The positional must not
+  // swallow a flag: `update --base-url https://x` would otherwise look up a
+  // project called "--base-url" and fail with a confusing "no API with that
+  // projectId".
+  const requestedProjectId =
+    flagValue(process.argv, '--project') || positionalArg(process.argv, 3);
   let chosenApi;
   if (requestedProjectId) {
     chosenApi = updateSettings.apis.find((a) => a.projectId === requestedProjectId);
@@ -2060,7 +2032,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     }
   } else if (updateSettings.apis.length === 1) {
     chosenApi = updateSettings.apis[0];
-  } else {
+  } else if (isInteractive()) {
     const labels = updateSettings.apis.map((a) => ({
       label: a.name || a.rootDir || a.id || '(unnamed)',
       hint: a.projectId ? dim(a.projectId) : '',
@@ -2070,6 +2042,17 @@ if (command === '--version' || command === '-v' || command === 'version') {
       defaultIndex: 0,
     });
     chosenApi = updateSettings.apis[idx];
+  } else {
+    // No TTY to pick with, and guessing which project a flag-driven run meant
+    // is the one mistake here that is expensive to undo.
+    console.log('');
+    console.log(red(`  ✗ This workspace has ${updateSettings.apis.length} APIs and no TTY to pick one.`));
+    console.log(dim(`  Add ${cyan('--project <id>')}:`));
+    for (const a of updateSettings.apis.filter((x) => x.projectId)) {
+      console.log(`    ${dim('•')} ${a.projectId} ${dim(`(${a.name || a.rootDir})`)}`);
+    }
+    console.log('');
+    await debug.flushAndExit(1);
   }
 
   if (!chosenApi?.projectId) {
@@ -2081,12 +2064,13 @@ if (command === '--version' || command === '-v' || command === 'version') {
   }
 
   // ── No TTY and no directive ────────────────────────────────────────
-  // Same stance `init` takes: don't self-drive. Every screen below needs
-  // a TTY, and a non-interactive picker silently answers with its default
-  // - so a bare `update` under an agent or in CI would appear to do
-  // something while actually editing nothing. Report the state and hand
-  // over the flags instead. `--status` is read-only, so lead with it.
-  if (!isInteractive() && !parseUpdateFlags(process.argv)) {
+  // Same stance `init` takes: don't self-drive. Every screen in the
+  // interactive flow needs a TTY, and a non-interactive picker silently
+  // answers with its default - so a bare `update` under an agent or in CI
+  // would appear to do something while actually editing nothing. Report the
+  // state and hand over the flags instead. `--status` is read-only, so lead
+  // with it.
+  if (!isInteractive() && !updateFlags) {
     const agent = detectAgent();
     const who = agent === 'codex' ? 'Codex' : agent === 'claude' ? 'Claude Code' : 'no terminal';
     console.log('');
@@ -2110,552 +2094,26 @@ if (command === '--version' || command === '-v' || command === 'version') {
     console.log(`  ${dim('Pushing needs a browser-approved session. Without one the edits still save')}`);
     console.log(`  ${dim(`locally and the JSON reports ${bold('synced: false')} with the reason - that is not a failure.`)}`);
     console.log('');
-    debug.log('update.agent-plan', { agent: detectAgent(), projectId: chosenApi.projectId });
+    debug.log('update.agent-plan', { agent, projectId: chosenApi.projectId });
     await debug.flushAndExit(0);
   }
 
-  // ── Flag-driven run ───────────────────────────────────────────────
-  // Any of the update flags means "do exactly this, don't ask me", which
-  // is the only form a coding agent or a CI job can drive - the pickers
-  // below need a TTY. Nothing in that path prompts, and local edits are
-  // saved before the push so a sync failure never discards them.
-  const updateFlags = parseUpdateFlags(process.argv);
-  if (updateFlags) {
-    const { packageDir: flagPkgDir } = resolveProjectDirs(cwd);
-    const code = await runFlagUpdate({
+  // ── Run it ─────────────────────────────────────────────────────────
+  // Flags mean "do exactly this, don't ask me", which is the only form a
+  // coding agent or a CI job can drive. Otherwise there is a human here.
+  const updateCode = updateFlags
+    ? await runFlagUpdate({
       rootDir: updateRoot,
-      packageDir: flagPkgDir,
+      packageDir: updatePkgDir,
       apiEntry: chosenApi,
       flags: updateFlags,
-    });
-    await debug.flushAndExit(code);
-  }
-
-  // Helper: clear the viewport + scrollback and reprint the logo +
-  // "Editing X / projectId" header. Called before every picker
-  // iteration so the screen doesn't accumulate stale renders from
-  // previous edits + sub-prompts. Same clear-home sequence the
-  // `init` flow uses between screens.
-  function repaintHeader() {
-    clearScreen();
-    console.log('');
-    printLogo();
-    console.log('');
-    const projectName = chosenApi.name || chosenApi.rootDir || 'this project';
-    console.log(`  ${bold('Editing')} ${cyan(projectName)}`);
-    console.log(dim(`  ${chosenApi.projectId}`));
-    console.log('');
-  }
-
-  // Shared tail for "the spec is settled, now publish it". Used by the
-  // up-front confirm and by the explicit spec flow below.
-  async function pushSpecAndSettings(oasFile) {
-    const tokenRes = await getCliToken({ projectId: chosenApi.projectId, interactive: isInteractive() });
-    if (!tokenRes.ok) {
-      // Everything is already saved locally, so this is a partial success.
-      console.log('');
-      console.log(`  ${yellow('!')} Saved locally but not synced: ${tokenRes.error}`);
-      console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)} to authorize and sync.`));
-      console.log('');
-      return 0;
-    }
-    console.log('');
-    if (oasFile) {
-      console.log(dim(`  Pushing ${oasFile} to ${SITE_URL}...`));
-      const push = await pushOas({
-        rootDir: updateRoot, oasFile, projectId: chosenApi.projectId, token: tokenRes.token,
-      });
-      if (!push.ok) {
-        if (push.expired) clearCachedToken(chosenApi.projectId);
-        console.log(`  ${red('✗')} ${push.error}`);
-        console.log(dim(`  Your local ${oasFile} is saved - re-run to retry the push.`));
-        console.log('');
-        return 1;
-      }
-      // Fingerprint what actually landed, so the next run can tell a local
-      // edit from "nothing has happened since".
-      recordPushedFingerprint({ rootDir: updateRoot, apiEntry: chosenApi, oasFile });
-      console.log(`  ${green('✓')} Spec synced${push.endpoints !== null ? dim(` (${push.endpoints} endpoints)`) : ''}.`);
-    }
-    const synced = await pushSettings({
-      rootDir: updateRoot, projectId: chosenApi.projectId, token: tokenRes.token,
-    });
-    if (!synced.ok) {
-      if (synced.expired) clearCachedToken(chosenApi.projectId);
-      console.log(`  ${red('✗')} ${synced.error}`);
-      console.log('');
-      return 1;
-    }
-    console.log(`  ${green('✓')} Settings synced.`);
-    console.log('');
-    return 0;
-  }
-
-  // What the up-front check found, shown above the menu rather than on a
-  // screen of its own. Empty when there was nothing to check.
-  let checkNote = [];
-  // Set when the check already established which half of `update` is wanted,
-  // so the menu is skipped rather than asked redundantly.
-  let skipMenuTo = null;
-
-  // ── Up-front spec check ───────────────────────────────────────────
-  // When the spec can be re-checked instantly - a URL to re-fetch, or a
-  // file the developer maintains - the first thing worth saying is
-  // whether it changed. The old opening was a menu whose "Update OAS
-  // file" read as "regenerate with AI" no matter where the spec came
-  // from, which is exactly wrong for a spec we didn't write.
-  //
-  // Nothing reaches their spec here: a URL refresh downloads to a
-  // scratch file, and the move only happens after the confirm.
-  if (isInteractive() && chosenApi.oasFile && AUTO_CHECK_KINDS.has(chosenApi.oasSource?.kind)) {
-    repaintHeader();
-    const src = chosenApi.oasSource;
-    const { packageDir: checkPkgDir } = resolveProjectDirs(cwd);
-
-    // Name the file, then get on with it. How the spec is produced is our
-    // problem, not something to narrate: for a described source it's a
-    // paragraph about someone's build internals, and it tells them nothing
-    // they can act on.
-    console.log(`  ${bold(chosenApi.oasFile)}`);
-    console.log('');
-
-    // `describe` and `native` re-derive through an agent, so they can take
-    // tens of seconds - enough that a bare "Checking..." reads as a hang. Set
-    // the expectation without describing the mechanism.
-    const slow = src.kind === 'describe' || src.kind === 'native';
-    const spin = startSpinner(
-      slow ? 'Getting the latest spec, this can take a moment' : 'Getting the latest spec',
-    );
-    let check;
-    try {
-      // Suppressed: the refresh helpers narrate the scratch path they wrote to
-      // (".restless/.oas-refresh/openapi.json"), which is our bookkeeping, not
-      // something the developer chose or can act on. It would also land on top
-      // of the spinner's line.
-      check = await withSuppressedOutput(true, () =>
-        checkForSpecChanges({
-          rootDir: updateRoot, packageDir: checkPkgDir, apiEntry: chosenApi,
-        }));
-    } catch (err) {
-      check = { status: 'failed', reason: err.message };
-    } finally {
-      spin.stop();
-    }
-    // Also ask the dashboard what it has. Cached token only: forcing a browser
-    // login to answer a status question nobody asked for would be worse than
-    // saying less. Silent when we can't, since the local answer still stands.
-    let dashboardGap = [];
-    const cachedToken = loadCachedToken(chosenApi.projectId);
-    if (cachedToken) {
-      const remote = await fetchDashboardSpec({
-        projectId: chosenApi.projectId, token: cachedToken.token,
-      });
-      const cmp = compareWithDashboard({
-        localOas: readCurrentSpec(updateRoot, chosenApi.oasFile),
-        localHash: hashOasFile(path.join(updateRoot, chosenApi.oasFile)),
-        remote,
-      });
-      dashboardGap = describeDashboardGap(cmp);
-      debug.log('update.dashboard-compare', { status: cmp?.status ?? null, missing: cmp?.missing?.length ?? 0 });
-    }
-
-    debug.log('update.spec-check', { kind: src.kind, status: check.status });
-
-    if (check.status === 'changed') {
-      // A staged refresh exists from here until it is applied or dropped, and
-      // `.restless/` is a committed directory - so make sure abandoning the
-      // prompt can't leave it behind.
-      if (check.tempFile) guardRefreshTemp(updateRoot);
-      console.log('');
-      for (const line of describeCheck(check)) console.log(line);
-      // Both facts at once when both apply: the local file has moved AND the
-      // dashboard is behind. Pushing settles both, so they belong in one
-      // decision rather than two rounds.
-      if (dashboardGap.length) {
-        console.log('');
-        for (const line of dashboardGap) console.log(line);
-      }
-      console.log('');
-      const ok = await askYesNo(
-        `  ${bold('Update the spec and sync your settings?')} ${dim('(Y/n) ')}`,
-        { defaultValue: true },
-      );
-      if (ok) {
-        const oasFile = applySpecChange({ rootDir: updateRoot, check });
-        releaseRefreshTemp();
-        recordSpec({
-          rootDir: updateRoot, apiEntry: chosenApi, oasFile, oasSource: check.oasSource,
-        });
-        await debug.flushAndExit(await pushSpecAndSettings(oasFile));
-      }
-      // Declined: drop the staged download and carry on to the menu, where
-      // they can edit settings or choose a different spec instead.
-      cleanRefreshTemp(updateRoot);
-      releaseRefreshTemp();
-    } else if (dashboardGap.length) {
-      // The case that started all of this. The local spec is exactly right and
-      // nothing needs regenerating, but the dashboard is serving something
-      // older - so the only thing outstanding is the push. Saying "your spec
-      // is unchanged" here and stopping is what sent someone looking for a bug
-      // in the diff.
-      console.log('');
-      for (const line of dashboardGap) console.log(line);
-      console.log('');
-      console.log(`  ${dim(`Your local ${chosenApi.oasFile} is already up to date.`)}`);
-      console.log('');
-      const ok = await askYesNo(
-        `  ${bold('Push it to the dashboard?')} ${dim('(Y/n) ')}`,
-        { defaultValue: true },
-      );
-      if (ok) await debug.flushAndExit(await pushSpecAndSettings(chosenApi.oasFile));
-    } else if (check.status === 'unchanged') {
-      // Nothing to do, so end here rather than dropping into a menu nobody
-      // asked for. The exit is explicit: an unprompted `waitForKey()` is
-      // indistinguishable from a hang, which is how this read before.
-      //
-      // Settings keep an escape hatch, because `update` edits those too and an
-      // unchanged spec is the common case - exiting outright would make the
-      // settings editor unreachable exactly when you'd normally reach it.
-      console.log('');
-      console.log(`  ${green('✓')} Your spec is unchanged ${dim(`(${check.endpoints} endpoints)`)}.`);
-      if (cachedToken) {
-        console.log(`  ${green('✓')} Your dashboard is serving this version.`);
-      } else {
-        console.log(dim("  Not compared with the dashboard - this machine isn't authorized yet."));
-      }
-      console.log('');
-      console.log(
-        `  ${dim('Press')} ${bold('Enter')} ${dim('to exit, or')} ${bold('s')} ${dim('to edit settings.')}`,
-      );
-      const key = await waitForKey();
-      if (key !== 's' && key !== 'S') {
-        console.log('');
-        await debug.flushAndExit(0);
-      }
-      // Straight to the field editor: they named what they wanted, so making
-      // them pick it out of a menu first would be a wasted screen.
-      skipMenuTo = 0;
-    } else if (check.status === 'unknown') {
-      checkNote = [
-        `  ${dim(`${chosenApi.oasFile} has ${check.endpoints} endpoints.`)}`,
-        dim("  Can't compare with the dashboard until this machine is authorized."),
-      ];
-    } else {
-      checkNote = [
-        `  ${yellow('!')} Couldn't check your spec: ${check.reason}`,
-        dim('  You can still edit settings or point us at another spec.'),
-      ];
-    }
-  }
-
-  // ── Top-level menu ────────────────────────────────────────────────
-  // Two choices only - everything `update` does is either editing
-  // settings or changing the spec. Ctrl-C bails at any prompt; there's
-  // no explicit "cancel" option.
-  let topChoice = skipMenuTo;
-  if (topChoice === null) {
-    repaintHeader();
-    for (const line of checkNote) console.log(line);
-    if (checkNote.length) console.log('');
-    const specHint = chosenApi.oasSource
-      ? `Currently ${describeOasSource(chosenApi.oasSource)}`
-      : 'Re-scan your routes, or point us at a spec';
-    topChoice = await singleSelect(
-      [
-        { label: 'Update Settings', hint: 'Edit name, base URL, visibility, or request prefix' },
-        { label: 'Change the spec', hint: specHint },
-      ],
-      { message: 'What do you want to update?', defaultIndex: 0 },
-    );
-  }
-
-  if (topChoice === 1) {
-    // ── Update the spec ────────────────────────────────────────────
-    // Everything about what "refresh" means is decided from the
-    // recorded `oasSource`, inside the step. Here we only handle the
-    // parts the step shouldn't own: resolving the package dir, and
-    // pushing the result once the user has agreed to it.
-    const { packageDir: updatePkgDir } = resolveProjectDirs(cwd);
-    const oasResult = await updateOas({
+    })
+    : await runInteractiveUpdate({
       rootDir: updateRoot,
       packageDir: updatePkgDir,
       apiEntry: chosenApi,
     });
-
-    if (!oasResult.changed) {
-      console.log('');
-      await debug.flushAndExit(0);
-    }
-
-    await debug.flushAndExit(await pushSpecAndSettings(oasResult.oasFile));
-  }
-
-  // ── Field-editor flow ─────────────────────────────────────────────
-  // Each picker row is a field with its current value; navigating to
-  // one and pressing Enter opens an inline editor. Submit (distinct
-  // from the field rows) ends the loop and continues to the sync.
-  // Chat lets the developer describe a change in plain English; we
-  // hand the message + current settings to the AI provider and apply
-  // whatever JSON patch comes back, after a y/n confirm.
-  // Re-find the entry inside `updateSettings` so mutations
-  // propagate back into the structure we'll save + upload.
-  const apiEntry = updateSettings.apis.find((a) => a.projectId === chosenApi.projectId);
-
-  function visibilityOf(entry) {
-    // generate-oas writes either `internal: true` (internal API)
-    // or `internal: false` / unset (external/customer-facing).
-    return entry.internal === true ? 'Internal' : 'External';
-  }
-
-  function displayValue(value) {
-    if (value === undefined || value === null || value === '') return dim('-');
-    return String(value);
-  }
-
-  // Best-effort extraction of a single JSON object from a model
-  // response. Tolerates ```json fences, leading prose, trailing prose.
-  function parseJsonBlock(text) {
-    if (typeof text !== 'string') return null;
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    const raw = fenced ? fenced[1] : text;
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start < 0 || end <= start) return null;
-    try { return JSON.parse(raw.slice(start, end + 1)); } catch { return null; }
-  }
-
-  // AI-driven edit path. The user types a sentence; we ship the
-  // editable subset of settings + their message to the provider and
-  // expect a JSON patch back. The patch is validated, diffed, and
-  // only applied after an explicit y/n.
-  async function chatEdit() {
-    console.log('');
-    const msg = (await ask(
-      `  ${bold('What do you want to change?')} ${dim('(blank to cancel)')}\n  > `,
-    )).trim();
-    if (!msg) return;
-
-    const view = {
-      name: apiEntry.name ?? null,
-      baseUrl: apiEntry.baseUrl ?? null,
-      internal: apiEntry.internal === true,
-      requestIdPrefix: apiEntry.requestIdPrefix ?? null,
-    };
-    const prompt = loadPrompt('update-settings-chat', {
-      currentSettings: JSON.stringify(view, null, 2),
-      userMessage: msg,
-    });
-
-    let raw;
-    try {
-      raw = await runAI(prompt, updateRoot);
-    } catch (err) {
-      console.log('');
-      console.log(red(`  ✗ Couldn't reach the AI: ${err.message}`));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-
-    const parsed = parseJsonBlock(raw);
-    if (!parsed) {
-      console.log('');
-      console.log(red(`  ✗ The AI didn't return a JSON patch. Try rephrasing.`));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-    if (parsed.error) {
-      console.log('');
-      console.log(yellow(`  ! ${parsed.error}`));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-
-    const changes = parsed.changes && typeof parsed.changes === 'object' ? parsed.changes : {};
-    const violations = [];
-    for (const [k, v] of Object.entries(changes)) {
-      const err = validateApiField(k, v);
-      if (err) violations.push(err);
-    }
-    if (violations.length) {
-      console.log('');
-      console.log(red(`  ✗ Proposed change is invalid:`));
-      for (const v of violations) console.log(red(`    · ${v}`));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-
-    const keys = Object.keys(changes);
-    if (keys.length === 0) {
-      console.log('');
-      console.log(yellow(`  ! No changes proposed. ${parsed.summary || ''}`));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-
-    console.log('');
-    if (parsed.summary) console.log(`  ${bold(parsed.summary)}`);
-    console.log('');
-    for (const k of keys) {
-      const before = displayValue(apiEntry[k]);
-      const after = displayValue(changes[k]);
-      console.log(`    ${dim(k.padEnd(16))} ${before}  ${green('→')}  ${green(after)}`);
-    }
-    console.log('');
-    const ok = await askYesNo(`  Apply these changes? ${dim('(Y/n) ')}`, { defaultValue: true });
-    if (!ok) {
-      console.log(dim('  Skipped.'));
-      console.log(dim('  Press any key to continue.'));
-      await waitForKey();
-      return;
-    }
-
-    for (const k of keys) apiEntry[k] = changes[k];
-    saveSettings(updateRoot, updateSettings);
-  }
-
-  let lastIndex = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    // Clear + reprint logo/header at the top of every loop tick so
-    // each round of editing starts on a fresh screen. Without this,
-    // sub-prompts (Visibility selector, inline input) leave their
-    // output above the next picker render and the terminal fills up
-    // with stale state.
-    repaintHeader();
-    const result = await actionPicker(
-      [
-        { label: 'Name',           value: apiEntry.name },
-        { label: 'Base URL',       value: apiEntry.baseUrl },
-        { label: 'Visibility',     value: visibilityOf(apiEntry) },
-        { label: 'Request prefix', value: apiEntry.requestIdPrefix },
-      ],
-      {
-        message: 'Use ↑↓ to navigate, Enter to edit, Esc to exit:',
-        actions: [
-          { key: 'submit', label: 'Submit',          hint: 'Save & sync to the dashboard.', primary: true },
-          { key: 'chat',   label: 'Chat about this', afterthought: true },
-        ],
-        defaultIndex: lastIndex,
-      },
-    );
-
-    if (result.kind === 'action') {
-      if (result.key === 'submit') break;
-      if (result.key === 'chat') {
-        await chatEdit();
-        // Park the cursor on Chat for follow-up edits. Indices:
-        // 0-3 are fields, 4 is Submit, 5 is Chat.
-        lastIndex = 5;
-        continue;
-      }
-    }
-
-    lastIndex = result.index;
-    const fieldChoice = result.index;
-
-    if (fieldChoice === 0) {
-      const next = (await ask(`  ${bold('Name')}: `, { defaultValue: apiEntry.name || '' })).trim();
-      if (next && next !== apiEntry.name) apiEntry.name = next;
-    } else if (fieldChoice === 1) {
-      const next = (await ask(`  ${bold('Base URL')}: `, { defaultValue: apiEntry.baseUrl || '' })).trim();
-      if (next && !/^https?:\/\//i.test(next)) {
-        console.log(red(`  ✗ Base URL must start with http:// or https://`));
-      } else if (next && next !== apiEntry.baseUrl) {
-        apiEntry.baseUrl = next;
-      }
-    } else if (fieldChoice === 2) {
-      const visIdx = await singleSelect(
-        [
-          { label: 'External', hint: 'Customer-facing - appears on the public docs.' },
-          { label: 'Internal', hint: 'Admin-only - hidden from the public docs.' },
-        ],
-        {
-          message: 'Visibility',
-          defaultIndex: apiEntry.internal === true ? 1 : 0,
-        },
-      );
-      apiEntry.internal = visIdx === 1;
-    } else if (fieldChoice === 3) {
-      const next = (await ask(
-        `  ${bold('Request prefix')} ${dim('(1-7 letters/digits)')}: `,
-        { defaultValue: apiEntry.requestIdPrefix || '' },
-      )).trim().toUpperCase();
-      if (next && !REQUEST_PREFIX_RE.test(next)) {
-        console.log(red(`  ✗ Prefix must be 1-7 uppercase letters or digits (e.g. TST).`));
-      } else if (next && next !== apiEntry.requestIdPrefix) {
-        apiEntry.requestIdPrefix = next;
-      }
-    }
-
-    // Persist after every successful edit so a Ctrl-C mid-flow
-    // doesn't throw away changes the user already confirmed.
-    saveSettings(updateRoot, updateSettings);
-  }
-
-  // Reload from disk so we send whatever's on disk now. Saves in the
-  // loop above already mirrored each edit, but reloading is the
-  // belt-and-suspenders move.
-  const freshSettings = loadSettings(updateRoot);
-
-  const projectIdForSync = chosenApi.projectId;
-
-  // Post-claim writes prove themselves with a browser-approved device
-  // token (the setup key is spent once the project is claimed). The
-  // handshake and its 24h cache live in lib/cli-token.js, shared with
-  // the spec push above.
-  const tokenRes = await getCliToken({ projectId: projectIdForSync, interactive: isInteractive() });
-  if (!tokenRes.ok) {
-    // Edits are already on disk, so this is a partial success.
-    console.log('');
-    console.log(`  ${yellow('!')} Settings updated locally but not synced: ${tokenRes.error}`);
-    console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)} to authorize and sync.`));
-    console.log('');
-    await debug.flushAndExit(0);
-  }
-  const cliToken = tokenRes.token;
-  if (!tokenRes.cached) setupInProgress = false;
-
-  // ── Upload ─────────────────────────────────────────────────────
-  console.log('');
-  console.log(dim(`  Uploading settings to ${SITE_URL}...`));
-  try {
-    const res = await fetch(`${SITE_URL}/api/projects/${projectIdForSync}/sync`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: cliToken, settings: freshSettings }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.status === 401) {
-      // Cached token went stale (server-side expiry doesn't always
-      // line up with our cache, e.g. if the admin revoked rows).
-      // Wipe the cache so the next run re-authorizes from scratch.
-      clearCachedToken(projectIdForSync);
-      console.log(red(`  ✗ Authorization expired or was revoked.`));
-      console.log(dim(`  Re-run ${cyan(`npx ${CLI_NAME} update`)} to re-authorize.`));
-      console.log('');
-      await debug.flushAndExit(1);
-    }
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      console.log(red(`  ✗ Sync failed (HTTP ${res.status}).`));
-      if (errText) console.log(dim(`    ${errText.slice(0, 200)}`));
-      console.log('');
-      await debug.flushAndExit(1);
-    }
-    console.log(green(`  ✓ Settings synced.`));
-    console.log('');
-  } catch (err) {
-    console.log(red(`  ✗ Sync failed: ${err.message}`));
-    console.log('');
-    await debug.flushAndExit(1);
-  }
-
-  await debug.flushAndExit(0);
+  await debug.flushAndExit(updateCode);
 } else if (command === 'submit-debug') {
   // Hidden command (intentionally absent from `printHelp`). Every run
   // writes a local debug log to ~/.restless/debug/; this uploads the

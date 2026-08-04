@@ -19,6 +19,7 @@ import {
   adoptOasFile,
   countOasEndpoints,
   describeOasSource,
+  describeSpecOutcome,
   fetchOasFromUrl,
   normalizeApiPath,
   oasSourceForPick,
@@ -541,12 +542,28 @@ async function finalizeApi({
 
 /**
  * Hand the user's freeform description to the AI: it locates an existing spec
- * in the repo or runs the project's own generation, landing a spec at the
- * absolute oas path. Returns the repo-relative path if a valid spec shows up,
- * else null so the caller can re-prompt.
+ * in the repo or runs the project's own generation, landing a spec at
+ * `destFile`.
+ *
+ * Returns `{ ok, oasFile, summary }` or `{ ok, error }`, and prints nothing.
+ * The caller decides what to say, because the same call is both a foreground
+ * action ("point me at a spec") and the engine behind a background check, and
+ * those want opposite amounts of narration.
+ *
+ * `onAmbiguous` is how the caller resolves several matching specs. Without it
+ * the first is taken and the summary records that, because the alternative was
+ * worse: this used to open a picker itself, which meant the "check before
+ * asking anything" pass could draw a full-screen prompt over a running
+ * spinner, with the picker's exact-row redraw math fighting the spinner's
+ * line rewrite.
+ *
+ * NOTE: `destFile` is emptied before the AI runs, so callers must pass a
+ * scratch path, never the spec they still want if this fails.
  */
-export async function locateOasWithAi({ input, rootDir, oasFile, packageDir, setSpinner }) {
-  const oasFileAbsolute = path.resolve(rootDir, oasFile);
+export async function locateOasWithAi({
+  input, rootDir, destFile, packageDir, setSpinner, onAmbiguous = null,
+}) {
+  const oasFileAbsolute = path.resolve(rootDir, destFile);
   const apiDir = path.dirname(oasFileAbsolute);
   const candidatesAbsolute = path.resolve(rootDir, OAS_CANDIDATES_FILE);
   // Clear any stale outputs so a no-op AI run is detectable and a prior run's
@@ -576,65 +593,74 @@ export async function locateOasWithAi({ input, rootDir, oasFile, packageDir, set
   if (fs.existsSync(oasFileAbsolute)) {
     const validation = await validateAndFixOas({ oasFullPath: oasFileAbsolute, packageDir, setSpinner });
     if (!validation.ok) {
-      console.log('');
-      console.log(`  ${yellow('•')} Found something, but it didn't parse as a valid spec.`);
-      return { finalOasFile: null };
+      return { ok: false, error: "Found something, but it didn't parse as a valid spec." };
     }
-    console.log('');
-    console.log(`  ${green('✓')} Spec ready at ${bold(oasFile)}.`);
-    return { finalOasFile: oasFile, summary: manifest.summary || `located the spec at ${oasFile}` };
+    return {
+      ok: true,
+      oasFile: destFile,
+      summary: manifest.summary || `located the spec at ${destFile}`,
+    };
   }
 
   // Ambiguous: the AI found several matching specs and left the choice to us.
   const candidates = manifest.candidates;
   if (candidates.length === 0) {
-    console.log('');
-    console.log(`  ${yellow('•')} Couldn't find or generate a spec from that.`);
-    return { finalOasFile: null };
+    return { ok: false, error: "Couldn't find or generate a spec from that." };
   }
 
   let chosen = candidates[0];
+  let autoPicked = false;
   if (candidates.length > 1) {
-    console.log('');
-    const labels = candidates.map((c) => {
-      const title = c.title && c.title !== c.path ? c.title : null;
-      return title ? `${bold(title)}\n${dim(c.path)}` : bold(c.path);
-    });
-    const idx = await singleSelect(labels, {
-      message: `Found ${candidates.length} specs that match. Which API do you want to import to Restless?`,
-      defaultIndex: 0,
-    });
-    chosen = candidates[idx];
+    if (onAmbiguous) {
+      chosen = await onAmbiguous(candidates);
+      if (!chosen) return { ok: false, error: 'No spec chosen.' };
+    } else {
+      autoPicked = true;
+    }
   }
 
-  // Copy the chosen spec into .restless/ so it ships with the code, then
-  // validate the copy (never mutating the user's original).
+  // Copy the chosen spec next to the destination so it ships with the code,
+  // then validate the copy (never mutating the user's original).
   if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
   const ext = path.extname(chosen.absPath).toLowerCase() === '.json' ? '.json' : '.yaml';
   const dest = path.join(apiDir, `openapi${ext}`);
   try {
     fs.copyFileSync(chosen.absPath, dest);
   } catch (err) {
-    console.log('');
-    console.log(`  ${red('✗')} Couldn't read ${chosen.path}: ${err.message}`);
-    return { finalOasFile: null };
+    return { ok: false, error: `Couldn't read ${chosen.path}: ${err.message}` };
   }
   const validation = await validateAndFixOas({ oasFullPath: dest, packageDir, setSpinner });
   if (!validation.ok) {
-    console.log('');
-    console.log(`  ${yellow('•')} ${chosen.path} didn't parse as a valid spec.`);
-    return { finalOasFile: null };
+    return { ok: false, error: `${chosen.path} didn't parse as a valid spec.` };
   }
-  const destRel = path.relative(rootDir, dest);
-  console.log('');
-  console.log(`  ${green('✓')} Using ${bold(chosen.path)}, copied to ${bold(destRel)}.`);
+
+  // Record which one we landed on and, when nobody was asked, that the choice
+  // was ours - so a later replay reproduces the same decision knowingly.
   const picked = candidates.length > 1
-    ? `used ${chosen.path} (chosen from ${candidates.length} matching specs)`
+    ? `used ${chosen.path} (${autoPicked ? 'first of' : 'chosen from'} ${candidates.length} matching specs)`
     : `used the spec found at ${chosen.path}`;
   // Keep the AI's account of how the specs are produced (e.g. the generation
   // command) alongside which one we landed on.
-  const summary = manifest.summary ? `${manifest.summary}; ${picked}` : picked;
-  return { finalOasFile: destRel, summary };
+  return {
+    ok: true,
+    oasFile: path.relative(rootDir, dest),
+    summary: manifest.summary ? `${manifest.summary}; ${picked}` : picked,
+    chosenPath: chosen.path,
+  };
+}
+
+/** The candidate picker `init` hands to `locateOasWithAi`. Kept next to the
+ *  call so the engine itself stays promptless. */
+export function pickOasCandidate(candidates) {
+  const labels = candidates.map((c) => {
+    const title = c.title && c.title !== c.path ? c.title : null;
+    return title ? `${bold(title)}\n${dim(c.path)}` : bold(c.path);
+  });
+  console.log('');
+  return singleSelect(labels, {
+    message: `Found ${candidates.length} specs that match. Which API do you want to import to Restless?`,
+    defaultIndex: 0,
+  }).then((idx) => candidates[idx]);
 }
 
 /**
@@ -731,16 +757,33 @@ async function adoptExistingOas({ rootDir, packageDir, update, setSpinner, known
     let finalOasFile = null;
     let oasSource = null;
     if (/^https?:\/\//i.test(input)) {
-      finalOasFile = await fetchOasFromUrl({ url: input, rootDir, apiDir, setSpinner });
+      const res = await fetchOasFromUrl({ url: input, rootDir, destDir: apiDir, setSpinner });
+      for (const line of describeSpecOutcome(res)) console.log(line);
+      finalOasFile = res.ok ? res.oasFile : null;
       oasSource = { kind: 'url', url: input };
     } else {
       const absPath = path.isAbsolute(input) ? input : path.resolve(rootDir, input);
       if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
-        finalOasFile = adoptOasFile({ absPath, rootDir, apiDir });
+        const res = adoptOasFile({ absPath, rootDir, destDir: apiDir });
+        for (const line of describeSpecOutcome(res)) console.log(line);
+        finalOasFile = res.ok ? res.oasFile : null;
         oasSource = { kind: 'file', input };
       } else {
-        const located = await locateOasWithAi({ input, rootDir, oasFile: OAS_FILE, packageDir, setSpinner });
-        finalOasFile = located.finalOasFile;
+        // Nothing to lose here: setup has no spec yet, so the destination is
+        // the file we are about to create either way.
+        const located = await locateOasWithAi({
+          input, rootDir, destFile: OAS_FILE, packageDir, setSpinner,
+          onAmbiguous: pickOasCandidate,
+        });
+        console.log('');
+        if (located.ok) {
+          console.log(located.chosenPath
+            ? `  ${green('✓')} Using ${bold(located.chosenPath)}, copied to ${bold(located.oasFile)}.`
+            : `  ${green('✓')} Spec ready at ${bold(located.oasFile)}.`);
+        } else {
+          console.log(`  ${yellow('•')} ${located.error}`);
+        }
+        finalOasFile = located.ok ? located.oasFile : null;
         // Record what was actually done to find the spec, not the freeform
         // instruction the user typed.
         oasSource = { kind: 'describe', summary: located.summary };

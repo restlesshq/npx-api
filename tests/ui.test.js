@@ -6,7 +6,6 @@ import {
   printLogo,
   setLogoSubtitle,
   startSpinner,
-  withSuppressedOutput,
 } from '../lib/ui.js';
 import { CLI_NAME } from '../lib/config.js';
 
@@ -246,46 +245,6 @@ describe('logo subtitle names the running command', () => {
   it('keeps the brand row intact', () => {
     setLogoSubtitle(`npx ${CLI_NAME} update`);
     expect(render()).toContain('Restless');
-  });
-});
-
-describe('withSuppressedOutput', () => {
-  it('swallows console.log while suppressing', async () => {
-    // The refresh helpers narrate the scratch path they wrote to, which is our
-    // bookkeeping and not something the developer can act on.
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    await withSuppressedOutput(true, () => {
-      console.log('Spec ready at .restless/.oas-refresh/openapi.json.');
-    });
-    expect(logSpy).not.toHaveBeenCalled();
-    logSpy.mockRestore();
-  });
-
-  it('leaves console.log alone when not suppressing', async () => {
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    await withSuppressedOutput(false, () => console.log('visible'));
-    expect(logSpy).toHaveBeenCalledWith('visible');
-    logSpy.mockRestore();
-  });
-
-  it('never touches process.stdout.write, so a spinner keeps animating', async () => {
-    const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    await withSuppressedOutput(true, () => { process.stdout.write('spinner frame'); });
-    expect(writeSpy).toHaveBeenCalledWith('spinner frame');
-    writeSpy.mockRestore();
-  });
-
-  it('restores console.log even when the body throws', async () => {
-    const before = console.log;
-    await expect(
-      withSuppressedOutput(true, () => { throw new Error('boom'); }),
-    ).rejects.toThrow('boom');
-    expect(console.log).toBe(before);
-  });
-
-  it('returns whatever the body returns', async () => {
-    expect(await withSuppressedOutput(true, () => 'value')).toBe('value');
-    expect(await withSuppressedOutput(true, async () => 'async value')).toBe('async value');
   });
 });
 

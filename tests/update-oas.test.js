@@ -3,20 +3,20 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
-  AUTO_CHECK_KINDS,
-  NO_AGENT_KINDS,
   applySpecChange,
   buildActions,
   checkForSpecChanges,
   cleanRefreshTemp,
-  compareWithDashboard,
-  describeCheck,
-  describeDashboardGap,
-  fetchDashboardSpec,
-  pushOas,
   regenerateTarget,
 } from '../steps/update-oas.js';
-import { MANAGED_OAS_FILE, canonicalOasHash } from '../lib/oas-source.js';
+import { describeCheck, describeDashboardGap } from '../steps/update-render.js';
+import { compareWithDashboard, fetchDashboardSpec, pushOas } from '../lib/project-sync.js';
+import {
+  MANAGED_OAS_FILE,
+  canonicalOasHash,
+  autoCheckKinds,
+  noAgentKinds,
+} from '../lib/oas-source.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 
 /**
@@ -201,9 +201,9 @@ describe('pushOas', () => {
  * more than the happy path: it must never touch the spec before consent, and a
  * failure must never block someone who only came to edit a setting.
  */
-describe('AUTO_CHECK_KINDS', () => {
+describe('which kinds can be checked, derived from the source table', () => {
   it('covers every kind that has a source to go back to', () => {
-    expect([...AUTO_CHECK_KINDS].sort()).toEqual([
+    expect([...autoCheckKinds()].sort()).toEqual([
       'describe', 'file', 'found', 'native', 'url',
     ]);
   });
@@ -213,23 +213,21 @@ describe('AUTO_CHECK_KINDS', () => {
     // re-checking means doing that again from scratch. That's a decision, not
     // a status check, so it stays behind an explicit action.
     for (const kind of ['ai', 'agent']) {
-      expect(AUTO_CHECK_KINDS.has(kind)).toBe(false);
+      expect(autoCheckKinds().has(kind)).toBe(false);
     }
   });
-});
 
-describe('NO_AGENT_KINDS', () => {
   it('is the subset that needs no agent pass', () => {
-    expect([...NO_AGENT_KINDS].sort()).toEqual(['file', 'found', 'url']);
+    expect([...noAgentKinds()].sort()).toEqual(['file', 'found', 'url']);
   });
 
   it('is a strict subset of what the interactive flow checks', () => {
     // `--status` is the cheap probe an agent runs first, so it must never
     // spawn a second agent to answer. The interactive flow goes wider because
     // a human is watching a spinner and can interrupt it.
-    for (const kind of NO_AGENT_KINDS) expect(AUTO_CHECK_KINDS.has(kind)).toBe(true);
-    expect(NO_AGENT_KINDS.has('describe')).toBe(false);
-    expect(NO_AGENT_KINDS.has('native')).toBe(false);
+    for (const kind of noAgentKinds()) expect(autoCheckKinds().has(kind)).toBe(true);
+    expect(noAgentKinds().has('describe')).toBe(false);
+    expect(noAgentKinds().has('native')).toBe(false);
   });
 });
 
@@ -262,7 +260,7 @@ describe('checkForSpecChanges for a spec on disk', () => {
     // Honest third state: no fingerprint means we cannot claim it changed,
     // and must not claim it didn't.
     const res = await checkForSpecChanges({ rootDir: tmp, apiEntry: entry() });
-    expect(res.status).toBe('unknown');
+    expect(res.kind).toBe('unknown');
     expect(res.endpoints).toBe(1);
   });
 
@@ -270,7 +268,7 @@ describe('checkForSpecChanges for a spec on disk', () => {
     const res = await checkForSpecChanges({
       rootDir: tmp, apiEntry: entry({ oasHash: canonicalOasHash(JSON.parse(V1)) }),
     });
-    expect(res.status).toBe('unchanged');
+    expect(res.kind).toBe('unchanged');
   });
 
   it('reports changed with a count delta when the content differs', async () => {
@@ -279,10 +277,11 @@ describe('checkForSpecChanges for a spec on disk', () => {
       rootDir: tmp,
       apiEntry: entry({ oasHash: canonicalOasHash(JSON.parse(V1)), oasOperationCount: 1 }),
     });
-    expect(res.status).toBe('changed');
-    // A hash can say THAT it changed, not which operations moved - so this
-    // path is explicitly count-only, and describeCheck must not imply a diff.
-    expect(res.countOnly).toBe(true);
+    // A hash can say THAT it changed, not which operations moved - so the
+    // result is discriminated as living on disk already, and describeCheck
+    // must not imply a diff it doesn't have.
+    expect(res.kind).toBe('on-disk');
+    expect(res.diff).toBeUndefined();
     expect(res.previousEndpoints).toBe(1);
     expect(res.endpoints).toBe(2);
     expect(describeCheck(res).join('\n')).toContain('1 to 2 endpoints');
@@ -301,7 +300,7 @@ describe('checkForSpecChanges for a spec on disk', () => {
   it('fails soft when the spec is gone', async () => {
     fs.rmSync(path.join(tmp, 'docs', 'openapi.json'));
     const res = await checkForSpecChanges({ rootDir: tmp, apiEntry: entry() });
-    expect(res.status).toBe('failed');
+    expect(res.kind).toBe('failed');
     expect(res.reason).toContain('not on disk');
   });
 
@@ -310,7 +309,7 @@ describe('checkForSpecChanges for a spec on disk', () => {
     const res = await checkForSpecChanges({
       rootDir: tmp, apiEntry: entry({ oasHash: 'x'.repeat(64) }),
     });
-    expect(res.status).toBe('failed');
+    expect(res.kind).toBe('failed');
     expect(res.reason).toContain('parse');
   });
 
@@ -318,7 +317,7 @@ describe('checkForSpecChanges for a spec on disk', () => {
     const res = await checkForSpecChanges({
       rootDir: tmp, apiEntry: entry({ oasSource: { kind: 'url' } }),
     });
-    expect(res.status).toBe('failed');
+    expect(res.kind).toBe('failed');
   });
 
   it('cleanRefreshTemp is safe when there is nothing to clean', () => {
@@ -434,7 +433,11 @@ describe('fetchDashboardSpec', () => {
     const res = await fetchDashboardSpec({ projectId: 'p-1', token: 'tok' });
     expect(res.ok).toBe(true);
     expect(res.operations).toEqual(['GET /a', 'GET /b']);
-    expect(fetchSpy.mock.calls[0][0]).toContain('/api/projects/p-1/oas?token=tok');
+    expect(fetchSpy.mock.calls[0][0]).toContain('/api/projects/p-1/oas');
+    // The credential belongs in a header. The query parameter is transitional,
+    // pending the server reading the header - when that lands, this assertion
+    // and the parameter go together.
+    expect(fetchSpy.mock.calls[0][1].headers.Authorization).toBe('Bearer tok');
     fetchSpy.mockRestore();
   });
 

@@ -2,10 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { REFRESH_STRATEGY_NAMES } from '../steps/update-oas.js';
 import {
   HTTP_METHODS,
   MANAGED_OAS_FILE,
+  OAS_SOURCES,
   OAS_SOURCE_KINDS,
+  oasSourceFacets,
   countOasEndpoints,
   describeOasSource,
   diffOperations,
@@ -362,5 +365,63 @@ describe('canonicalOasHash (shared with the dashboard)', () => {
   it('returns null for a spec that is not there', () => {
     expect(canonicalOasHash(null)).toBeNull();
     expect(canonicalOasHash('nope')).toBeNull();
+  });
+});
+
+/**
+ * The source table replaced five things in four files that each answered a
+ * question about the same seven kinds: a phrasing switch, a pick-to-source
+ * switch, two Sets partitioning kinds by capability, an if/else chain building
+ * the action list, and a `kind === 'describe' || kind === 'native'` inlined in
+ * the entry point. They drifted, which is how `found` and `native` ended up
+ * with no phrasing at all.
+ *
+ * These tests hold the table complete, so adding a kind fails loudly here
+ * rather than quietly degrading at one of the old call sites.
+ */
+describe('OAS_SOURCES is complete for every kind', () => {
+  it('declares every facet for every kind', () => {
+    for (const kind of OAS_SOURCE_KINDS) {
+      const f = OAS_SOURCES[kind];
+      expect(typeof f.phrase, kind).toBe('function');
+      expect(typeof f.autoCheck, kind).toBe('boolean');
+      expect(typeof f.needsAgent, kind).toBe('boolean');
+      expect(typeof f.strategy, kind).toBe('string');
+      expect(typeof f.action, kind).toBe('function');
+    }
+  });
+
+  it('names only strategies that exist, or the read-only one', () => {
+    // A kind pointing at an unimplemented strategy would fail at the moment
+    // someone tried to refresh it.
+    for (const kind of OAS_SOURCE_KINDS) {
+      const { strategy } = OAS_SOURCES[kind];
+      if (strategy === 'reread') continue; // produces no bytes; nothing to stage
+      expect(REFRESH_STRATEGY_NAMES, `${kind} -> ${strategy}`).toContain(strategy);
+    }
+  });
+
+  it('re-reads exactly the kinds whose file the developer owns', () => {
+    // These are the two we must never regenerate over.
+    const reread = OAS_SOURCE_KINDS.filter((k) => OAS_SOURCES[k].strategy === 'reread');
+    expect(reread.sort()).toEqual(['file', 'found']);
+  });
+
+  it('treats an unknown kind the way it treats `ai`', () => {
+    // A settings file from a newer CLI must not be checked automatically on a
+    // guess about what its kind means.
+    const unknown = oasSourceFacets('something-new');
+    expect(unknown.autoCheck).toBe(false);
+    expect(unknown.action({}, {})).toBeNull();
+    expect(unknown.phrase({})).toBe('from your last setup');
+  });
+
+  it('only offers an action a half-written source can actually run', () => {
+    // `url` with no url and `describe` with no summary have nothing to go back
+    // to, so they must not claim a primary action.
+    expect(OAS_SOURCES.url.action({}, {})).toBeNull();
+    expect(OAS_SOURCES.describe.action({}, {})).toBeNull();
+    expect(OAS_SOURCES.url.action({}, { url: 'https://a.com/o.json' }).key).toBe('refetch');
+    expect(OAS_SOURCES.describe.action({}, { summary: 's' }).key).toBe('replay');
   });
 });

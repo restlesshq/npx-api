@@ -36,8 +36,8 @@ const WRITTEN_FIELDS = {
   requestIdPrefix: 'steps/generate-oas.js finalizeApi, bin/api.js register/update',
   testCurl: 'steps/generate-oas.js finalizeApi',
   redact: 'steps/detect-auth.js (read by @restlessai/sdk at startup)',
-  oasHash: 'steps/update-oas.js recordPushedFingerprint',
-  oasOperationCount: 'steps/update-oas.js recordPushedFingerprint',
+  oasHash: 'lib/project-sync.js syncProject',
+  oasOperationCount: 'lib/project-sync.js syncProject',
   lastSyncedAt: 'steps/generate-oas.js finalizeApi, bin/api.js register',
 };
 

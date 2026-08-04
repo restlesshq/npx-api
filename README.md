@@ -80,9 +80,12 @@ $ npx api update
   Update the spec and sync your settings? [Y/n]
 ```
 
-Say no and you get the full menu instead. Nothing touches your spec before you
-answer: a refresh is written to a scratch directory and only moved into place
-once you agree.
+Say no and you get the full menu instead.
+
+Nothing touches your spec before you answer, on any path through `update`: every
+refresh - re-fetching a URL, replaying a recorded command, regenerating from your
+routes - is written to a scratch directory and only moved into place once you
+agree. If it fails, or you say no, the file you already had is exactly as it was.
 
 It checks the dashboard too, which is the other way a spec goes out of date:
 
@@ -120,7 +123,8 @@ for that explicitly.
 If a refresh would remove endpoints from your docs, it says so and asks.
 Regenerating from your routes is always available as an explicit choice, and it
 writes to `.restless/openapi.json` rather than overwriting a spec you wrote
-yourself.
+yourself - when that changes which file your project points at, the confirm says
+so before you answer, not afterwards.
 
 `update` also runs without prompts when you tell it exactly what to do, which is
 what a coding agent or a CI job needs. Run it inside Claude Code or Codex with
