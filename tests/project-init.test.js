@@ -274,4 +274,51 @@ describe('uploadPendingArtifacts', () => {
     expect(res.oas).toBe('none');
     expect(res.settings).toBe('uploaded');
   });
+
+  // A claimed project has no pending slot to stage into: the server refuses,
+  // and the setup key on disk is spent because claiming deletes the server's
+  // copy. That is a different outcome from a failure, and callers branch on
+  // it - `setup-account` skips the whole claim ceremony rather than minting a
+  // login token for a project that already has an owner.
+  it('reports claimed on a 409, not failed', async () => {
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 409, text: async () => 'already claimed' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('claimed');
+    expect(res.error).toBeUndefined();
+  });
+
+  it('reports claimed on a 401 - the same state seen from the credential side', async () => {
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'Unauthorized' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('claimed');
+    expect(res.error).toBeUndefined();
+  });
+
+  it('still reports the endpoint count when the upload was refused', async () => {
+    // The recap line ("mapped N endpoints") is true regardless of whether
+    // staging was the right operation to attempt, so the count is read from
+    // the local file rather than salvaged from a successful response.
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 409, text: async () => '' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.endpoints).toBe(2);
+  });
+
+  it('still reports the endpoint count when the upload failed outright', async () => {
+    writeProject();
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'boom' })
+      .mockResolvedValueOnce({ ok: true });
+    const res = await mod.uploadPendingArtifacts({ rootDir: tmp, projectId: 'p-1', setupKey: 's-1', fetchImpl });
+    expect(res.oas).toBe('failed');
+    expect(res.endpoints).toBe(2);
+  });
 });

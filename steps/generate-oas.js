@@ -10,14 +10,21 @@ import { fatalError } from '../lib/errors.js';
 import { scanCodebase } from '../lib/find-endpoints.js';
 import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
-import { parseOas } from '../lib/oas-parse.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 import { isInteractive } from '../lib/env.js';
+import {
+  MANAGED_OAS_FILE,
+  adoptOasFile,
+  countOasEndpoints,
+  describeOasSource,
+  fetchOasFromUrl,
+  normalizeApiPath,
+  oasSourceForPick,
+  validateAndFixOas,
+} from '../lib/oas-source.js';
 import * as debug from '../lib/debug.js';
-
-const MAX_OAS_FIX_ATTEMPTS = 2;
 
 // How many follow-up passes we'll make to add file-based routes the first
 // generation pass left out. See ensurePathCoverage for why this exists.
@@ -25,52 +32,14 @@ const MAX_COVERAGE_ATTEMPTS = 2;
 
 // Where a generated/adopted spec lands, and the placeholder server URL the
 // generate-oas prompt writes (swapped for the real base URL in finalizeApi).
-const OAS_FILE = '.restless/openapi.json';
+// Aliased rather than re-declared so there is one definition of the path the
+// CLI owns - `update` decides what it may overwrite from the same constant.
+const OAS_FILE = MANAGED_OAS_FILE;
 const PLACEHOLDER_DOMAIN = 'https://example.com';
 
 // Where the locate-oas AI pass lists multiple matching specs when it can't
 // pick one unambiguously, so the CLI can ask the user which to use.
 const OAS_CANDIDATES_FILE = '.restless/.oas-candidates.json';
-
-// Read the file we just wrote and parse it the same way the server will. If
-// it doesn't parse, hand the error back to the LLM and ask it to fix the file
-// in place. Retries up to MAX_OAS_FIX_ATTEMPTS times.
-async function validateAndFixOas({ oasFullPath, packageDir, setSpinner }) {
-  for (let attempt = 0; attempt <= MAX_OAS_FIX_ATTEMPTS; attempt++) {
-    let raw;
-    try {
-      raw = fs.readFileSync(oasFullPath, 'utf8');
-    } catch (err) {
-      return { ok: false, error: `Could not read ${oasFullPath}: ${err.message}` };
-    }
-    const format = oasFullPath.endsWith('.json') ? 'json' : 'yaml';
-    const result = parseOas(raw, format);
-    if (result.ok) return { ok: true };
-
-    if (attempt === MAX_OAS_FIX_ATTEMPTS) {
-      return { ok: false, error: result.error };
-    }
-
-    setSpinner('Fixing OpenAPI spec');
-    const fixPrompt = loadPrompt('fix-oas', {
-      oasFile: oasFullPath,
-      parseError: result.error,
-    });
-    await runAI(fixPrompt, packageDir, { setSpinner });
-  }
-  return { ok: false, error: 'Exhausted fix attempts' };
-}
-
-// Collapse a path to a shape we can compare across sources: parameter names
-// don't matter for coverage (`/users/{id}` == `/users/{userId}` == `/users/:id`),
-// and a trailing slash is not a distinct route.
-function normalizeApiPath(p) {
-  const collapsed = p
-    .replace(/\{[^}]+\}/g, '{}') // {id} / {userId} -> {}
-    .replace(/:[^/]+/g, '{}') // :id -> {}
-    .replace(/\/+$/, ''); // drop trailing slash
-  return collapsed === '' ? '/' : collapsed;
-}
 
 /**
  * Compare the file-based routes on disk against the paths the generated spec
@@ -571,113 +540,12 @@ async function finalizeApi({
 }
 
 /**
- * Fetch a spec from a URL once, validate it parses (same parser the server
- * uses), and save it under .restless/. Returns the repo-relative path, or
- * null on any failure so the caller can re-prompt.
- */
-async function fetchOasFromUrl({ url, rootDir, apiDir, setSpinner }) {
-  setSpinner({ phase: 'Fetching spec', detail: url });
-  let raw;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      setSpinner('');
-      console.log('');
-      console.log(`  ${red('✗')} ${url} returned ${res.status}.`);
-      return null;
-    }
-    raw = await res.text();
-  } catch (err) {
-    setSpinner('');
-    console.log('');
-    console.log(`  ${red('✗')} Couldn't fetch ${url}: ${err.message}`);
-    return null;
-  }
-  setSpinner('');
-
-  // Detect JSON vs YAML so we save with the right extension (validateAndFixOas
-  // and the server both key off it). Try strict JSON first, then YAML.
-  let format = 'json';
-  let parsed = parseOas(raw, 'json');
-  if (!parsed.ok || !isStrictJson(raw)) {
-    const asYaml = parseOas(raw, 'yaml');
-    if (asYaml.ok && !isStrictJson(raw)) {
-      parsed = asYaml;
-      format = 'yaml';
-    }
-  }
-  if (!parsed.ok) {
-    console.log('');
-    console.log(`  ${red('✗')} That URL didn't return a valid OpenAPI spec.`);
-    console.log(`  ${dim(parsed.error)}`);
-    return null;
-  }
-
-  if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
-  const dest = path.join(apiDir, format === 'yaml' ? 'openapi.yaml' : 'openapi.json');
-  safeWriteFileSync(dest, raw);
-  const rel = path.relative(rootDir, dest);
-  console.log('');
-  console.log(`  ${green('✓')} Downloaded to ${bold(rel)}.`);
-  return rel;
-}
-
-function isStrictJson(raw) {
-  try {
-    JSON.parse(raw);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Adopt an OAS file already on disk. Copies it into .restless/ if it lives
- * outside the repo (so it ships with the code), validates it parses, and
- * returns the repo-relative path, or null if it doesn't parse.
- */
-function adoptOasFile({ absPath, rootDir, apiDir }) {
-  const raw = (() => {
-    try { return fs.readFileSync(absPath, 'utf8'); } catch { return null; }
-  })();
-  if (raw === null) {
-    console.log('');
-    console.log(`  ${red('✗')} Couldn't read ${absPath}.`);
-    return null;
-  }
-  const format = absPath.endsWith('.json') ? 'json' : 'yaml';
-  const parsed = parseOas(raw, format);
-  if (!parsed.ok) {
-    console.log('');
-    console.log(`  ${red('✗')} ${path.relative(rootDir, absPath)} didn't parse as an OpenAPI spec.`);
-    console.log(`  ${dim(parsed.error)}`);
-    return null;
-  }
-
-  const rel = path.relative(rootDir, absPath);
-  if (rel.startsWith('..')) {
-    // Outside the repo - copy into .restless/ so it lives with the codebase.
-    if (!fs.existsSync(apiDir)) safeMkdirSync(apiDir, { recursive: true });
-    const ext = path.extname(absPath) || '.yaml';
-    const dest = path.join(apiDir, `openapi${ext}`);
-    fs.copyFileSync(absPath, dest);
-    const destRel = path.relative(rootDir, dest);
-    console.log('');
-    console.log(`  ${green('✓')} Copied to ${bold(destRel)} so it lives with your code.`);
-    return destRel;
-  }
-  console.log('');
-  console.log(`  ${green('✓')} Using the file at ${bold(rel)}.`);
-  return rel;
-}
-
-/**
  * Hand the user's freeform description to the AI: it locates an existing spec
  * in the repo or runs the project's own generation, landing a spec at the
  * absolute oas path. Returns the repo-relative path if a valid spec shows up,
  * else null so the caller can re-prompt.
  */
-async function locateOasWithAi({ input, rootDir, oasFile, packageDir, setSpinner }) {
+export async function locateOasWithAi({ input, rootDir, oasFile, packageDir, setSpinner }) {
   const oasFileAbsolute = path.resolve(rootDir, oasFile);
   const apiDir = path.dirname(oasFileAbsolute);
   const candidatesAbsolute = path.resolve(rootDir, OAS_CANDIDATES_FILE);
@@ -783,8 +651,14 @@ function readOasManifest({ candidatesAbsolute, rootDir }) {
   } catch {
     return { summary: null, candidates: [] };
   }
-  const summary = typeof parsed?.summary === 'string' && parsed.summary.trim()
-    ? parsed.summary.trim()
+  // Capped because this is model-written prose that gets persisted as
+  // `oasSource.summary` and then rendered in places that assume one short
+  // line: a picker hint (the picker's redraw math counts exactly one row per
+  // item) and a spinner label. A paragraph-length summary breaks both.
+  const SUMMARY_MAX = 120;
+  const rawSummary = typeof parsed?.summary === 'string' ? parsed.summary.trim() : '';
+  const summary = rawSummary
+    ? (rawSummary.length > SUMMARY_MAX ? `${rawSummary.slice(0, SUMMARY_MAX - 1)}…` : rawSummary)
     : null;
   const list = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
   const seen = new Set();
@@ -922,43 +796,6 @@ async function adoptExistingOas({ rootDir, packageDir, update, setSpinner, known
 }
 
 /**
- * Human-readable summary of how a remembered spec was sourced, for the
- * reuse-on-rerun note. Mirrors the `oasSource.kind` values written by the
- * adopt + generate paths.
- */
-function describeOasSource(src) {
-  switch (src?.kind) {
-    case 'ai': return 'generated with AI';
-    case 'url': return src.url ? `fetched from ${src.url}` : 'fetched from a URL';
-    case 'file': return src.input ? `from ${src.input}` : 'from a file you provided';
-    case 'describe': return src.summary || 'from the location you described';
-    default: return 'from your last setup';
-  }
-}
-
-const HTTP_METHODS = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']);
-
-/**
- * Count operations in a spec, so the confirm screen can say "23 endpoints" -
- * the fastest way for someone to tell whether a remembered spec is the one
- * they meant. Returns null when the file won't parse.
- */
-function countOasEndpoints(absPath) {
-  try {
-    const oas = loadOas(absPath);
-    let n = 0;
-    for (const ops of Object.values(oas?.paths || {})) {
-      for (const method of Object.keys(ops || {})) {
-        if (HTTP_METHODS.has(method.toLowerCase())) n++;
-      }
-    }
-    return n;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * APIs a previous run already mapped: an `oasSource` recorded in settings and
  * a spec still on disk that still parses. A spec we can't read is dropped
  * from the list rather than offered, so the caller falls through to the normal
@@ -1046,6 +883,96 @@ async function confirmRememberedOas({ remembered }) {
 
   if (one) return picked === 0 ? remembered[0] : null;
   return picked < remembered.length ? remembered[picked] : null;
+}
+
+/**
+ * The lines describing routes a generation pass couldn't cover. Shared so
+ * `init` and `update` report an incomplete spec identically - a gap that is
+ * loud in one flow and silent in the other is worse than either.
+ */
+export function describeCoverageGap(coverage) {
+  const n = coverage.missing.length;
+  return [
+    `  ${yellow('•')} ${n} route${n === 1 ? '' : 's'} couldn't be added to the spec automatically:`,
+    ...coverage.missing.slice(0, 8).map((m) => `    ${dim(`${m.methods.join(', ')} ${m.path}`)}`),
+    ...(n > 8 ? [`    ${dim(`… and ${n - 8} more`)}`] : []),
+  ];
+}
+
+/**
+ * Write a spec by reading the routes: the AI pass, its parse-and-fix loop, and
+ * the file-route coverage guard. Exported because `npx api update` regenerates
+ * through exactly this path - "re-scan my routes" has to mean the same thing
+ * after setup as during it, including the coverage guard, or an update would
+ * quietly produce a less complete spec than the original.
+ *
+ * Returns `{ ok, oasFile, oasFullPath, coverage }`, and on a parse failure
+ * `{ ok: false, error }` rather than exiting: `init` treats that as fatal
+ * because it has no spec to fall back on, while `update` still has the
+ * previous one on disk and should say so instead of dying.
+ */
+export async function generateOasWithAi({
+  rootDir,
+  packageDir,
+  apiRootDir = '.',
+  name,
+  framework = null,
+  internalEndpoints = [],
+  existingOasFile = null,
+  preferNative = false,
+  oasFile = OAS_FILE,
+  setSpinner,
+}) {
+  const existingOasNote = existingOasFile
+    ? `An existing OAS file was found at ${existingOasFile}. Use it as a starting point - update it if the code has diverged, but preserve any hand-written descriptions or examples.`
+    : '';
+  // Only when the user actually chose native generation. Previously this
+  // note went out whenever the framework *could* generate, so someone who
+  // wanted the routes read directly still got a spec assembled from the
+  // framework's output.
+  const frameworkNote = preferNative
+    ? `This framework (${framework}) supports generating an OAS file natively, and the user asked for that. Use the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps from the routes.`
+    : '';
+  const internalNote = internalEndpoints?.length
+    ? `The following endpoints were detected as internal/admin and should be marked as such:\n${internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`
+    : '';
+
+  // Pass an absolute path to the AI so it can't accidentally walk up
+  // the tree and write into a parent's `.restless/` directory. The relative
+  // path was getting resolved against whatever the AI considered "the
+  // project root," which sometimes meant the monorepo above the user's
+  // actual package.
+  const oasFullPath = path.resolve(rootDir, oasFile);
+  const apiDir = path.resolve(packageDir, apiRootDir || '.');
+  const endpointChecklist = buildEndpointChecklist(apiDir);
+
+  await runAI(
+    loadPrompt('generate-oas', {
+      name,
+      domain: PLACEHOLDER_DOMAIN,
+      oasFile: oasFullPath,
+      existingOasNote,
+      frameworkNote,
+      internalNote,
+      endpointChecklist,
+    }),
+    packageDir,
+    { setSpinner },
+  );
+
+  // Validate before we go any further - server uses the same parse logic,
+  // so if it fails here it'll fail there too. Hand errors back to the LLM
+  // and let it iterate.
+  const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+  if (!validation.ok) {
+    return { ok: false, error: validation.error, oasFile, oasFullPath };
+  }
+
+  // Completeness guard: the single-pass generator can silently drop large,
+  // deeply-nested route trees while still emitting their schemas. Diff the
+  // authoritative file-route list against what landed and fill any gaps.
+  const coverage = await ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner });
+  return { ok: true, oasFile, oasFullPath, coverage };
 }
 
 export default async function generateOas({ packageDir, rootDir, update, setSpinner, aiTool = 'Claude Code' }) {
@@ -1216,6 +1143,12 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   let skipReason = null;
   let finalOasFile = oasFile;
   let preferNativeGeneration = canGenerateNatively;
+  // How this spec came to be, recorded on the settings entry. This is not
+  // decoration: `npx api update` reads it to decide what "refresh my spec"
+  // means, and the right answer is completely different per kind (re-fetch a
+  // URL, re-read a file the user maintains, re-run a framework generator,
+  // re-scan the routes). Every branch below has to set it.
+  let oasSource = null;
 
   {
     const options = [];
@@ -1256,6 +1189,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       // Point settings at their file - don't overwrite their work.
       finalOasFile = selectedApi.existingOasFile;
       skipReason = `using ${bold(selectedApi.existingOasFile)}`;
+      oasSource = oasSourceForPick('found', { existingOasFile: selectedApi.existingOasFile });
     } else if (picked === 'adopt') {
       // Hand the detected API's identity over so the adopted spec lands on
       // the same settings entry instead of a second, re-inferred one.
@@ -1268,12 +1202,20 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
           language: selectedApi.language,
         },
       });
+      // adoptExistingOas records its own provenance (url / file / describe)
+      // and finalizes, so a successful adopt never reaches the tail below.
       if (!res.fallbackToGenerate) return res;
       preferNativeGeneration = canGenerateNatively;
+      oasSource = oasSourceForPick(preferNativeGeneration ? 'native' : 'ai', {
+        framework: selectedApi.framework,
+      });
     } else {
       // 'ai' means write it from the routes even if the framework could have
       // emitted one; 'native' means try the framework's generator first.
       preferNativeGeneration = picked === 'native';
+      oasSource = oasSourceForPick(preferNativeGeneration ? 'native' : 'ai', {
+        framework: selectedApi.framework,
+      });
     }
   }
 
@@ -1289,66 +1231,30 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       '',
     ]});
 
-    const existingOasNote = selectedApi.existingOasFile
-      ? `An existing OAS file was found at ${selectedApi.existingOasFile}. Use it as a starting point - update it if the code has diverged, but preserve any hand-written descriptions or examples.`
-      : '';
-    // Only when the user actually chose native generation. Previously this
-    // note went out whenever the framework *could* generate, so someone who
-    // wanted the routes read directly still got a spec assembled from the
-    // framework's output.
-    const frameworkNote = preferNativeGeneration
-      ? `This framework (${selectedApi.framework}) supports generating an OAS file natively, and the user asked for that. Use the framework's built-in OAS generation first. If it doesn't produce a complete spec, fill in the gaps from the routes.`
-      : '';
-    const internalNote = selectedApi.internalEndpoints?.length
-      ? `The following endpoints were detected as internal/admin and should be marked as such:\n${selectedApi.internalEndpoints.join(', ')}\n\nFor internal endpoints: include them in the spec but tag them with \`x-internal: true\` and add them to a tag called "Internal". This way they're documented but can be filtered out by tools that consume the spec.`
-      : '';
-
-    // Pass an absolute path to the AI so it can't accidentally walk up
-    // the tree and write into a parent's `.restless/` directory. The relative
-    // path was getting resolved against whatever the AI considered "the
-    // project root," which sometimes meant the monorepo above the user's
-    // actual package.
-    const oasFileAbsolute = path.resolve(rootDir, oasFile);
-    const endpointChecklist = buildEndpointChecklist(
-      path.resolve(packageDir, selectedApi.rootDir || '.'),
-    );
-    const vars = {
+    const gen = await generateOasWithAi({
+      rootDir,
+      packageDir,
+      apiRootDir: selectedApi.rootDir || '.',
       name: selectedApi.name,
-      domain: PLACEHOLDER_DOMAIN,
-      oasFile: oasFileAbsolute,
-      existingOasNote,
-      frameworkNote,
-      internalNote,
-      endpointChecklist,
-    };
+      framework: selectedApi.framework,
+      internalEndpoints: selectedApi.internalEndpoints,
+      existingOasFile: selectedApi.existingOasFile,
+      preferNative: preferNativeGeneration,
+      oasFile,
+      setSpinner,
+    });
 
-    await runAI(loadPrompt('generate-oas', vars), packageDir, { setSpinner });
-
-    // Validate before we go any further - server uses the same parse logic,
-    // so if it fails here it'll fail there too. Hand errors back to the LLM
-    // and let it iterate.
-    const oasFullPath = oasFileAbsolute;
-    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
-    if (!validation.ok) {
+    if (!gen.ok) {
       fatalError('Generated OpenAPI spec failed to parse.', [
-        validation.error,
-        `File: ${oasFullPath}`,
+        gen.error,
+        `File: ${gen.oasFullPath}`,
         'Try re-running, or open the file and fix it by hand.',
       ]);
     }
 
-    // Completeness guard: the single-pass generator can silently drop large,
-    // deeply-nested route trees while still emitting their schemas. Diff the
-    // authoritative file-route list against what landed and fill any gaps.
-    const apiDir = path.resolve(packageDir, selectedApi.rootDir || '.');
-    const coverage = await ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner });
-    if (!coverage.ok && coverage.missing.length) {
+    if (gen.coverage && !gen.coverage.ok && gen.coverage.missing.length) {
       // Never ship an incomplete spec silently - name what's still missing.
-      update({ sub: { 0: 'done' }, activeSub: 1, message: [
-        `  ${yellow('•')} ${coverage.missing.length} route${coverage.missing.length === 1 ? '' : 's'} couldn't be added to the spec automatically:`,
-        ...coverage.missing.slice(0, 8).map((m) => `    ${dim(`${m.methods.join(', ')} ${m.path}`)}`),
-        ...(coverage.missing.length > 8 ? [`    ${dim(`… and ${coverage.missing.length - 8} more`)}`] : []),
-      ]});
+      update({ sub: { 0: 'done' }, activeSub: 1, message: describeCoverageGap(gen.coverage) });
     }
   }
 
@@ -1366,6 +1272,6 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     finalOasFile,
     endpoints: selectedApi.endpoints || [],
     replacePlaceholderDomain: finalOasFile === oasFile && !skipReason,
-    oasSource: { kind: 'ai' },
+    oasSource,
   });
 }
