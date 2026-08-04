@@ -85,7 +85,7 @@ let _tempHandlersInstalled = false;
  * Neither survives a SIGKILL or a crash, so `cleanRefreshTemp` runs at the
  * start of every stage as well.
  */
-export function guardRefreshTemp(rootDir) {
+function guardRefreshTemp(rootDir) {
   _tempGuardRoot = rootDir;
   // Install once per process. Re-arming after a release used to add a second
   // pair of listeners every time.
@@ -102,7 +102,7 @@ export function guardRefreshTemp(rootDir) {
 }
 
 /** Stop guarding, once the staged file has been applied or deliberately dropped. */
-export function releaseRefreshTemp() {
+function releaseRefreshTemp() {
   _tempGuardRoot = null;
 }
 
@@ -114,7 +114,7 @@ export function regenerateTarget(apiEntry) {
 }
 
 /** Parse the spec currently on disk, so a refresh can be diffed against it. */
-export function readCurrentSpec(rootDir, oasFile) {
+function readCurrentSpec(rootDir, oasFile) {
   if (!oasFile) return null;
   const abs = path.join(rootDir, oasFile);
   if (!fs.existsSync(abs)) return null;
@@ -293,7 +293,7 @@ function compareStaged({ apiEntry, rootDir, stagedFile, oasSource, coverage = nu
  * failure here must never block someone who only wanted to edit a setting, so
  * every error path returns rather than throwing.
  */
-export function checkFileOnDisk({ rootDir, apiEntry }) {
+function checkFileOnDisk({ rootDir, apiEntry }) {
   const currentAbs = apiEntry.oasFile ? path.join(rootDir, apiEntry.oasFile) : null;
   if (!currentAbs || !fs.existsSync(currentAbs)) {
     return { kind: 'failed', reason: `${apiEntry.oasFile || 'the spec'} is not on disk` };
@@ -492,7 +492,7 @@ async function stageFromPrompt({ rootDir, packageDir, apiEntry, setSpinner }) {
  * staged (or pointed-at) spec. Shared by the interactive prompt and by
  * `--oas <file|url>` so a flag can't reach a different answer than a person.
  */
-export async function stageSpecFromInput({
+async function stageSpecFromInput({
   input, rootDir, packageDir = rootDir, apiEntry = {}, setSpinner = () => {}, onAmbiguous = null,
 }) {
   if (/^https?:\/\//i.test(input)) {
