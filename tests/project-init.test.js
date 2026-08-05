@@ -43,12 +43,118 @@ function mintingFetch() {
   }));
 }
 
+/**
+ * The setup-provenance defaults read how this run was driven, and
+ * `detectAgent()` caches on first call - so a case that asserts about them
+ * re-imports the module with the environment it means to test. Two things
+ * have to be pinned, not just the env vars: without the clean slate every
+ * default would read 'agent' when the suite is run from inside a coding
+ * agent, and without `tty` every default would read 'agent' regardless,
+ * because vitest runs us with both streams piped.
+ */
+async function freshProjectInit(env = {}, { tty = true } = {}) {
+  vi.resetModules();
+  const saved = { ...process.env };
+  const savedTty = { out: process.stdout.isTTY, in: process.stdin.isTTY };
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'RESTLESS_AGENT']) {
+    delete process.env[k];
+  }
+  Object.assign(process.env, env);
+  process.stdout.isTTY = tty;
+  process.stdin.isTTY = tty;
+  // resetModules gives the fresh graph its own pathGuard too, so the write
+  // boundary the outer beforeEach configured has to be re-declared or every
+  // settings write throws EROOTUNSET.
+  const { setGitRoot: setFreshGitRoot } = await import('../lib/pathGuard.js');
+  setFreshGitRoot(tmp);
+  const fresh = await import('../lib/project-init.js');
+  return {
+    mod: fresh,
+    restore: () => {
+      for (const k of Object.keys(process.env)) delete process.env[k];
+      Object.assign(process.env, saved);
+      process.stdout.isTTY = savedTty.out;
+      process.stdin.isTTY = savedTty.in;
+    },
+  };
+}
+
 describe('registerProject', () => {
+  let restoreEnv;
+  afterEach(() => { if (restoreEnv) restoreEnv(); restoreEnv = null; });
+
   it('sends only the hash, never the key', async () => {
+    const { mod: fresh, restore } = await freshProjectInit(); restoreEnv = restore;
     const fetchImpl = mintingFetch();
-    await mod.registerProject({ writeKeyHash: 'abc123', fetchImpl });
+    await fresh.registerProject({ writeKeyHash: 'abc123', fetchImpl });
     const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
-    expect(body).toEqual({ write_key_hash: 'abc123' });
+    expect(body.write_key_hash).toBe('abc123');
+    expect(Object.keys(body).sort()).toEqual(['setup_source', 'write_key_hash']);
+  });
+
+  it('records the agent the caller picked, over anything in the environment', async () => {
+    const { mod: fresh, restore } = await freshProjectInit({ CLAUDECODE: '1' }); restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.registerProject({ writeKeyHash: 'h', agent: 'codex', fetchImpl });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+      setup_source: 'agent',
+      setup_agent: 'codex',
+    });
+  });
+
+  it('falls back to the agent driving the run when the caller picked none', async () => {
+    const { mod: fresh, restore } = await freshProjectInit({ CLAUDECODE: '1' }); restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.registerProject({ writeKeyHash: 'h', fetchImpl });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+      setup_source: 'agent',
+      setup_agent: 'claude',
+    });
+  });
+
+  it('reports a plain terminal run as cli with no agent', async () => {
+    const { mod: fresh, restore } = await freshProjectInit(); restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.registerProject({ writeKeyHash: 'h', fetchImpl });
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(body.setup_source).toBe('cli');
+    expect(body).not.toHaveProperty('setup_agent');
+  });
+
+  it('reports an unidentifiable agent as agent-driven with no name', async () => {
+    // A piped run from an agent whose markers we don't know. 'cli' would be
+    // the one answer that is definitely wrong.
+    const { mod: fresh, restore } = await freshProjectInit({}, { tty: false });
+    restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.registerProject({ writeKeyHash: 'h', fetchImpl });
+    const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(body.setup_source).toBe('agent');
+    expect(body).not.toHaveProperty('setup_agent');
+  });
+
+  it('reports a self-named agent under its own name', async () => {
+    const { mod: fresh, restore } = await freshProjectInit(
+      { RESTLESS_AGENT: 'cursor' },
+      { tty: false },
+    );
+    restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.registerProject({ writeKeyHash: 'h', fetchImpl });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+      setup_source: 'agent',
+      setup_agent: 'cursor',
+    });
+  });
+
+  it('carries the picked agent through ensureProject to the registration', async () => {
+    const { mod: fresh, restore } = await freshProjectInit(); restoreEnv = restore;
+    const fetchImpl = mintingFetch();
+    await fresh.ensureProject({ rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_k', agent: 'claude', fetchImpl });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+      setup_source: 'cli',
+      setup_agent: 'claude',
+    });
   });
 
   it('retries once on a 5xx (the metrics service cold-starts)', async () => {

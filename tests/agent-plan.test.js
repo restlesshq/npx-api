@@ -183,4 +183,24 @@ describe('buildAgentPlan', () => {
     expect(plan).toContain('do not edit `.gitignore` yourself');
     expect(plan).not.toContain('Keep the diff small');
   });
+
+  it('asks an agent we could not identify to name itself on the key command', () => {
+    // Only Claude Code and Codex export a marker we recognize, so anything
+    // else reaches here unnamed - and the key command is the one that
+    // registers the project, so it is the only place the name matters.
+    const plan = buildAgentPlan({ rootDir: dir, cli: 'api', agent: 'your agent' });
+    expect(plan).toContain('--agent <your-name>');
+    expect(plan).toContain('--agent cursor');
+    expect(plan).toContain('nothing about the user or this repo');
+  });
+
+  it('does not ask an agent that is already named to name itself', () => {
+    const plan = buildAgentPlan({
+      rootDir: dir,
+      cli: 'api',
+      agent: 'Claude Code',
+      agentSlug: 'claude',
+    });
+    expect(plan).not.toContain('--agent');
+  });
 });
