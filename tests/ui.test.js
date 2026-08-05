@@ -1,5 +1,13 @@
-import { describe, it, expect } from 'vitest';
-import { normalizePickerItem, pickContextualHint } from '../lib/ui.js';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import {
+  isAbortKey,
+  normalizePickerItem,
+  pickContextualHint,
+  printLogo,
+  setLogoSubtitle,
+  startSpinner,
+} from '../lib/ui.js';
+import { CLI_NAME } from '../lib/config.js';
 
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
@@ -137,5 +145,148 @@ describe('pickContextualHint', () => {
     // matters is 38;2;<r>;<g>;<b>. Just confirm we start a foreground
     // color region (not the default).
     expect(r.lines[0]).toMatch(/\x1b\[(33|38;2;|38;5;)/);
+  });
+});
+
+describe('startSpinner stays on one line', () => {
+  /**
+   * The spinner redraws with `\x1b[2K\r`, which clears the current line and
+   * returns to ITS start. A message wider than the terminal wraps, so `\r`
+   * lands on the last visual line only, the earlier ones survive, and every
+   * tick leaks another - the spinner scrolls the screen and reads as a hang.
+   * It is fed URLs, file paths and model-written summaries, so none of its
+   * messages have a bounded length.
+   */
+  function capture(msg, columns) {
+    const chunks = [];
+    const origWrite = process.stdout.write;
+    const origCols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    Object.defineProperty(process.stdout, 'columns', { value: columns, configurable: true });
+    process.stdout.write = (c) => { chunks.push(String(c)); return true; };
+    try {
+      const spinner = startSpinner(msg);
+      // Drive one tick without waiting on the real 80ms interval.
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          spinner.stop();
+          process.stdout.write = origWrite;
+          if (origCols) Object.defineProperty(process.stdout, 'columns', origCols);
+          else delete process.stdout.columns;
+          resolve(chunks);
+        }, 120);
+      });
+    } catch (err) {
+      process.stdout.write = origWrite;
+      throw err;
+    }
+  }
+
+  const widest = (chunks) => Math.max(
+    0,
+    ...chunks
+      .map((c) => strip(c).replace(/\x1b\[2K/g, '').replace(/\r/g, ''))
+      .map((c) => c.length),
+  );
+
+  it('truncates a message far wider than the terminal', async () => {
+    const long = 'x'.repeat(400);
+    const chunks = await capture(long, 80);
+    expect(widest(chunks)).toBeLessThanOrEqual(80);
+  });
+
+  it('marks the truncation so it does not read as the whole message', async () => {
+    const chunks = await capture('y'.repeat(400), 80);
+    expect(chunks.some((c) => c.includes('\u2026'))).toBe(true);
+  });
+
+  it('leaves a short message intact', async () => {
+    const chunks = await capture('Waiting for approval', 80);
+    expect(chunks.some((c) => strip(c).includes('Waiting for approval'))).toBe(true);
+  });
+
+  it('never emits a newline, which is what would leak a line per tick', async () => {
+    const chunks = await capture('z'.repeat(400), 80);
+    expect(chunks.join('').includes('\n')).toBe(false);
+  });
+
+  it('adapts to a narrow terminal', async () => {
+    const chunks = await capture('w'.repeat(400), 40);
+    expect(widest(chunks)).toBeLessThanOrEqual(40);
+  });
+});
+
+describe('logo subtitle names the running command', () => {
+  // Row 2 of the logo was hardcoded to `npx api init`, so `update` displayed
+  // the wrong command above every screen it drew. The default now also honours
+  // CLI_NAME, which exists so output matches whatever bin name shipped - the
+  // old literal ignored it.
+  const DEFAULT_SUBTITLE = `npx ${CLI_NAME} init`;
+  afterEach(() => setLogoSubtitle(DEFAULT_SUBTITLE));
+
+  function render() {
+    const out = [];
+    const orig = process.stdout.write;
+    process.stdout.write = (c) => { out.push(String(c)); return true; };
+    try { printLogo(); } finally { process.stdout.write = orig; }
+    return strip(out.join(''));
+  }
+
+  it('defaults to init, under whatever name the CLI was invoked as', () => {
+    expect(render()).toContain(DEFAULT_SUBTITLE);
+  });
+
+  it('shows whatever the command sets', () => {
+    setLogoSubtitle(`npx ${CLI_NAME} update`);
+    const drawn = render();
+    expect(drawn).toContain(`npx ${CLI_NAME} update`);
+    expect(drawn).not.toContain(DEFAULT_SUBTITLE);
+  });
+
+  it('keeps the brand row intact', () => {
+    setLogoSubtitle(`npx ${CLI_NAME} update`);
+    expect(render()).toContain('Restless');
+  });
+});
+
+describe('isAbortKey', () => {
+  /**
+   * Every raw-mode prompt keys off this, so it decides both whether Esc gets
+   * you out and whether the arrow keys still work. The Esc test is exact for
+   * that reason: arrows arrive as `\x1b[A` and friends, so a prefix match would
+   * make Up and Down quit the picker instead of moving in it.
+   */
+  it('treats Ctrl-C and a bare Esc as abort', () => {
+    expect(isAbortKey('\x03')).toBe(true);
+    expect(isAbortKey('\x1b')).toBe(true);
+  });
+
+  it('does NOT treat any arrow key as abort', () => {
+    for (const arrow of ['\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D']) {
+      expect(isAbortKey(arrow)).toBe(false);
+    }
+  });
+
+  it('does not treat other escape sequences as abort', () => {
+    // Delete, Home, End, page keys - anything that shares the Esc prefix.
+    for (const seq of ['\x1b[3~', '\x1b[H', '\x1b[F', '\x1b[5~', '\x1b[6~', '\x1bOP']) {
+      expect(isAbortKey(seq)).toBe(false);
+    }
+  });
+
+  it('leaves ordinary input alone', () => {
+    for (const key of ['\r', '\n', 's', 'S', ' ', '\x7f', '\b', '\x01', '\x05', '']) {
+      expect(isAbortKey(key)).toBe(false);
+    }
+  });
+
+  it('still catches a Ctrl-C bundled with other bytes', () => {
+    // A fast paste or a burst read can deliver it alongside other input.
+    expect(isAbortKey('abc\x03')).toBe(true);
+  });
+
+  it('is safe on non-string input', () => {
+    for (const v of [undefined, null, 0, {}, []]) {
+      expect(isAbortKey(v)).toBe(false);
+    }
   });
 });

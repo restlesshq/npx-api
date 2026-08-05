@@ -2,9 +2,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { bold, dim, green, red, cyan, celebrationBanner } from '../lib/ui.js';
+import { bold, dim, green, red, cyan, celebrationBanner, isAbortKey } from '../lib/ui.js';
 import { loadSettings } from '../lib/settings.js';
-import { SITE_URL } from '../lib/config.js';
+import { SITE_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive } from '../lib/env.js';
 import { uploadPendingArtifacts } from '../lib/project-init.js';
 import * as debug from '../lib/debug.js';
@@ -64,7 +64,7 @@ function waitForEnter() {
     };
 
     const onData = (key) => {
-      if (key === '\x03') { cleanup(); process.stdout.write('\n'); process.exit(130); }
+      if (isAbortKey(key)) { cleanup(); process.stdout.write('\n'); process.exit(130); }
       if (key === '\r' || key === '\n') { cleanup(); resolve('enter'); }
       // Ignore everything else - typing in the terminal at this prompt
       // shouldn't do anything except wait for Enter or get pre-empted by
@@ -124,10 +124,36 @@ export default async function setupAccount({
     ]});
     return { apiKey };
   }
+  const endpointCount = artifacts.endpoints;
+
+  // ── Already claimed: nothing left to do here ────────────────────
+  // Everything below this point is the claim ceremony, and all of it
+  // assumes an unclaimed project: it mints a login token, shows the
+  // link, and polls for the claim to complete. On a re-run of a project
+  // that already has an owner, that sequence used to run anyway and
+  // dead-end - the token was minted (nothing verifies the setup key
+  // there), the user was told setup was complete, the claim redirected
+  // to `?error=already_claimed`, the SetupToken was never marked done,
+  // and the poll waited forever. So stop here instead, and say what
+  // actually happened.
+  if (artifacts.oas === 'claimed') {
+    update({ status: 'done', sub: { 0: 'done', 1: 'done' }, message: [
+      `  ${green('✓')} ${bold('This project is already claimed')} - your account has it.`,
+      '',
+      hasLocalOas
+        ? `  ${dim(`Your local ${oasFile} was left alone. To push it to the dashboard:`)}`
+        : `  ${dim('To push a spec to the dashboard once you have one:')}`,
+      `    ${cyan(`npx ${CLI_NAME} update`)}`,
+      '',
+      `  ${dim('Everything else in this run (SDK, key, wiring) is applied and ready.')}`,
+    ]});
+    debug.log('setup-account.already-claimed', { projectId, hasLocalOas });
+    return { apiKey };
+  }
+
   if (artifacts.settings === 'failed') {
     update({ message: [`  ${dim('!')} ${artifacts.settingsError || 'Settings upload skipped.'}`] });
   }
-  const endpointCount = artifacts.endpoints;
 
   // ── Sub 1: Log in to claim the project ──────────────────────────
   // Hand the project + setupKey to the server up front, keyed by an
@@ -204,7 +230,7 @@ export default async function setupAccount({
   // hero (bright-green + bold, brightest thing on screen); the URL is demoted to
   // a dim fallback below it.
   update({ status: 'done', sub: { 0: 'done', 1: 'done' }, message: [
-    ...celebrationBanner(`🎉  ${bold('Setup complete')} — your API is ready to claim`),
+    ...celebrationBanner(`🎉  ${bold('Setup complete')}: your API is ready to claim`),
     '',
     ...recap,
     '',
@@ -232,7 +258,7 @@ export default async function setupAccount({
     // Keep the completed step tree (status stays done) so the payoff doesn't
     // snap back to an in-progress look while we wait on the browser login.
     update({ status: 'done', message: [
-      ...celebrationBanner(`🎉  ${bold('Setup complete')} — one last step to claim it`),
+      ...celebrationBanner(`🎉  ${bold('Setup complete')}: one last step to claim it`),
       '',
       `  ${green(bold('❯ Opening your browser…'))}`,
       // No second glyph: a bare ❯ under the line reads as an input prompt
