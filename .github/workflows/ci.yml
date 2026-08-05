@@ -41,22 +41,14 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      # npm install, not npm ci. `npm ci` cannot work here: npm only records the
-      # resolving platform's optional binaries in the lockfile, so ours holds
-      # the darwin-arm64 builds of rolldown, lightningcss, and sharp and none of
-      # the Linux ones. `npm ci` on Linux fails before running a single test.
-      #
-      # Resolving fresh is also the more honest test for this package. The
-      # published tarball ships no lockfile and users reach it through
-      # `npx -y @restlessai/cli@latest`, so they resolve our caret ranges at
-      # install time. This is the tree they actually get; the locked one is not.
-      # The cost is that an upstream release can turn this red without a change
-      # here, but that same release would already be reaching users.
-      #
-      # --no-package-lock because plain `npm install` still reuses the lockfile's
-      # optional set on npm 10 (Node 20 and 22), which reproduces the same
-      # missing-binary crash one step later. Only npm 11 (Node 24) re-resolves.
-      - run: npm install --no-audit --no-fund --no-package-lock
+      # npm ci, so the lockfile is authoritative and this fails loudly if it ever
+      # drifts out of sync with package.json again. It only works because the
+      # lockfile now carries all 32 platform binaries rather than just the six
+      # darwin-arm64 ones. npm records only the resolving platform's optional
+      # deps, so regenerate from a clean directory (no node_modules present) or
+      # the Linux builds of rolldown, lightningcss, and sharp go missing and
+      # every job here dies before running a test.
+      - run: npm ci --no-audit --no-fund
       - run: npm test
 
   package:
