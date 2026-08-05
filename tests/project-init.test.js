@@ -56,7 +56,20 @@ async function freshProjectInit(env = {}, { tty = true } = {}) {
   vi.resetModules();
   const saved = { ...process.env };
   const savedTty = { out: process.stdout.isTTY, in: process.stdin.isTTY };
-  for (const k of ['CLAUDECODE', 'CLAUDE_CODE', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'RESTLESS_AGENT']) {
+  // Same slate `freshEnv` in env.test.js clears, and it has to stay the same
+  // slate. CI is the one that actually bit us: GitHub Actions sets CI=true,
+  // `isPipedRun()` refuses to call a CI job agent-driven, and so the piped
+  // cases below passed locally and failed only on a runner.
+  for (const k of [
+    'CLAUDECODE',
+    'CLAUDE_CODE',
+    'CODEX_SANDBOX',
+    'CODEX_SANDBOX_NETWORK_DISABLED',
+    'RESTLESS_AGENT',
+    'CI',
+    'RESTLESS_INTERACTIVE',
+    'RESTLESS_NONINTERACTIVE',
+  ]) {
     delete process.env[k];
   }
   Object.assign(process.env, env);
