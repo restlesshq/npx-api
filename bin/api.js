@@ -24,7 +24,7 @@ import testSetup from '../steps/test-setup.js';
 import runInteractiveUpdate from '../steps/update-interactive.js';
 import runFlagUpdate, { parseUpdateFlags, UPDATE_FLAGS } from '../steps/update-flags.js';
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
-import { isInteractive, isAgent, detectAgent } from '../lib/env.js';
+import { isInteractive, isAgent, detectAgent, agentLabel } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
@@ -370,6 +370,9 @@ function printHelp() {
     console.log(`    ${cyan(name.padEnd(agentWidth))}  ${dim(hint)}`);
   }
   console.log('');
+  console.log(`    ${dim(`Not Claude Code or Codex? Add ${cyan('--agent <name>')}${'\x1b[2m'} (or set`)}`);
+  console.log(`    ${dim(`${cyan('RESTLESS_AGENT')}${'\x1b[2m'}) so the project records which agent set it up.`)}`);
+  console.log('');
   // `update` needs no TTY when it's told exactly what to do, which is the
   // only way an agent or a CI job can drive it.
   console.log(`  ${bold('Flags for')} ${cyan('update')} ${dim('(any of these skips the prompts)')}`);
@@ -401,9 +404,18 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // restores the old behaviour for CI and for agents that would rather
   // delegate the whole thing.
   const { rootDir: agentRoot } = resolveProjectDirs(process.cwd());
-  const agentName = detectAgent() === 'codex' ? 'Codex' : 'Claude Code';
-  console.log(buildAgentPlan({ rootDir: agentRoot, cli: CLI_NAME, agent: agentName }));
-  debug.log('init.agent-plan', { agent: detectAgent(), rootDir: agentRoot });
+  // `agentSlug` is null when we can tell an agent is driving but not which
+  // one (a piped run from an agent we have no marker for). The playbook uses
+  // that to ask the reader to identify itself, so the next command it runs
+  // can report a name instead of a blank.
+  const agentSlug = detectAgent();
+  console.log(buildAgentPlan({
+    rootDir: agentRoot,
+    cli: CLI_NAME,
+    agent: agentLabel(agentSlug),
+    agentSlug,
+  }));
+  debug.log('init.agent-plan', { agent: agentSlug, rootDir: agentRoot });
   await debug.flushAndExit(0);
 
 } else if (command === 'init' || command === 'setup' || command === 'supercharge') {
@@ -751,6 +763,12 @@ if (command === '--version' || command === '-v' || command === 'version') {
   if (choice === 0) setProvider('claude');
   else if (choice === 1) setProvider('codex');
 
+  // The same choice in the two shapes the rest of the run needs: a label for
+  // the screens ("Claude Code is reading your routes…") and a slug recorded
+  // on the project as the agent that ran this setup.
+  const setupAgent = ['claude', 'codex'][choice] || 'claude';
+  const setupAiTool = setupAgent === 'codex' ? 'Codex' : 'Claude Code';
+
   // "Book a quick installation call" - hand off to a human.
   if (choice === 2) {
     console.log('');
@@ -793,7 +811,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     rootDir,
     update: plan.makeUpdater(0),
     setSpinner,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+    aiTool: setupAiTool,
   });
 
   debug.log('discovered', {
@@ -814,7 +832,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
     apiDir: resolveApiDir(packageDir, oasResult.apiRootDir),
     language: oasResult.detectedLanguage,
     framework: oasResult.detectedFramework,
-    aiTool: ['Claude Code', 'Codex'][choice] || 'Claude Code',
+    aiTool: setupAiTool,
+    agent: setupAgent,
   });
   debug.log('setup-context', redactSetupContext(ctx));
 
@@ -2072,7 +2091,10 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // with it.
   if (!isInteractive() && !updateFlags) {
     const agent = detectAgent();
-    const who = agent === 'codex' ? 'Codex' : agent === 'claude' ? 'Claude Code' : 'no terminal';
+    // An agent that named itself gets named back; one we only inferred from a
+    // piped run has nothing to call it, and "no terminal" is the accurate
+    // thing to say about why the prompts aren't coming.
+    const who = agent ? agentLabel(agent) : 'no terminal';
     console.log('');
     console.log(`  ${bold('This project is set up.')} ${dim(`(${who} detected)`)}`);
     console.log('');

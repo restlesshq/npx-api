@@ -40,6 +40,15 @@ transcript; `--inline` prints it on stdout instead, but only for humans - under
 a coding agent it refuses. It also reports whether git ignores that env file
 (`envIgnoredByGit`), so the key can't slip into a commit unnoticed.
 
+**Not Claude Code or Codex?** Those two announce themselves in the environment;
+everything else we infer from a run whose input and output are both pipes,
+which is what an agent's shell tool looks like. That's enough to hand over the
+playbook instead of driving your repo from a hidden sub-agent, but it can't
+tell us *which* tool you are - so name yourself and it gets recorded on the
+project: `--agent cursor` on any command, or `RESTLESS_AGENT=cursor` in the
+environment. Piping on purpose as a human? `RESTLESS_INTERACTIVE=1` opts back
+out.
+
 Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set
 it up by hand with the commands above, book a call, or ask questions first.
@@ -174,3 +183,7 @@ Authorizing a machine needs a browser once; after that the session is reused for
  - It uses your local AI, so no code will be sent to our servers.
  - Inside a coding agent, the AI doing the work is the one you're already
    using, and nothing extra is spawned behind your back.
+ - Registering a project records two things about how setup ran: whether you
+   started it yourself or your coding agent did, and which agent did the work
+   (`--agent` / `RESTLESS_AGENT` if you set one, otherwise blank unless it's
+   Claude Code or Codex). That's it - no prompts, no code, no file contents.

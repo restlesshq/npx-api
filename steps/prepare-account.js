@@ -140,7 +140,16 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
     // project identically - including reusing this repo's existing project
     // when the key hasn't changed, instead of minting a fresh one per run and
     // leaving the previous project holding all the logs.
-    ({ projectId, setupKey, reused: reusedProject } = await ensureProject({ rootDir, apiRootDir, apiKey }));
+    //
+    // `agent` is the one the user picked on the setup screen - the only place
+    // that choice exists, since nothing in the environment says which agent a
+    // terminal run decided to hand the work to.
+    ({ projectId, setupKey, reused: reusedProject } = await ensureProject({
+      rootDir,
+      apiRootDir,
+      apiKey,
+      agent: ctx.agent,
+    }));
   } catch (err) {
     setSpinner('');
     fatalError(`Couldn't register this project with ${SITE_URL}.`, [
