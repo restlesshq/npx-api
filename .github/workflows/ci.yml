@@ -52,7 +52,11 @@ jobs:
       # install time. This is the tree they actually get; the locked one is not.
       # The cost is that an upstream release can turn this red without a change
       # here, but that same release would already be reaching users.
-      - run: npm install --no-audit --no-fund
+      #
+      # --no-package-lock because plain `npm install` still reuses the lockfile's
+      # optional set on npm 10 (Node 20 and 22), which reproduces the same
+      # missing-binary crash one step later. Only npm 11 (Node 24) re-resolves.
+      - run: npm install --no-audit --no-fund --no-package-lock
       - run: npm test
 
   package:
