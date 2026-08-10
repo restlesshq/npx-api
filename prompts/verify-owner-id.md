@@ -7,7 +7,7 @@ You are the **security verification pass** for a Restless SDK install in this {{
 
 So: be skeptical. Confirm rather than assume.
 
-**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read files inside {{vendorDir}}.**
+**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read or scan {{neverRead}}.**
 
 ## What to do
 

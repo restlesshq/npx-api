@@ -2,7 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { detectEnvLoader, envLoaderHasKey } from '../lib/envLoader.js';
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
+import { envLoaderHasKey } from '../lib/sdk-line-spec.js';
+
+// Env detection is a writer method, so these go through the registry - the
+// same path setup-context takes. Previously a three-branch if-chain in
+// envLoader.js, where a language with no branch silently got the Node answer.
+function detectEnvLoader(dir, language = 'javascript') {
+  return getSdkWriter(language).detectEnvLoader(dir);
+}
 
 function tmp() {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'envloader-')));

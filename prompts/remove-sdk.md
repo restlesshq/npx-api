@@ -34,7 +34,7 @@ For each file above (and anywhere else you find SDK code), remove:
 ## Rules
 
 - **NEVER read, open, grep, or list `.env`, `.env.*`, or any environment / secret file.** The CLI cleans those up separately. Do not touch them under any circumstances.
-- **NEVER read or scan files inside {{vendorDir}}.**
+- **NEVER read or scan {{neverRead}}.**
 - Use the **Edit** tool to remove SDK code, one file at a time. Preserve surrounding code style, indentation, and formatting exactly.
 - **Only remove SDK-related lines.** Do not refactor, rename, or "improve" surrounding code while you're in there.
 - If removing the SDK leaves a now-unused import for an unrelated module (e.g. a `path` import that was only used to construct a Restless config path), remove that too. But do not remove imports that still have other valid uses.

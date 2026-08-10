@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { detectStack, describeLanguages, unsupportedStackMessage, stackCheckDisabled } from '../lib/detect-stack.js';
+import { detectStack, unsupportedStackMessage, stackCheckDisabled } from '../lib/detect-stack.js';
+import { describeLanguage, describeLanguages, SUPPORTED_LANGUAGES } from '../lib/sdk-writers/index.js';
 
 function tmp() {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'detect-stack-')));
@@ -211,6 +212,20 @@ describe('unsupportedStackMessage', () => {
     };
     const { headline } = unsupportedStackMessage(stack, { rootDir: '/repo' });
     expect(headline).toContain('Ruby and Go');
+  });
+
+  // Regression: this copy was written out by hand and still read "JavaScript,
+  // TypeScript and Python" after Ruby and Go shipped, so a Rails user was told
+  // we could not set up the language we had just added support for.
+  it('names every language the registry can actually wire', () => {
+    const { details } = unsupportedStackMessage(
+      { supported: false, nodeEvidence: [], foreign: [{ language: 'Rust', files: ['Cargo.toml'] }], languages: ['Rust'] },
+      { rootDir: '/repo' },
+    );
+    const body = details.join('\n');
+    for (const language of SUPPORTED_LANGUAGES) {
+      expect(body).toContain(describeLanguage(language));
+    }
   });
 
   it('truncates a long evidence list', () => {

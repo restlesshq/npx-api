@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { existingRestlessKey, findExistingEnvFile, resolveApiDir } from '../steps/prepare-account.js';
+import { existingRestlessKey, findExistingEnvFile } from '../steps/prepare-account.js';
+import { resolveOwningDir } from '../lib/install-target.js';
 
 function tmp() {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'prepare-account-')));
@@ -140,25 +141,28 @@ describe('findExistingEnvFile', () => {
   });
 });
 
-describe('resolveApiDir', () => {
+// `.env` has to land in the same directory the dependency does, so this is
+// the same resolver install-sdk uses - it was a second wrapper until the two
+// were collapsed. These cases pin the JavaScript (package.json) manifest.
+describe('resolveOwningDir, for the .env location', () => {
   let root;
   beforeEach(() => { root = fs.realpathSync(tmp()); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   it('returns packageDir when apiRootDir is missing', () => {
-    expect(resolveApiDir(root, undefined)).toBe(root);
-    expect(resolveApiDir(root, '')).toBe(root);
+    expect(resolveOwningDir(root, undefined, 'javascript')).toBe(root);
+    expect(resolveOwningDir(root, '', 'javascript')).toBe(root);
   });
 
   it('returns packageDir when apiRootDir is "."', () => {
-    expect(resolveApiDir(root, '.')).toBe(root);
+    expect(resolveOwningDir(root, '.', 'javascript')).toBe(root);
   });
 
   it('returns the apiRootDir when it has its own package.json', () => {
     const sub = path.join(root, 'packages', 'api');
     fs.mkdirSync(sub, { recursive: true });
     fs.writeFileSync(path.join(sub, 'package.json'), '{}');
-    expect(resolveApiDir(root, 'packages/api')).toBe(sub);
+    expect(resolveOwningDir(root, 'packages/api', 'javascript')).toBe(sub);
   });
 
   it('walks up to the nearest ancestor with a package.json', () => {
@@ -166,13 +170,13 @@ describe('resolveApiDir', () => {
     const leaf = path.join(mid, 'src', 'routes');
     fs.mkdirSync(leaf, { recursive: true });
     fs.writeFileSync(path.join(mid, 'package.json'), '{}');
-    expect(resolveApiDir(root, 'packages/api/src/routes')).toBe(mid);
+    expect(resolveOwningDir(root, 'packages/api/src/routes', 'javascript')).toBe(mid);
   });
 
   it('falls back to packageDir when no ancestor has package.json', () => {
     const sub = path.join(root, 'src');
     fs.mkdirSync(sub, { recursive: true });
-    expect(resolveApiDir(root, 'src')).toBe(root);
+    expect(resolveOwningDir(root, 'src', 'javascript')).toBe(root);
   });
 });
 

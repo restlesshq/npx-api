@@ -2,7 +2,7 @@ The Restless SDK is already wired into this {{language}} project that uses {{fra
 
 **Your only job** is to pick a stable, immutable identity expression and patch the existing managed SDK block. Do NOT re-install anything, do NOT touch other files.
 
-**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read files inside {{vendorDir}}.**
+**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read or scan {{neverRead}}.**
 
 ## What to do
 

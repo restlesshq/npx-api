@@ -67,7 +67,9 @@ describe('getSdkWriter', () => {
     expect(err).toBeInstanceOf(UnsupportedLanguageError);
     expect(err.language).toBe('csharp');
     expect(err.message).toContain('csharp');
-    expect(err.message).toContain('javascript');
+    // Reads as prose, so it lists what we support rather than dumping the
+    // registry keys joined with " and " ("javascript and typescript and ...").
+    expect(err.message).toContain('JavaScript, TypeScript, Python, Ruby and Go');
   });
 });
 
@@ -159,5 +161,70 @@ describe('optional methods are actually optional at the call sites', () => {
       );
       expect(unguarded, `unguarded calls to ${method}`).toEqual([]);
     }
+  });
+});
+
+describe('descriptor.neverRead', () => {
+  // Regression: this was a `python ? ... : ...` in lib/ai.js, so Ruby and Go
+  // rendered `node_modules/` into the "NEVER read files inside X" line of
+  // three shipped prompts - naming a directory those projects do not have and
+  // leaving vendor/bundle/ and the Go module cache unmentioned.
+  it('names a vendored tree that actually exists for that language', () => {
+    const expected = {
+      javascript: 'node_modules/',
+      typescript: 'node_modules/',
+      python: '.venv/',
+      ruby: 'vendor/bundle/',
+      go: 'vendor/',
+    };
+    for (const [language, dir] of Object.entries(expected)) {
+      expect(getSdkWriter(language).descriptor.neverRead).toContain(dir);
+    }
+  });
+
+  it('never tells a non-Node project to avoid node_modules alone', () => {
+    for (const language of ['python', 'ruby', 'go']) {
+      const paths = getSdkWriter(language).descriptor.neverRead;
+      expect(paths.filter((p) => p !== 'node_modules/').length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('the registry is the only place that dispatches on language', () => {
+  // The registry's docstring promises that adding a language means adding it
+  // here once. That was false: envLoader.js, install-target.js, scanners.js,
+  // detect-stack.js, agent-plan.js, test-setup.js and bin/api.js each keyed off
+  // the language name themselves, and assertWriterShape checked none of them -
+  // so a new language silently got the JavaScript answer at those sites.
+  //
+  // This test keeps the promise honest. If it fails, the fix is a writer method
+  // or a descriptor field, not a branch.
+  it('no module outside lib/sdk-writers/ compares a language to a literal', () => {
+    const files = [
+      'lib/install-target.js', 'lib/scanners.js', 'lib/detect-stack.js',
+      'lib/agent-plan.js', 'lib/ai.js', 'lib/setup-context.js',
+      'steps/test-setup.js', 'steps/install-sdk.js', 'steps/final-checks.js',
+      'bin/api.js',
+    ];
+    const offenders = [];
+    for (const file of files) {
+      const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+      src.split('\n').forEach((line, i) => {
+        // Comments are allowed to name a language - several explain why the
+        // branch that used to be here is gone.
+        const code = line.replace(/\/\/.*$/, '').replace(/^\s*\*.*$/, '');
+        // `typescript` is exempt: the registry maps it to the JavaScript writer
+        // on purpose, so a descriptor cannot tell the two apart. The registry
+        // docstring names the only two things that turn on the difference -
+        // which guide we load and which config filename we emit - and those are
+        // the sites this skips.
+        for (const language of SUPPORTED_LANGUAGES.filter((l) => l !== 'typescript')) {
+          if (new RegExp(`===\\s*['"]${language}['"]|['"]${language}['"]\\s*===`).test(code)) {
+            offenders.push(`${file}:${i + 1} ${line.trim()}`);
+          }
+        }
+      });
+    }
+    expect(offenders).toEqual([]);
   });
 });

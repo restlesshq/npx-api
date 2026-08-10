@@ -8,6 +8,7 @@ import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { extractJson } from '../lib/extract-json.js';
 import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
+import { findWiredSourceFile as findWired } from '../lib/wired-file.js';
 import * as debug from '../lib/debug.js';
 import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import {
@@ -19,57 +20,17 @@ import {
 } from '../lib/sdk-writers/contract.js';
 
 /**
- * Find the entry source file the SDK is actually wired into. Two-layer
- * check (matches install-sdk's `findWiredSourceFile`): grep for any
- * `@restlessai/sdk` reference, then verify each candidate with the
- * writer's `parse()` so we don't treat a stale comment or partial
- * leftover as a wired block.
+ * The wired file, with the LOOSE predicate.
  *
- * Preference order:
- *   1. `ctx.entryFile` if install-sdk already pinned one (relative path
- *      under installDir). Saves a re-grep and keeps the two steps in
- *      lockstep.
- *   2. Grep for candidates, parse each, return the first that's a real
- *      block.
+ * final-checks wants the wider net specifically so it can find old-API files:
+ * they carry the import but no factory call, so the strict `hasInit` check
+ * rejects exactly the files the old-API repair flow exists to rewrite.
  */
 function findWiredSourceFile(installDir, ctx) {
-  const writer = getSdkWriter(ctx?.language || 'javascript');
-
-  // Plugin-style Next wiring: the setup callback (credential + owner.id)
-  // lives in restless.config.*, and that's the file the owner-id repair
-  // flows must patch. Resolve it directly - the grep below would surface
-  // next.config.* too (it also references the package), and which of the
-  // two comes back first is up to grep's walk order.
-  const plugin = nextPluginWiringStatus(installDir);
-  if (plugin.hasDefineConfig) {
-    return path.join(installDir, plugin.restlessConfigFile);
-  }
-
-  // `hasSdkReference` (loose), not `hasInit` (strict). The strict check
-  // rejects OLD-API files (they have the import but no factory call),
-  // and final-checks specifically wants to FIND those so the old-api
-  // repair flow can rewrite them. install-sdk uses hasInit for its own
-  // "should we skip the AI wiring pass?" decision, which is correct
-  // there - here we want the wider net.
-  if (ctx?.entryFile) {
-    const abs = path.isAbsolute(ctx.entryFile)
-      ? ctx.entryFile
-      : path.join(installDir, ctx.entryFile);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      if (writer.hasSdkReference(content)) return abs;
-    } catch {}
-  }
-
-  const candidates = writer.candidateWiringFiles(installDir);
-  for (const rel of candidates) {
-    const abs = path.join(installDir, rel);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      if (writer.hasSdkReference(content)) return abs;
-    } catch {}
-  }
-  return null;
+  return findWired(installDir, ctx?.language || 'javascript', {
+    loose: true,
+    entryFile: ctx?.entryFile || null,
+  });
 }
 
 /**
@@ -102,10 +63,8 @@ function findWiredSourceFile(installDir, ctx) {
 // The owner.id policy sets live in `lib/sdk-writers/contract.js`: they encode
 // what SETUP-002 means (permanent, immutable, never a credential), which is
 // identical in every language, so a Python writer inherits them rather than
-// re-listing them. Aliased to the old local names to keep the analysis below
-// reading the way it did.
-const RISKY_TOKENS = RISKY_CREDENTIAL_TOKENS;
-const PLACEHOLDER_STRINGS = PLACEHOLDER_OWNER_IDS;
+// re-listing them. Used under their canonical names - a local alias would mean
+// two names for one set forever.
 
 export function analyzeOwnerId(expr) {
   if (!expr || typeof expr !== 'string') {
@@ -132,7 +91,7 @@ export function analyzeOwnerId(expr) {
   }
 
   // Critical: raw secrets.
-  if (RISKY_TOKENS.some((t) => e.includes(t)) || /^\s*key\s*$/.test(e)) {
+  if (RISKY_CREDENTIAL_TOKENS.some((t) => e.includes(t)) || /^\s*key\s*$/.test(e)) {
     return {
       severity: 'critical',
       reason: 'looks like a raw secret (auth header, api key, token, or password)',
@@ -145,7 +104,7 @@ export function analyzeOwnerId(expr) {
   const stringLit = trimmed.match(/^(['"])(.+)\1$/);
   if (stringLit) {
     const value = stringLit[2].toLowerCase();
-    if (PLACEHOLDER_STRINGS.has(value)) {
+    if (PLACEHOLDER_OWNER_IDS.has(value)) {
       return {
         severity: 'critical',
         reason: `the literal '${stringLit[2]}' fake-groups every request under one tenant. Return \`undefined\` (or omit \`owner\`) when there's no real owner for the request.`,

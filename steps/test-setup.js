@@ -8,8 +8,8 @@ import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
-import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromPythonSource, portFromRubySource, portFromGoSource, portFromUrl, portFromDocker, frameworkDefaultPort, pythonFrameworkDefaultPort, rubyFrameworkDefaultPort, goFrameworkDefaultPort } from '../lib/test-diagnosis.js';
-import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
+import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromUrl, portFromDocker } from '../lib/test-diagnosis.js';
+import { getSdkWriter, writerForExtension } from '../lib/sdk-writers/index.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { isInteractive } from '../lib/env.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
@@ -124,74 +124,30 @@ function isDockerFile(file) {
 }
 
 /** Gem names declared by whichever Ruby manifest this dir has. */
-function rubyDeps(searchDir) {
-  const names = new Set();
-  for (const file of ['Gemfile', 'gems.rb', 'Gemfile.lock']) {
-    try {
-      const text = fs.readFileSync(path.join(searchDir, file), 'utf8');
-      for (const m of text.matchAll(/^\s*gem\s+["']([^"']+)["']/gm)) names.add(m[1].toLowerCase());
-      for (const m of text.matchAll(/^\s{4}([a-z][\w-]*)\s/gm)) names.add(m[1].toLowerCase());
-    } catch {}
-  }
-  return [...names];
-}
 
 /** Dependency names declared by whichever Python manifest this dir has. */
-function pythonDeps(searchDir) {
-  const names = new Set();
-  for (const file of ['requirements.txt', 'pyproject.toml', 'Pipfile', 'setup.py', 'setup.cfg']) {
-    try {
-      const text = fs.readFileSync(path.join(searchDir, file), 'utf8');
-      for (const m of text.matchAll(/^[\s"']*([A-Za-z][\w.-]*)/gm)) names.add(m[1].toLowerCase());
-      for (const m of text.matchAll(/["']([A-Za-z][\w.-]*)/g)) names.add(m[1].toLowerCase());
-    } catch {}
-  }
-  return [...names];
-}
 
+/**
+ * The local port the user's server listens on, strongest evidence first.
+ *
+ * One cascade for every language. It used to have six `normalizeLanguage(...)
+ * === 'go' / 'ruby' / 'python'` branches - three identical loops over a file
+ * list with a different parser, and three default-port blocks - which is the
+ * registry's dispatch rebuilt by hand in a step file. The per-language parts
+ * are now `writer.portFiles`, `writer.parsePort` and `writer.defaultLocalPort`.
+ */
 function detectLocalPort(searchDir, language = 'javascript', framework = '') {
-  let pkg = null;
-  try {
-    const pkgPath = path.join(searchDir, 'package.json');
-    if (fs.existsSync(pkgPath)) pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-  } catch {}
+  const writer = getSdkWriter(language);
 
-  // 1. Explicit port declared in package.json (scripts or config.port).
-  if (pkg) {
-    const p = portFromPackageJson(pkg);
-    if (p) return { port: p, source: 'package.json' };
-  }
-
-  // 1b. Python has no package.json to read, and its process managers put the
-  //     port in files with no Node analogue.
-  if (normalizeLanguage(language) === 'go') {
-    for (const name of ['main.go', 'Procfile', 'docker-compose.yml', 'Dockerfile']) {
-      try {
-        const full = path.join(searchDir, name);
-        if (!fs.existsSync(full)) continue;
-        const p = portFromGoSource(fs.readFileSync(full, 'utf8'));
-        if (p) return { port: p, source: name };
-      } catch {}
-    }
-  }
-  if (normalizeLanguage(language) === 'ruby') {
-    for (const name of ['Procfile', 'config/puma.rb', 'config.ru', 'Rakefile', 'docker-compose.yml']) {
-      try {
-        const full = path.join(searchDir, name);
-        if (!fs.existsSync(full)) continue;
-        const p = portFromRubySource(fs.readFileSync(full, 'utf8'));
-        if (p) return { port: p, source: name };
-      } catch {}
-    }
-  }
-  if (normalizeLanguage(language) === 'python') {
-    for (const name of ['Procfile', 'manage.py', 'pyproject.toml', 'Makefile', 'docker-compose.yml']) {
-      try {
-        const full = path.join(searchDir, name);
-        if (!fs.existsSync(full)) continue;
-        const p = portFromPythonSource(fs.readFileSync(full, 'utf8'));
-        if (p) return { port: p, source: name };
-      } catch {}
+  // 1. An explicit declaration in one of this language's config files.
+  for (const name of writer.portFiles) {
+    try {
+      const full = path.join(searchDir, name);
+      if (!fs.existsSync(full)) continue;
+      const port = writer.parsePort(fs.readFileSync(full, 'utf8'));
+      if (port) return { port, source: name };
+    } catch {
+      // Unreadable - try the next candidate.
     }
   }
 
@@ -220,7 +176,7 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
   //    localhost URL anywhere (softest, so it never pre-empts an explicit one).
   try {
     const files = execSync(
-      'find . -maxdepth 3 \\( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.py" -o -name "*.rb" -o -name "*.md" -o -name "*.mdx" -o -name "*.txt" -o -name "docker-compose*.yml" -o -name "docker-compose*.yaml" -o -name "compose.yml" -o -name "compose.yaml" -o -name "Dockerfile" \\) -not -path "*/node_modules/*" | head -100',
+      'find . -maxdepth 3 \\( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" -o -name "*.mjs" -o -name "*.cjs" -o -name "*.py" -o -name "*.rb" -o -name "*.go" -o -name "*.md" -o -name "*.mdx" -o -name "*.txt" -o -name "docker-compose*.yml" -o -name "docker-compose*.yaml" -o -name "compose.yml" -o -name "compose.yaml" -o -name "Dockerfile" \\) -not -path "*/node_modules/*" | head -100',
       { cwd: searchDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
     );
     const entries = [];
@@ -228,10 +184,11 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
       try { entries.push({ file, content: fs.readFileSync(path.join(searchDir, file), 'utf8') }); } catch {}
     }
     for (const { file, content } of entries) {
-      const p = file.endsWith('.go') ? portFromGoSource(content)
-        : file.endsWith('.py') ? portFromPythonSource(content)
-        : /\.(rb|ru)$/.test(file) ? portFromRubySource(content)
-        : portFromSource(content);
+      // Parse each file with the writer that owns its extension, so a .go file
+      // in a mixed repo is read by the Go parser even though we are set up as
+      // something else. Falls back to this language's parser for anything
+      // unclaimed (Docker files, markdown).
+      const p = (writerForExtension(path.extname(file)) || writer).parsePort(content);
       if (p) return { port: p, source: path.basename(file) };
     }
     for (const { file, content } of entries) {
@@ -246,29 +203,7 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
   } catch {}
 
   // 4. Nothing explicit - fall back to the framework's conventional default.
-  if (normalizeLanguage(language) === 'go') {
-    return { port: goFrameworkDefaultPort(), source: null };
-  }
-  if (normalizeLanguage(language) === 'ruby') {
-    const deps = rubyDeps(searchDir);
-    const d = rubyFrameworkDefaultPort(deps, framework);
-    if (d) return { port: d, source: 'the framework default' };
-    return { port: '9292', source: null };   // rackup's default, not Node's 3000
-  }
-  if (normalizeLanguage(language) === 'python') {
-    const deps = pythonDeps(searchDir);
-    const d = pythonFrameworkDefaultPort(deps, framework);
-    if (d) return { port: d, source: 'the framework default' };
-    // 3000 is a Node convention and would be wrong for every Python
-    // framework; 8000 is the closest thing Python has to a default.
-    return { port: '8000', source: null };
-  }
-  if (pkg) {
-    const d = frameworkDefaultPort(pkg);
-    if (d) return { port: d, source: 'the framework default' };
-  }
-
-  return { port: '3000', source: null };
+  return writer.defaultLocalPort(searchDir, framework) || { port: '3000', source: null };
 }
 
 export default async function testSetup({

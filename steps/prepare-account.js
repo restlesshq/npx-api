@@ -6,16 +6,6 @@ import { fatalError } from '../lib/errors.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { generateWriteKey, ensureProject } from '../lib/project-init.js';
 import * as debug from '../lib/debug.js';
-import { resolveOwningDir } from '../lib/install-target.js';
-
-/**
- * The directory that owns the detected API, so `.env` lands next to the
- * server that will read it. Shared with install-sdk so the dependency and the
- * env file can never end up in different places.
- */
-export function resolveApiDir(packageDir, apiRootDir, language) {
-  return resolveOwningDir(packageDir, apiRootDir, language);
-}
 
 /**
  * Find a real `.env` (or `.env.local`) regular file, searching from

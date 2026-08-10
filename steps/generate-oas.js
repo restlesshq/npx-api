@@ -10,6 +10,7 @@ import { fatalError } from '../lib/errors.js';
 import { scanCodebase } from '../lib/find-endpoints.js';
 import { scanFor } from '../lib/scanners.js';
 import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
+import { SUPPORTED_LANGUAGES_LABEL } from '../lib/sdk-writers/index.js';
 import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
 import { loadOas } from '../lib/oas-auth.js';
@@ -1140,7 +1141,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     labels.push(`${bold('Other')}\n${dim('tell us where to look')}`);
 
     console.log('');
-    console.log(`  ${dim('We support JavaScript, TypeScript and Python projects (more coming soon).')}`);
+    console.log(`  ${dim(`We support ${SUPPORTED_LANGUAGES_LABEL} projects (more coming soon).`)}`);
     console.log('');
     const chosenIdx = await singleSelect(labels, {
       message: apis.length === 0

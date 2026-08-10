@@ -14,8 +14,8 @@ import { countOperations } from '../lib/oas-parse.js';
 import { setGitRoot } from '../lib/pathGuard.js';
 import { flagValue, positionalArg } from '../lib/args.js';
 import generateOas from '../steps/generate-oas.js';
-import prepareAccount, { resolveApiDir } from '../steps/prepare-account.js';
-import installSdk, { resolveInstallDir } from '../steps/install-sdk.js';
+import prepareAccount from '../steps/prepare-account.js';
+import installSdk from '../steps/install-sdk.js';
 import { createSetupContext, redactSetupContext, getSdkLineSpec } from '../lib/setup-context.js';
 import verifyOwnerId from '../steps/verify-owner-id.js';
 import finalChecks from '../steps/final-checks.js';
@@ -29,6 +29,7 @@ import { buildAgentPlan } from '../lib/agent-plan.js';
 import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
 import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
+import { resolveOwningDir } from '../lib/install-target.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
@@ -857,12 +858,19 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // Build the SetupContext once we know the project shape. Every step
   // downstream reads from this object and writes back into it - no step
   // re-derives keyDelivery / envLoader / sdkLineSpec.
+  //
+  // `installDir` (where the dependency goes) and `apiDir` (where `.env` goes)
+  // are the same directory by design - the SDK and the key it reads have to
+  // land in the same project. They used to be computed by two separate
+  // helpers, `resolveInstallDir` and `resolveApiDir`, which is how they were
+  // able to disagree.
+  const owningDir = resolveOwningDir(packageDir, oasResult.apiRootDir, oasResult.detectedLanguage);
   const ctx = createSetupContext({
     packageDir,
     rootDir,
     apiRootDir: oasResult.apiRootDir,
-    installDir: resolveInstallDir(packageDir, oasResult.apiRootDir, oasResult.detectedLanguage),
-    apiDir: resolveApiDir(packageDir, oasResult.apiRootDir, oasResult.detectedLanguage),
+    installDir: owningDir,
+    apiDir: owningDir,
     language: oasResult.detectedLanguage,
     framework: oasResult.detectedFramework,
     aiTool: setupAiTool,
@@ -1053,7 +1061,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // from what setup recorded rather than from a live detection pass.
   const apiLanguage = settingsForKey.apis?.find((a) => a.rootDir === apiRootDir)?.language
     || settingsForKey.apis?.[0]?.language;
-  const apiDir = resolveApiDir(keyPkgDir, apiRootDir, apiLanguage);
+  const apiDir = resolveOwningDir(keyPkgDir, apiRootDir, apiLanguage);
 
   // Reuse a key that's already on disk rather than minting a second one for
   // the same project - a re-run that swaps the key underneath a running
@@ -1437,18 +1445,24 @@ if (command === '--version' || command === '-v' || command === 'version') {
     }
   }
 
-  // Python: there is no safe universal uninstall. `pip uninstall` would hit
-  // whichever interpreter the CLI happens to resolve, which may not be the
-  // project's virtualenv, and editing requirements.txt for someone is worse
-  // than telling them. Name the file and the line and let them do it.
+  // Only npm can remove a dependency for the user safely (see
+  // `descriptor.autoUninstall`). Everything else gets told which manifest
+  // still lists the SDK.
+  //
+  // This used to be a `=== 'python'` check on both sides, so Ruby and Go fell
+  // through to the npm path: `api reset` on a Rails-plus-React repo scanned the
+  // frontend's package.json, found no gem, and reported nothing to remove -
+  // while in the worst case running `npm uninstall` in a directory that had
+  // nothing to do with the SDK it was asked to remove.
+  const resetWriter = getSdkWriter(resetLanguage);
   let uninstalledCount = 0;
-  if (normalizeLanguage(resetLanguage) === 'python') {
-    const manifests = getSdkWriter(resetLanguage).descriptor.manifests
+
+  if (!resetWriter.descriptor.autoUninstall) {
+    const listing = resetWriter.descriptor.manifests
       .map((m) => path.join(resetRoot, m))
-      .filter((f) => fs.existsSync(f));
-    const listing = manifests.filter((f) => {
-      try { return fs.readFileSync(f, 'utf8').includes(resetSdkName); } catch { return false; }
-    });
+      .filter((f) => {
+        try { return fs.readFileSync(f, 'utf8').includes(resetSdkName); } catch { return false; }
+      });
     if (listing.length) {
       for (const f of listing) {
         console.log(yellow(`  ! ${resetSdkName} is still listed in ${path.relative(resetRoot, f)} - remove that line and re-sync your environment.`));
@@ -1457,27 +1471,27 @@ if (command === '--version' || command === '-v' || command === 'version') {
       console.log(dim(`  • ${resetSdkName} not listed in any manifest.`));
     }
     uninstalledCount = listing.length;
-  }
-  const pkgFiles = normalizeLanguage(resetLanguage) === 'python' ? [] : findPackageJsons(resetRoot);
-  for (const pkgPath of pkgFiles) {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      const inDeps = pkg.dependencies && '@restlessai/sdk' in pkg.dependencies;
-      const inDev = pkg.devDependencies && '@restlessai/sdk' in pkg.devDependencies;
-      if (!inDeps && !inDev) continue;
-      const pkgDir = path.dirname(pkgPath);
-      const rel = path.relative(resetRoot, pkgPath) || 'package.json';
+  } else {
+    for (const pkgPath of findPackageJsons(resetRoot)) {
       try {
-        execSync('npm uninstall @restlessai/sdk', { cwd: pkgDir, stdio: 'pipe' });
-        console.log(green(`  ✓ Uninstalled @restlessai/sdk in ${rel}`));
-        uninstalledCount++;
-      } catch {
-        console.log(yellow(`  ! Could not run npm uninstall in ${rel} - remove manually.`));
-      }
-    } catch {}
-  }
-  if (uninstalledCount === 0 && normalizeLanguage(resetLanguage) !== 'python') {
-    console.log(dim('  • @restlessai/sdk not listed in any package.json.'));
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        const inDeps = pkg.dependencies && resetSdkName in pkg.dependencies;
+        const inDev = pkg.devDependencies && resetSdkName in pkg.devDependencies;
+        if (!inDeps && !inDev) continue;
+        const pkgDir = path.dirname(pkgPath);
+        const rel = path.relative(resetRoot, pkgPath) || 'package.json';
+        try {
+          execSync(`npm uninstall ${resetSdkName}`, { cwd: pkgDir, stdio: 'pipe' });
+          console.log(green(`  ✓ Uninstalled ${resetSdkName} in ${rel}`));
+          uninstalledCount++;
+        } catch {
+          console.log(yellow(`  ! Could not run npm uninstall in ${rel} - remove manually.`));
+        }
+      } catch {}
+    }
+    if (uninstalledCount === 0) {
+      console.log(dim(`  • ${resetSdkName} not listed in any package.json.`));
+    }
   }
 
   // d. Strip RESTLESS_KEY from .env files (no AI - we never let the model
@@ -1524,7 +1538,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // so on a Python project reset would report "nothing to remove" and leave
   // the wiring in place. `.restless/` is deleted by the time we get here, so
   // read the language before that happens (captured above as `resetLanguage`).
-  const resetWriter = getSdkWriter(resetLanguage);
+  // Same `resetWriter` the uninstall step above resolved.
   const sdkFiles = resetWriter.candidateWiringFiles(resetRoot);
   if (sdkFiles.length === 0) {
     console.log(dim(`  • No ${resetWriter.descriptor.packageSpecifier} references in source files.`));
