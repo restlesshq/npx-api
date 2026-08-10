@@ -26,6 +26,7 @@ import runFlagUpdate, { parseUpdateFlags, UPDATE_FLAGS } from '../steps/update-f
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive, isAgent, detectAgent, agentLabel } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
+import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
@@ -404,6 +405,33 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // restores the old behaviour for CI and for agents that would rather
   // delegate the whole thing.
   const { rootDir: agentRoot } = resolveProjectDirs(process.cwd());
+
+  // Same gate the interactive path applies in generate-oas, checked here too
+  // because this branch hands over a playbook and exits without ever reaching
+  // detection. Without it an agent pointed at a Django repo gets told to run
+  // `npm install @restlessai/sdk` and wire Express middleware.
+  if (!stackCheckDisabled()) {
+    const stack = detectStack(agentRoot);
+    debug.log('init.agent-plan.stack-check', {
+      supported: stack.supported,
+      languages: stack.languages,
+      nodeEvidence: stack.nodeEvidence,
+    });
+    if (!stack.supported) {
+      const { headline, details } = unsupportedStackMessage(stack, {
+        rootDir: agentRoot,
+        cliName: CLI_NAME,
+      });
+      try {
+        fatalError(headline, details);
+      } catch {
+        // fatalError throws FatalExit to stop its caller; here we're already
+        // at the exit, so swallow it and flush on the failure code.
+      }
+      await debug.flushAndExit(1);
+    }
+  }
+
   // `agentSlug` is null when we can tell an agent is driving but not which
   // one (a piped run from an agent we have no marker for). The playbook uses
   // that to ask the reader to identify itself, so the next command it runs

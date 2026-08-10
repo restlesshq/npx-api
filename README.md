@@ -6,6 +6,26 @@ It's not just another observability platform (although you can use it to see wha
 
 Think of us more as an API success platform. We give humans, AI and you the tools to quickly make successful calls.
 
+# Supported stacks
+
+Node and TypeScript APIs: Express, Fastify, Koa, Hono, NestJS, and Next.js (App
+Router or Pages Router). That's what the SDK and this setup flow cover today.
+
+If `npx api init` finds another language's project (a `requirements.txt`,
+`pyproject.toml`, `go.mod`, `Gemfile`, `composer.json`, `Cargo.toml`, and so on)
+and no Node HTTP server anywhere in the tree, it tells you and stops rather than
+scanning a codebase it can't wire up. Python, Go, and Ruby SDKs are on the
+roadmap, and the call it prints is the fastest way to get on the list.
+
+The check only fires when there's no Node server to find, so a Node API that
+keeps Python build scripts around is unaffected. If it does misjudge your repo -
+an HTTP framework we don't know by name, or a bare `node:http` server we
+couldn't see - skip it and scan anyway:
+
+```
+RESTLESS_SKIP_STACK_CHECK=1 npx api init
+```
+
 # What lands in your project
 
  - `.restless/` - your API's OpenAPI spec plus the settings the SDK reads at

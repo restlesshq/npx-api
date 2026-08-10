@@ -8,12 +8,14 @@ import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/se
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
 import { scanCodebase } from '../lib/find-endpoints.js';
+import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
 import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
 import { safeWriteFileSync, safeMkdirSync } from '../lib/pathGuard.js';
 import { isInteractive } from '../lib/env.js';
+import { CLI_NAME } from '../lib/config.js';
 import {
   MANAGED_OAS_FILE,
   adoptOasFile,
@@ -1052,6 +1054,28 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       ]});
       debug.log('generate-oas.reused', { oasFile: chosen.api.oasFile, endpoints: chosen.endpoints });
       return shapeFromRemembered(chosen.api);
+    }
+  }
+
+  // Bail on a repo we can't set up BEFORE spending an AI pass on it. Detection
+  // is Node-only end to end, and the "we couldn't find any APIs" picker below
+  // offers exactly one option - a free-form hint that re-runs the same
+  // Node-only scan - so a Python repo used to loop there indefinitely with no
+  // way out but Ctrl-C. Scoped to `packageDir` because that's the tree
+  // `locateApis` actually scans.
+  if (!stackCheckDisabled()) {
+    const stack = detectStack(packageDir);
+    debug.log('generate-oas.stack-check', {
+      supported: stack.supported,
+      languages: stack.languages,
+      nodeEvidence: stack.nodeEvidence,
+    });
+    if (!stack.supported) {
+      const { headline, details } = unsupportedStackMessage(stack, {
+        rootDir: packageDir,
+        cliName: CLI_NAME,
+      });
+      fatalError(headline, details);
     }
   }
 
