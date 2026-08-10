@@ -58,10 +58,9 @@ describe('detectStack', () => {
       ]);
     });
 
-    it('flags Go, Ruby, PHP, Rust, Java and .NET projects', () => {
+    it('flags Go, PHP, Rust, Java and .NET projects', () => {
       const cases = [
         ['go.mod', 'module example.com/api\n', 'Go'],
-        ['Gemfile', "source 'https://rubygems.org'\ngem 'rails'\n", 'Ruby'],
         ['composer.json', '{"require":{"laravel/framework":"^11"}}', 'PHP'],
         ['Cargo.toml', '[package]\nname = "api"\n', 'Rust'],
         ['pom.xml', '<project></project>', 'Java'],
@@ -121,9 +120,9 @@ describe('detectStack', () => {
 
     it('allows a bare node:http server with no framework dependency at all', () => {
       // No recognizable dep and no matched route - only the source marker
-      // stands between this repo and a wrong "we do not support Ruby" exit.
+      // stands between this repo and a wrong "we do not support Go" exit.
       write(dir, 'package.json', pkg({}));
-      write(dir, 'Gemfile', "source 'https://rubygems.org'\n");
+      write(dir, 'go.mod', 'module x\n');
       write(dir, 'server.mjs', "import { createServer } from 'node:http';\ncreateServer(handler).listen(3000);\n");
       const stack = detectStack(dir);
       expect(stack.supported).toBe(true);
