@@ -211,3 +211,55 @@ describe('against the real pet-store fixture', () => {
     expect(f.ownerIdExpr).toBe('workspace_id');
   });
 });
+
+describe('the shapes real Ruby apps actually use', () => {
+  it('reads a Rails wiring that has no require line', () => {
+    // Found end to end: Bundler auto-requires gems, so config/application.rb
+    // wires the SDK with no `require "restless"` anywhere in the file.
+    // Demanding an import would report every Rails install as unwired.
+    const src = [
+      'require_relative "boot"',
+      'require "rails/all"',
+      '',
+      'CLIENT = Restless.new(ENV["RESTLESS_KEY"])',
+      '',
+      'CLIENT.setup do |request|',
+      '  result = { api_key: CLIENT.mask(request.header("Authorization")) }',
+      '  workspace_id = resolve_workspace(request.header("Authorization"))',
+      '  if workspace_id',
+      '    result[:owner] = { id: workspace_id, enrich: method(:load_workspace) }',
+      '  end',
+      '  result',
+      'end',
+      '',
+      'module Railsy',
+      '  class Application < Rails::Application',
+      '    config.middleware.insert_before 0, CLIENT.rack',
+      '  end',
+      'end',
+    ].join('\n');
+
+    expect(src).not.toContain('require "restless"');
+    expect(rb.hasInit(src)).toBe(true);
+    const f = rb.readBlockFields(src);
+    expect(f.initArgForm).toBe('env-ref');
+    expect(f.credentialExpr).toBe('request.header("Authorization")');
+    expect(f.ownerIdExpr).toBe('workspace_id');
+  });
+
+  it('reads an inline owner hash in a config.ru', () => {
+    const src = [
+      'require "restless"',
+      'CLIENT = Restless.new(ENV["RESTLESS_KEY"])',
+      'CLIENT.setup do |request|',
+      '  { api_key: CLIENT.mask(request.header("Authorization")),',
+      '    owner: { id: request.header("X-Workspace-Id"), enrich: ->(id) { { label: id } } } }',
+      'end',
+      'use CLIENT.rack',
+      'run App',
+    ].join('\n');
+    const f = rb.readBlockFields(src);
+    expect(f.credentialExpr).toBe('request.header("Authorization")');
+    expect(f.ownerIdExpr).toBe('request.header("X-Workspace-Id")');
+  });
+});

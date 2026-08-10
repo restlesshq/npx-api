@@ -12,15 +12,16 @@ Think of us more as an API success platform. We give humans, AI and you the tool
 | --- | --- |
 | JavaScript / TypeScript | Express, Fastify, Koa, Hono, NestJS, Next.js (App or Pages Router) |
 | Python | Flask, Django, FastAPI, Starlette, and anything else speaking WSGI or ASGI |
+| Ruby | Rails, Sinatra, Hanami, Grape, Roda, and anything else speaking Rack |
 
-Go and Ruby SDKs exist and their CLI support is next.
+A Go SDK exists and its CLI support is next.
 
 A repo can hold more than one. A Django API behind a Next.js frontend is two
 real APIs, and setup scans for both and asks which you meant rather than
 picking for you.
 
 If `npx api init` finds only a language we can't wire yet (a `go.mod`,
-`Gemfile`, `composer.json`, `Cargo.toml`, and so on) it tells you and stops
+`composer.json`, `Cargo.toml`, and so on) it tells you and stops
 rather than scanning a codebase it can't set up. The call it prints is the
 fastest way to get your language moved up.
 
