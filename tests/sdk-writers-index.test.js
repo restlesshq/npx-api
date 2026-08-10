@@ -46,6 +46,17 @@ describe('getSdkWriter', () => {
     expect(getSdkWriter(undefined)).toBe(jsWriter);
   });
 
+  it('still refuses Python while Phase 1b is incomplete', () => {
+    // lib/sdk-writers/python.js exists and passes assertWriterShape, but a
+    // writer alone does not make a language installable. This registry is the
+    // ship gate: until endpoint detection, install-dir resolution, the
+    // installed-check and the guide are all in place (and restless-sdk is on
+    // PyPI), Python must stay unreachable rather than half-work. Delete this
+    // test in the same change that registers the writer.
+    expect(() => getSdkWriter('python')).toThrow(UnsupportedLanguageError);
+    expect(SUPPORTED_LANGUAGES).not.toContain('python');
+  });
+
   it('THROWS for a language with no writer instead of silently using JS', () => {
     // The whole point of the registry. The old `writers[language] || jsWriter`
     // handed a Python repo the JavaScript writer, which then matched none of
@@ -122,7 +133,14 @@ describe('SUPPORTED_LANGUAGES', () => {
         expect(typeof descriptor.fields[concept], `${lang}.fields.${concept}`).toBe('string');
       }
       expect(descriptor.commentPrefix).toBeTruthy();
-      expect(['method', 'package']).toContain(descriptor.maskCall.style);
+      // A list, not one value: Python reaches mask as both a staticmethod
+      // and a module export, so a single-style field could not describe it.
+      expect(descriptor.maskCall.styles.length).toBeGreaterThan(0);
+      for (const style of descriptor.maskCall.styles) {
+        expect(['method', 'module', 'package']).toContain(style);
+      }
+      expect(descriptor.searchPattern).toBeTruthy();
+      expect(descriptor.searchGlobs.length).toBeGreaterThan(0);
     }
   });
 });
