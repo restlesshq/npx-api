@@ -12,8 +12,7 @@ import {
   portFromSource,
   portFromUrl,
   portFromDocker,
-  frameworkDefaultPort,
-} from '../lib/test-diagnosis.js';
+  frameworkDefaultPort, pythonFrameworkDefaultPort, portFromPythonSource } from '../lib/test-diagnosis.js';
 
 // eslint-disable-next-line no-control-regex
 const strip = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, '');
@@ -298,5 +297,38 @@ describe('fixContext stale-key', () => {
   it('defaults the CLI name to api', () => {
     const c = fixContext('stale-key', { localBase: 'http://localhost:3001' });
     expect(c.guidance).toContain('npx api key');
+  });
+});
+
+describe('Python port heuristics', () => {
+  it('knows each framework\'s conventional default', () => {
+    // 3000 is a Node convention. Guessing it for Django sends `npx api
+    // verify` at a closed port and reads as "the SDK isn't working".
+    expect(pythonFrameworkDefaultPort(['django'])).toBe('8000');
+    expect(pythonFrameworkDefaultPort(['flask'])).toBe('5000');
+    expect(pythonFrameworkDefaultPort(['fastapi', 'uvicorn'])).toBe('8000');
+    expect(pythonFrameworkDefaultPort(['bottle'])).toBe('8080');
+    expect(pythonFrameworkDefaultPort(['pyramid'])).toBe('6543');
+    expect(pythonFrameworkDefaultPort(['tornado'])).toBe('8888');
+  });
+
+  it('falls back to the detected framework name when deps are unreadable', () => {
+    expect(pythonFrameworkDefaultPort([], 'Flask')).toBe('5000');
+    expect(pythonFrameworkDefaultPort([], 'FastAPI')).toBe('8000');
+    expect(pythonFrameworkDefaultPort([], 'unknown')).toBeNull();
+  });
+
+  it('reads an explicit port out of Python source and process config', () => {
+    expect(portFromPythonSource('app.run(port=5001)')).toBe('5001');
+    expect(portFromPythonSource('app.run(host="0.0.0.0", port=8080)')).toBe('8080');
+    expect(portFromPythonSource('uvicorn.run(app, port=9000)')).toBe('9000');
+    expect(portFromPythonSource('python manage.py runserver 0.0.0.0:8001')).toBe('8001');
+    expect(portFromPythonSource('web: gunicorn --bind 0.0.0.0:8002 app:app')).toBe('8002');
+    expect(portFromPythonSource('uvicorn app:app --port 8003')).toBe('8003');
+  });
+
+  it('returns null rather than guessing when nothing is declared', () => {
+    expect(portFromPythonSource('def handler(): pass')).toBeNull();
+    expect(portFromPythonSource('')).toBeNull();
   });
 });

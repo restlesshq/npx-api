@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { runAI, loadPrompt, pkgRoot } from '../lib/ai.js';
+import { runAI, loadPrompt, loadPromptForLanguage, pkgRoot } from '../lib/ai.js';
 import { bold, dim, green, red, cyan, yellow, orange, ask, terminalPrompt, waitForKey } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { CLI_NAME } from '../lib/config.js';
@@ -197,11 +197,12 @@ export function resolveInstallDir(packageDir, apiRootDir, language) {
 export function inlineKeyIntoSource(installDir, apiKey) {
   let touched = [];
   try {
-    // JAVASCRIPT-ONLY, by construction: everything below matches CJS/ESM
-    // require and import call shapes. Left on the raw grep rather than the
-    // writer's `candidateWiringFiles` because routing the search through the
-    // writer while the patching stays JS would only hide that. Porting this
-    // is part of adding a language, not part of the shared plumbing.
+    // DEAD CODE, and JavaScript-only by construction. Nothing calls this
+    // function: the inline-key path is handled by `canonicalizeInitArg`,
+    // which goes through the writer and works in every language. Everything
+    // below matches CJS/ESM require shapes by regex, so it was never going
+    // to port - but it is exported, so it is left here until someone
+    // confirms no consumer outside this repo imports it.
     const files = findSdkReferences(installDir);
     const literal = JSON.stringify(apiKey);
     const TODO = '// TODO: move this out of the codebase before committing';
@@ -524,7 +525,7 @@ export default async function installSdk({
   const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
   const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
   const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
-  const basePrompt = loadPrompt('setup-sdk', {
+  const basePrompt = loadPromptForLanguage('setup-sdk', guideLanguage, {
     language: detectedLanguage,
     framework: detectedFramework || detectedLanguage,
     guide: setupSection,

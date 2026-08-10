@@ -4,7 +4,7 @@ import { bold, dim, green, yellow, red, cyan, orange, ask, askYesNo, waitForKey 
 import { loadSettings } from '../lib/settings.js';
 import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
-import { runAI, loadPrompt } from '../lib/ai.js';
+import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { extractJson } from '../lib/extract-json.js';
 import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
@@ -396,7 +396,10 @@ export function runChecks(ctx) {
   // see one here, every downstream check (init form, credential, owner)
   // is reading from a broken block, so surface this first and route the
   // user into a focused AI rewrite.
-  const oldApiHit = writer.findOldApiSetup(content);
+  // Optional method: only the JavaScript writer has an old API to migrate
+  // from (see OPTIONAL_WRITER_METHODS). Calling it unconditionally would
+  // throw TypeError on every Python run.
+  const oldApiHit = writer.findOldApiSetup ? writer.findOldApiSetup(content) : null;
   if (oldApiHit !== null) {
     rows.push({
       kind: 'old-api',
@@ -585,6 +588,7 @@ async function repairOwnerId({ ctx, sourceFile, writer, update, setSpinner, subI
 
   try {
     const prompt = loadPrompt('fix-owner-id', {
+      ...languagePromptVars(ctx?.language),
       language: ctx.language || 'javascript',
       framework: ctx.framework || ctx.language || 'your framework',
     });

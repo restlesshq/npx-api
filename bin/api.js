@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { bold, dim, green, red, cyan, yellow, orange, brand, white, muted, ask, askYesNo, startSpinner, singleSelect, actionPicker, typeLine, typeOut, inlineStatus, waitForKey, animateLogoIn, printLogo, suppressInput, clearScreen, setLogoSubtitle, isAbortKey } from '../lib/ui.js';
-import { runAI, loadPrompt, setProvider } from '../lib/ai.js';
+import { runAI, loadPrompt, languagePromptVars, setProvider } from '../lib/ai.js';
 import { createPlanManager } from '../lib/runner.js';
 import { resolveProjectDirs, findGitRoot, isGitIgnored } from '../lib/project.js';
 import { countOperations } from '../lib/oas-parse.js';
@@ -26,6 +26,8 @@ import runFlagUpdate, { parseUpdateFlags, UPDATE_FLAGS } from '../steps/update-f
 import { SITE_URL, CALENDLY_URL, CLI_NAME } from '../lib/config.js';
 import { isInteractive, isAgent, detectAgent, agentLabel } from '../lib/env.js';
 import { buildAgentPlan } from '../lib/agent-plan.js';
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
+import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
 import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
@@ -410,6 +412,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // because this branch hands over a playbook and exits without ever reaching
   // detection. Without it an agent pointed at a Django repo gets told to run
   // `npm install @restlessai/sdk` and wire Express middleware.
+  let agentLanguages = ['javascript'];
   if (!stackCheckDisabled()) {
     const stack = detectStack(agentRoot);
     debug.log('init.agent-plan.stack-check', {
@@ -430,6 +433,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       }
       await debug.flushAndExit(1);
     }
+    agentLanguages = stack.setupLanguages;
   }
 
   // `agentSlug` is null when we can tell an agent is driving but not which
@@ -442,6 +446,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     cli: CLI_NAME,
     agent: agentLabel(agentSlug),
     agentSlug,
+    languages: agentLanguages,
   }));
   debug.log('init.agent-plan', { agent: agentSlug, rootDir: agentRoot });
   await debug.flushAndExit(0);
@@ -979,8 +984,32 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(0);
   }
 
-  const langAliases = { sdk: 'javascript', js: 'javascript', node: 'javascript', typescript: 'javascript', ts: 'javascript' };
-  const lang = langAliases[topic] || topic || 'javascript';
+  // `guide sdk` must resolve to the language of THIS repo, not to JavaScript.
+  // The agent playbook tells the reader to run exactly that command, so a
+  // hardcoded default handed an agent working in a Django project the
+  // Express/Next wiring instructions - confidently, and in full.
+  //
+  // Order: an explicit `guide python` wins, then what setup recorded in
+  // .restless/settings.json, then a fresh detection pass, then JavaScript.
+  let lang;
+  if (topic && topic !== 'sdk') {
+    lang = normalizeLanguage(topic);
+  } else {
+    const { rootDir: gRoot, packageDir: gPkg } = resolveProjectDirs(process.cwd());
+    const recorded = loadSettings(gRoot).apis?.[0]?.language;
+    if (recorded) {
+      lang = normalizeLanguage(recorded);
+    } else {
+      let routed = [];
+      try { routed = detectStack(gPkg).setupLanguages; } catch {}
+      // Prefer a non-JS routed language: a Python repo with a package.json
+      // for its frontend routes as both, and the SDK guide it needs is the
+      // one for the API, not the one for the build tooling.
+      lang = normalizeLanguage(routed.find((l) => l !== 'javascript' && l !== 'typescript') || routed[0] || 'javascript');
+    }
+  }
+  // TypeScript shares the JavaScript guide.
+  if (lang === 'typescript') lang = 'javascript';
   const guidePath = path.join(PKG_DIR, 'docs', 'sdks', `${lang}.md`);
   if (!fs.existsSync(guidePath) || lang.startsWith('_')) {
     // `_`-prefixed files are archived guides, not something to offer.
@@ -1359,13 +1388,19 @@ if (command === '--version' || command === '-v' || command === 'version') {
 } else if (command === 'reset') {
   const cwd = process.cwd();
   const { rootDir: resetRoot } = resolveProjectDirs(cwd);
+  // Read the language BEFORE `.restless/` is deleted below - it is the only
+  // record of what this project was set up as, and the grep for SDK wiring
+  // needs it. Falls back to JavaScript, which is what every pre-Python
+  // project recorded (or omitted).
+  const resetLanguage = loadSettings(resetRoot).apis?.[0]?.language || 'javascript';
+  const resetSdkName = getSdkWriter(resetLanguage).descriptor.packageSpecifier;
 
   console.log('');
   console.log(`  ${bold(yellow('This will reset Restless from this project.'))}`);
   console.log('');
   console.log(`  About to:`);
   console.log(`    ${dim('•')} Remove the ${cyan('.restless/')} directory`);
-  console.log(`    ${dim('•')} Uninstall ${cyan('@restlessai/sdk')} from every ${cyan('package.json')} found`);
+  console.log(`    ${dim('•')} Uninstall ${cyan(resetSdkName)} from your project manifests`);
   console.log(`    ${dim('•')} Ask AI to strip SDK setup code from your source files`);
   console.log(`    ${dim('•')} Remove ${cyan('RESTLESS_KEY')} from any ${cyan('.env*')} files`);
   console.log('');
@@ -1402,8 +1437,28 @@ if (command === '--version' || command === '-v' || command === 'version') {
     }
   }
 
-  const pkgFiles = findPackageJsons(resetRoot);
+  // Python: there is no safe universal uninstall. `pip uninstall` would hit
+  // whichever interpreter the CLI happens to resolve, which may not be the
+  // project's virtualenv, and editing requirements.txt for someone is worse
+  // than telling them. Name the file and the line and let them do it.
   let uninstalledCount = 0;
+  if (normalizeLanguage(resetLanguage) === 'python') {
+    const manifests = getSdkWriter(resetLanguage).descriptor.manifests
+      .map((m) => path.join(resetRoot, m))
+      .filter((f) => fs.existsSync(f));
+    const listing = manifests.filter((f) => {
+      try { return fs.readFileSync(f, 'utf8').includes(resetSdkName); } catch { return false; }
+    });
+    if (listing.length) {
+      for (const f of listing) {
+        console.log(yellow(`  ! ${resetSdkName} is still listed in ${path.relative(resetRoot, f)} - remove that line and re-sync your environment.`));
+      }
+    } else {
+      console.log(dim(`  • ${resetSdkName} not listed in any manifest.`));
+    }
+    uninstalledCount = listing.length;
+  }
+  const pkgFiles = normalizeLanguage(resetLanguage) === 'python' ? [] : findPackageJsons(resetRoot);
   for (const pkgPath of pkgFiles) {
     try {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
@@ -1421,7 +1476,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       }
     } catch {}
   }
-  if (uninstalledCount === 0) {
+  if (uninstalledCount === 0 && normalizeLanguage(resetLanguage) !== 'python') {
     console.log(dim('  • @restlessai/sdk not listed in any package.json.'));
   }
 
@@ -1465,9 +1520,14 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // no package dep) - lower chance it tries to "fix" what we just
   // removed. We never tell it about the .env step; the prompt forbids
   // reading those anyway.
-  const sdkFiles = findSdkReferences(resetRoot);
+  // Language-aware: the default grep looks for `@restlessai/sdk` in JS files,
+  // so on a Python project reset would report "nothing to remove" and leave
+  // the wiring in place. `.restless/` is deleted by the time we get here, so
+  // read the language before that happens (captured above as `resetLanguage`).
+  const resetWriter = getSdkWriter(resetLanguage);
+  const sdkFiles = resetWriter.candidateWiringFiles(resetRoot);
   if (sdkFiles.length === 0) {
-    console.log(dim('  • No @restlessai/sdk references in source files.'));
+    console.log(dim(`  • No ${resetWriter.descriptor.packageSpecifier} references in source files.`));
   } else {
     const claudeOk = hasClaude();
     const codexOk = hasCodex() && hasCodexAuth();
@@ -1480,6 +1540,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       console.log(`  ${dim('Asking')} ${cyan(claudeOk ? 'Claude' : 'Codex')} ${dim('to strip SDK setup code from your source...')}`);
       try {
         const prompt = loadPrompt('remove-sdk', {
+          ...languagePromptVars(resetLanguage),
           files: sdkFiles.map((f) => `- ${f}`).join('\n'),
         });
         await runAI(prompt, resetRoot);

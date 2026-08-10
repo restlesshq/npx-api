@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
 import {
   getSdkWriter,
   isSupportedLanguage,
@@ -130,6 +131,31 @@ describe('SUPPORTED_LANGUAGES', () => {
       }
       expect(descriptor.searchPattern).toBeTruthy();
       expect(descriptor.searchGlobs.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('optional methods are actually optional at the call sites', () => {
+  it('every step guards a method a writer may not implement', () => {
+    // Regression: final-checks called writer.findOldApiSetup(content)
+    // unconditionally. Python does not implement it (nothing else has an old
+    // API to migrate from), so every Python run would have died with
+    // "writer.findOldApiSetup is not a function" inside final checks.
+    const python = getSdkWriter('python');
+    const missing = OPTIONAL_WRITER_METHODS.filter((m) => typeof python[m] !== 'function');
+    expect(missing).toContain('findOldApiSetup');
+
+    const sources = [
+      'steps/final-checks.js', 'steps/install-sdk.js', 'steps/verify-owner-id.js',
+    ].map((f) => readFileSync(new URL(`../${f}`, import.meta.url), 'utf8')).join('\n');
+
+    for (const method of missing) {
+      // Every line that CALLS the method must also test for it first.
+      const unguarded = sources.split('\n').filter(
+        (line) => new RegExp(`writer\\.${method}\\s*\\(`).test(line)
+          && !new RegExp(`writer\\.${method}\\s*(\\?|&&)`).test(line),
+      );
+      expect(unguarded, `unguarded calls to ${method}`).toEqual([]);
     }
   });
 });

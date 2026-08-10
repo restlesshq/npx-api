@@ -2,12 +2,12 @@ The Restless SDK is already wired into this {{language}} project that uses {{fra
 
 **Your only job** is to pick a stable, immutable identity expression and patch the existing managed SDK block. Do NOT re-install anything, do NOT touch other files.
 
-**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read files inside node_modules/.**
+**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read files inside {{vendorDir}}.**
 
 ## What to do
 
-1. **Find the file containing the SDK setup code.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
-   - Classic: a server file with `restless()` / `require('@restlessai/sdk')()` plus an `sdk.setup((req) => ({ ... }))` registration.
+1. **Find the file containing the SDK setup code.** Run `grep -rE "{{sdkPackage}}" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
+   - Classic: a server file with `restless()` / `require('{{sdkPackage}}')()` plus an `sdk.setup((req) => ({ ... }))` registration.
    - Next.js single-config: a `restless.config.*` at the project root containing `defineConfig({ setup: async (req) => ({ ... }) })` (ignore `next.config.*` - it only wraps the build config and holds no owner).
 
    That's the only file you should edit.
@@ -55,7 +55,7 @@ The Restless SDK is already wired into this {{language}} project that uses {{fra
 
 ## Rules
 
-- Only edit the file containing the SDK block. Do not modify package.json, .gitignore, tsconfig, Dockerfiles, or CI config.
+- Only edit the file containing the SDK block. Do not modify {{manifest}}, .gitignore, tsconfig, Dockerfiles, or CI config.
 - Do not install packages.
 - Do not read .env or any file in node_modules.
 - Keep your change minimal: just add or replace the `owner.id` line.

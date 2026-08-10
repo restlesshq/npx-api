@@ -6,9 +6,10 @@ import { bold, dim, green, red, yellow, cyan, orange, singleSelect, ask, askYesN
 import { startStep } from '../lib/step-template.js';
 import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
-import { runAI, loadPrompt } from '../lib/ai.js';
+import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
-import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromUrl, portFromDocker, frameworkDefaultPort } from '../lib/test-diagnosis.js';
+import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromPythonSource, portFromUrl, portFromDocker, frameworkDefaultPort, pythonFrameworkDefaultPort } from '../lib/test-diagnosis.js';
+import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { isInteractive } from '../lib/env.js';
 import { findTestCandidates, buildCurl } from '../lib/test-endpoint.js';
@@ -122,7 +123,20 @@ function isDockerFile(file) {
   return /(?:^|\/)(?:docker-compose[^/]*\.ya?ml|compose\.ya?ml|Dockerfile)$/i.test(file);
 }
 
-function detectLocalPort(searchDir) {
+/** Dependency names declared by whichever Python manifest this dir has. */
+function pythonDeps(searchDir) {
+  const names = new Set();
+  for (const file of ['requirements.txt', 'pyproject.toml', 'Pipfile', 'setup.py', 'setup.cfg']) {
+    try {
+      const text = fs.readFileSync(path.join(searchDir, file), 'utf8');
+      for (const m of text.matchAll(/^[\s"']*([A-Za-z][\w.-]*)/gm)) names.add(m[1].toLowerCase());
+      for (const m of text.matchAll(/["']([A-Za-z][\w.-]*)/g)) names.add(m[1].toLowerCase());
+    } catch {}
+  }
+  return [...names];
+}
+
+function detectLocalPort(searchDir, language = 'javascript', framework = '') {
   let pkg = null;
   try {
     const pkgPath = path.join(searchDir, 'package.json');
@@ -133,6 +147,19 @@ function detectLocalPort(searchDir) {
   if (pkg) {
     const p = portFromPackageJson(pkg);
     if (p) return { port: p, source: 'package.json' };
+  }
+
+  // 1b. Python has no package.json to read, and its process managers put the
+  //     port in files with no Node analogue.
+  if (normalizeLanguage(language) === 'python') {
+    for (const name of ['Procfile', 'manage.py', 'pyproject.toml', 'Makefile', 'docker-compose.yml']) {
+      try {
+        const full = path.join(searchDir, name);
+        if (!fs.existsSync(full)) continue;
+        const p = portFromPythonSource(fs.readFileSync(full, 'utf8'));
+        if (p) return { port: p, source: name };
+      } catch {}
+    }
   }
 
   // 2. .env* files. We don't list every variant by hand - glob the dir. We
@@ -168,7 +195,7 @@ function detectLocalPort(searchDir) {
       try { entries.push({ file, content: fs.readFileSync(path.join(searchDir, file), 'utf8') }); } catch {}
     }
     for (const { file, content } of entries) {
-      const p = portFromSource(content);
+      const p = file.endsWith('.py') ? portFromPythonSource(content) : portFromSource(content);
       if (p) return { port: p, source: path.basename(file) };
     }
     for (const { file, content } of entries) {
@@ -183,6 +210,14 @@ function detectLocalPort(searchDir) {
   } catch {}
 
   // 4. Nothing explicit - fall back to the framework's conventional default.
+  if (normalizeLanguage(language) === 'python') {
+    const deps = pythonDeps(searchDir);
+    const d = pythonFrameworkDefaultPort(deps, framework);
+    if (d) return { port: d, source: 'the framework default' };
+    // 3000 is a Node convention and would be wrong for every Python
+    // framework; 8000 is the closest thing Python has to a default.
+    return { port: '8000', source: null };
+  }
   if (pkg) {
     const d = frameworkDefaultPort(pkg);
     if (d) return { port: d, source: 'the framework default' };
@@ -221,7 +256,7 @@ export default async function testSetup({
   // the detected port plus any base path the OAS mounts the API under (e.g.
   // servers `.../api` → we probe `http://localhost:PORT/api`), so an API
   // that isn't at the root still gets hit correctly.
-  const detected = detectLocalPort(searchDir);
+  const detected = detectLocalPort(searchDir, ctx?.language, ctx?.framework);
   let oas = null;
   try { if (apiEntry?.oasFile) oas = loadOas(path.resolve(rootDir, apiEntry.oasFile)); } catch {}
   const basePath = basePathFromServers(oas);
@@ -446,7 +481,7 @@ export default async function testSetup({
     ]});
     debug.log('test-setup.fix-start', { state });
     try {
-      await runAI(loadPrompt('fix-sdk', { evidence, guidance, base: localBase() }), installDir, { setSpinner });
+      await runAI(loadPrompt('fix-sdk', { ...languagePromptVars(ctx?.language), evidence, guidance, base: localBase() }), installDir, { setSpinner });
       update({ message: [
         `  ${green('✓')} ${orange(aiTool)} applied a fix. ${bold('Restart your server')} and we'll re-check automatically.`,
       ]});

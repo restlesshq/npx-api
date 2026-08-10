@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { runAI, loadPrompt } from '../lib/ai.js';
+import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { bold, dim, green, yellow, cyan, orange } from '../lib/ui.js';
 import * as debug from '../lib/debug.js';
 import { getSdkWriter } from '../lib/sdk-writers/index.js';
@@ -91,6 +91,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
   ]});
 
   const prompt = loadPrompt('verify-owner-id', {
+    ...languagePromptVars(language),
     language,
     framework: framework || language,
   });

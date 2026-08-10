@@ -29,10 +29,9 @@ function wired({ arg = 'os.environ["RESTLESS_KEY"]', ownerId = 'workspace_id_for
 }
 
 describe('conformance to the shared writer interface', () => {
-  it('satisfies assertWriterShape even though it is not registered yet', () => {
-    // Deliberately absent from SDK_WRITERS until the rest of Phase 1b lands.
-    // This proves the writer is correct without making the CLI claim Python
-    // support it cannot deliver.
+  it('satisfies the shared writer contract', () => {
+    // The registry asserts this at import for every registered writer; the
+    // explicit call keeps the failure readable when it is this one.
     expect(() => assertWriterShape('python', py)).not.toThrow();
   });
 
@@ -243,9 +242,14 @@ describe('stripOwnerIdConfirm', () => {
 describe('canonicalizeInitArg', () => {
   const ctx = (over) => ({ keyDelivery: 'manual', envLoader: { mode: 'dotenv' }, ...over });
 
-  it('rewrites an env-ref to the Python idiom', () => {
+  it('rewrites an env-ref to a form that cannot raise at import', () => {
+    // `os.environ["X"]` raises KeyError when the loader has not run yet, and
+    // a client constructed at module import would take the app down at
+    // startup over an observability variable. `.get()` returns None and the
+    // SDK falls back to its own lookup.
     const out = py.canonicalizeInitArg(wired({ arg: '' }), ctx());
-    expect(out).toContain('restless.Restless(os.environ["RESTLESS_KEY"])');
+    expect(out).toContain('restless.Restless(os.environ.get("RESTLESS_KEY"))');
+    expect(out).not.toContain('os.environ["RESTLESS_KEY"])');
   });
 
   it('writes a literal key and adds the inline TODO with a # comment', () => {
@@ -285,12 +289,14 @@ describe('canonicalizeInitArg', () => {
   });
 });
 
-describe('shapes it deliberately refuses to touch', () => {
-  it('bails rather than mutating an owner assigned outside the dict literal', () => {
-    // What the real Flask fixture does: builds the result, then attaches the
-    // owner conditionally on a later line. Not the shape the guide emits, and
-    // patching it by regex would corrupt it, so readBlockFields reports no
-    // owner id and setOwnerId is a no-op. The repair flow asks the user.
+describe('the conditional owner form', () => {
+  it('reads and patches an owner assigned outside the dict literal', () => {
+    // Regression, found end to end rather than by unit test: this is what you
+    // write when the owner is optional, because a dict literal cannot omit a
+    // key conditionally without contortions. The real pet-store fixtures use
+    // it AND the CLI's own setup-sdk-python prompt tells the AI to write it.
+    // A writer that only read the inline form reported "no owner.id is set"
+    // for a correct wiring and sent the user into the repair flow.
     const src = [
       'import restless  # noqa: E402',
       'client = restless.Restless(os.environ["RESTLESS_KEY"])',
@@ -304,7 +310,26 @@ describe('shapes it deliberately refuses to touch', () => {
 
     expect(py.hasInit(src)).toBe(true);
     expect(py.readBlockFields(src).credentialExpr).toBe('environ.get("HTTP_AUTHORIZATION")');
-    expect(py.readBlockFields(src).ownerIdExpr).toBeNull();
+    expect(py.readBlockFields(src).ownerIdExpr).toBe('workspace_id');
+
+    const patched = py.setOwnerId(src, 'tenant_id(request)');
+    expect(patched).toContain('"id": tenant_id(request)');
+    expect(py.readBlockFields(patched).ownerIdExpr).toBe('tenant_id(request)');
+  });
+
+  it('still refuses an owner that is not a dict literal at all', () => {
+    // A ternary or helper call the user wrote on purpose. Inserting a second
+    // owner key would shadow theirs, so bail and let the repair flow ask.
+    const src = [
+      'import restless',
+      'client = restless.Restless()',
+      '@client.setup',
+      'def _(request):',
+      '    return {',
+      '        "api_key": client.mask(request.header("authorization")),',
+      '        "owner": owner_for(request) if request.user else None,',
+      '    }',
+    ].join('\n');
     expect(py.setOwnerId(src, 'x.id')).toBe(src);
   });
 });
