@@ -8,7 +8,7 @@ import { SITE_URL } from '../lib/config.js';
 import { loadSettings } from '../lib/settings.js';
 import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import * as debug from '../lib/debug.js';
-import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromPythonSource, portFromRubySource, portFromUrl, portFromDocker, frameworkDefaultPort, pythonFrameworkDefaultPort, rubyFrameworkDefaultPort } from '../lib/test-diagnosis.js';
+import { parseStatus, normalizeBaseUrl, basePathFromServers, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixActions, fixContext, portFromPackageJson, portFromSource, portFromPythonSource, portFromRubySource, portFromGoSource, portFromUrl, portFromDocker, frameworkDefaultPort, pythonFrameworkDefaultPort, rubyFrameworkDefaultPort, goFrameworkDefaultPort } from '../lib/test-diagnosis.js';
 import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
 import { loadOas } from '../lib/oas-auth.js';
 import { isInteractive } from '../lib/env.js';
@@ -164,6 +164,16 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
 
   // 1b. Python has no package.json to read, and its process managers put the
   //     port in files with no Node analogue.
+  if (normalizeLanguage(language) === 'go') {
+    for (const name of ['main.go', 'Procfile', 'docker-compose.yml', 'Dockerfile']) {
+      try {
+        const full = path.join(searchDir, name);
+        if (!fs.existsSync(full)) continue;
+        const p = portFromGoSource(fs.readFileSync(full, 'utf8'));
+        if (p) return { port: p, source: name };
+      } catch {}
+    }
+  }
   if (normalizeLanguage(language) === 'ruby') {
     for (const name of ['Procfile', 'config/puma.rb', 'config.ru', 'Rakefile', 'docker-compose.yml']) {
       try {
@@ -218,7 +228,8 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
       try { entries.push({ file, content: fs.readFileSync(path.join(searchDir, file), 'utf8') }); } catch {}
     }
     for (const { file, content } of entries) {
-      const p = file.endsWith('.py') ? portFromPythonSource(content)
+      const p = file.endsWith('.go') ? portFromGoSource(content)
+        : file.endsWith('.py') ? portFromPythonSource(content)
         : /\.(rb|ru)$/.test(file) ? portFromRubySource(content)
         : portFromSource(content);
       if (p) return { port: p, source: path.basename(file) };
@@ -235,6 +246,9 @@ function detectLocalPort(searchDir, language = 'javascript', framework = '') {
   } catch {}
 
   // 4. Nothing explicit - fall back to the framework's conventional default.
+  if (normalizeLanguage(language) === 'go') {
+    return { port: goFrameworkDefaultPort(), source: null };
+  }
   if (normalizeLanguage(language) === 'ruby') {
     const deps = rubyDeps(searchDir);
     const d = rubyFrameworkDefaultPort(deps, framework);

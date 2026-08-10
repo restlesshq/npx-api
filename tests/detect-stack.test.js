@@ -58,9 +58,8 @@ describe('detectStack', () => {
       ]);
     });
 
-    it('flags Go, PHP, Rust, Java and .NET projects', () => {
+    it('flags PHP, Rust, Java and .NET projects', () => {
       const cases = [
-        ['go.mod', 'module example.com/api\n', 'Go'],
         ['composer.json', '{"require":{"laravel/framework":"^11"}}', 'PHP'],
         ['Cargo.toml', '[package]\nname = "api"\n', 'Rust'],
         ['pom.xml', '<project></project>', 'Java'],
@@ -86,10 +85,11 @@ describe('detectStack', () => {
       write(dir, 'services/py/setup.py', 'setup()\n');
       write(dir, 'services/go/go.mod', 'module x\n');
       const stack = detectStack(dir);
-      // Python is supported and Go is not yet, so this is set up as Python.
+      // Both are supported now, so both get scanned and the picker offers
+      // whichever APIs each turns up.
       expect(stack.supported).toBe(true);
       expect(stack.languages).toEqual(['Python', 'Go']);
-      expect(stack.setupLanguages).toEqual(['python']);
+      expect(stack.setupLanguages).toEqual(['python', 'go']);
     });
   });
 
@@ -109,7 +109,7 @@ describe('detectStack', () => {
         const d = tmp();
         try {
           write(d, 'package.json', pkg({ [dep]: '^1' }));
-          write(d, 'go.mod', 'module x\n');
+          write(d, 'composer.json', '{}');
           const stack = detectStack(d);
           expect(stack.supported, `${dep} should count as Node`).toBe(true);
         } finally {
@@ -122,7 +122,7 @@ describe('detectStack', () => {
       // No recognizable dep and no matched route - only the source marker
       // stands between this repo and a wrong "we do not support Go" exit.
       write(dir, 'package.json', pkg({}));
-      write(dir, 'go.mod', 'module x\n');
+      write(dir, 'composer.json', '{}');
       write(dir, 'server.mjs', "import { createServer } from 'node:http';\ncreateServer(handler).listen(3000);\n");
       const stack = detectStack(dir);
       expect(stack.supported).toBe(true);
@@ -268,8 +268,8 @@ describe('routing (setupLanguages)', () => {
   });
 
   it('does not route to a language with no writer yet', () => {
-    write(dir, 'go.mod', 'module x\n');
-    write(dir, 'main.go', 'package main\n');
+    write(dir, 'composer.json', '{"require":{"laravel/framework":"^11"}}');
+    write(dir, 'index.php', '<?php\n');
     const stack = detectStack(dir);
     expect(stack.setupLanguages).toEqual([]);
     expect(stack.supported).toBe(false);

@@ -52,7 +52,7 @@ describe('getSdkWriter', () => {
     // handed a Python repo the JavaScript writer, which then matched none of
     // its own patterns and reported "SDK not wired" - wrong, and wrong in a
     // way that looks like a user error rather than a missing feature.
-    for (const lang of ['go', 'php', 'csharp']) {
+    for (const lang of ['php', 'csharp', 'rust', 'java']) {
       expect(() => getSdkWriter(lang)).toThrow(UnsupportedLanguageError);
     }
   });
@@ -60,13 +60,13 @@ describe('getSdkWriter', () => {
   it('names the language and what is supported in the error', () => {
     let err;
     try {
-      getSdkWriter('golang');
+      getSdkWriter('c#');
     } catch (e) {
       err = e;
     }
     expect(err).toBeInstanceOf(UnsupportedLanguageError);
-    expect(err.language).toBe('go');
-    expect(err.message).toContain('go');
+    expect(err.language).toBe('csharp');
+    expect(err.message).toContain('csharp');
     expect(err.message).toContain('javascript');
   });
 });
@@ -78,7 +78,8 @@ describe('isSupportedLanguage', () => {
     expect(isSupportedLanguage(undefined)).toBe(true);
     expect(isSupportedLanguage('python')).toBe(true);
     expect(isSupportedLanguage('ruby')).toBe(true);
-    expect(isSupportedLanguage('go')).toBe(false);
+    expect(isSupportedLanguage('golang')).toBe(true);
+    expect(isSupportedLanguage('php')).toBe(false);
   });
 
   it('is not fooled by inherited Object properties', () => {
@@ -89,7 +90,7 @@ describe('isSupportedLanguage', () => {
 
 describe('SUPPORTED_LANGUAGES', () => {
   it('lists exactly the languages with a writer', () => {
-    expect(SUPPORTED_LANGUAGES).toEqual(['javascript', 'typescript', 'python', 'ruby']);
+    expect(SUPPORTED_LANGUAGES).toEqual(['javascript', 'typescript', 'python', 'ruby', 'go']);
     for (const lang of SUPPORTED_LANGUAGES) {
       expect(() => getSdkWriter(lang)).not.toThrow();
     }
