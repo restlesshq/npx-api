@@ -1,0 +1,128 @@
+import { describe, it, expect } from 'vitest';
+import {
+  getSdkWriter,
+  isSupportedLanguage,
+  normalizeLanguage,
+  OPTIONAL_WRITER_METHODS,
+  REQUIRED_WRITER_METHODS,
+  SUPPORTED_LANGUAGES,
+  UnsupportedLanguageError,
+} from '../lib/sdk-writers/index.js';
+import { SETUP_CONCEPTS } from '../lib/sdk-writers/contract.js';
+import * as jsWriter from '../lib/sdk-writers/javascript.js';
+
+describe('normalizeLanguage', () => {
+  it('canonicalizes the spellings detection and hand-edited settings produce', () => {
+    expect(normalizeLanguage('Node.js')).toBe('javascript');
+    expect(normalizeLanguage('nodejs')).toBe('javascript');
+    expect(normalizeLanguage('JS')).toBe('javascript');
+    expect(normalizeLanguage('  TypeScript  ')).toBe('typescript');
+    expect(normalizeLanguage('ts')).toBe('typescript');
+    expect(normalizeLanguage('py')).toBe('python');
+    expect(normalizeLanguage('golang')).toBe('go');
+    expect(normalizeLanguage('rb')).toBe('ruby');
+  });
+
+  it('treats an absent language as JavaScript, the long-standing default', () => {
+    // install-sdk and final-checks both defaulted this way before the
+    // registry existed; changing it would repoint every un-annotated re-run.
+    expect(normalizeLanguage(undefined)).toBe('javascript');
+    expect(normalizeLanguage(null)).toBe('javascript');
+    expect(normalizeLanguage('')).toBe('javascript');
+    expect(normalizeLanguage('   ')).toBe('javascript');
+  });
+
+  it('passes through an unknown language rather than guessing', () => {
+    expect(normalizeLanguage('elixir')).toBe('elixir');
+    expect(normalizeLanguage('C#')).toBe('csharp');
+  });
+});
+
+describe('getSdkWriter', () => {
+  it('returns the JavaScript writer for both JS and TS', () => {
+    expect(getSdkWriter('javascript')).toBe(jsWriter);
+    expect(getSdkWriter('typescript')).toBe(jsWriter);
+    expect(getSdkWriter('Node.js')).toBe(jsWriter);
+    expect(getSdkWriter(undefined)).toBe(jsWriter);
+  });
+
+  it('THROWS for a language with no writer instead of silently using JS', () => {
+    // The whole point of the registry. The old `writers[language] || jsWriter`
+    // handed a Python repo the JavaScript writer, which then matched none of
+    // its own patterns and reported "SDK not wired" - wrong, and wrong in a
+    // way that looks like a user error rather than a missing feature.
+    for (const lang of ['python', 'ruby', 'go', 'php', 'csharp']) {
+      expect(() => getSdkWriter(lang)).toThrow(UnsupportedLanguageError);
+    }
+  });
+
+  it('names the language and what is supported in the error', () => {
+    let err;
+    try {
+      getSdkWriter('py');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UnsupportedLanguageError);
+    expect(err.language).toBe('python');
+    expect(err.message).toContain('python');
+    expect(err.message).toContain('javascript');
+  });
+});
+
+describe('isSupportedLanguage', () => {
+  it('answers without throwing', () => {
+    expect(isSupportedLanguage('javascript')).toBe(true);
+    expect(isSupportedLanguage('ts')).toBe(true);
+    expect(isSupportedLanguage(undefined)).toBe(true);
+    expect(isSupportedLanguage('python')).toBe(false);
+    expect(isSupportedLanguage('go')).toBe(false);
+  });
+
+  it('is not fooled by inherited Object properties', () => {
+    expect(isSupportedLanguage('constructor')).toBe(false);
+    expect(isSupportedLanguage('toString')).toBe(false);
+  });
+});
+
+describe('SUPPORTED_LANGUAGES', () => {
+  it('lists exactly the languages with a writer', () => {
+    expect(SUPPORTED_LANGUAGES).toEqual(['javascript', 'typescript']);
+    for (const lang of SUPPORTED_LANGUAGES) {
+      expect(() => getSdkWriter(lang)).not.toThrow();
+    }
+  });
+
+  it('every writer implements the methods the steps actually call', () => {
+    for (const lang of SUPPORTED_LANGUAGES) {
+      const writer = getSdkWriter(lang);
+      for (const fn of REQUIRED_WRITER_METHODS) {
+        expect(typeof writer[fn], `${lang}.${fn}`).toBe('function');
+      }
+    }
+  });
+
+  it('does not require the Node-only or vestigial methods', () => {
+    // `generate` has no production caller (the AI writes the wiring, the CLI
+    // only patches), and hasWithRestless/hasDefineConfig are the Next.js
+    // plugin checks that CONTRACT.md §14 marks as having no cross-language
+    // analogue. Requiring either would make every new writer stub something
+    // it can never meaningfully implement.
+    for (const fn of ['generate', 'parse', 'findOldApiSetup', 'hasWithRestless', 'hasDefineConfig']) {
+      expect(REQUIRED_WRITER_METHODS).not.toContain(fn);
+      expect(OPTIONAL_WRITER_METHODS).toContain(fn);
+    }
+  });
+
+  it('every writer spells all the CONTRACT §15 concepts', () => {
+    for (const lang of SUPPORTED_LANGUAGES) {
+      const { descriptor } = getSdkWriter(lang);
+      expect(descriptor, `${lang} descriptor`).toBeTruthy();
+      for (const concept of SETUP_CONCEPTS) {
+        expect(typeof descriptor.fields[concept], `${lang}.fields.${concept}`).toBe('string');
+      }
+      expect(descriptor.commentPrefix).toBeTruthy();
+      expect(['method', 'package']).toContain(descriptor.maskCall.style);
+    }
+  });
+});

@@ -8,7 +8,7 @@ import { CLI_NAME } from '../lib/config.js';
 import { safeWriteFileSync } from '../lib/pathGuard.js';
 import { fatalError } from '../lib/errors.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
+import { getSdkWriter, normalizeLanguage } from '../lib/sdk-writers/index.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
 import {
   detectNext,
@@ -17,16 +17,6 @@ import {
   nextPluginWiringStatus,
   findNextConfigFile,
 } from '../lib/next-detect.js';
-
-/**
- * Pick the language-specific SDK writer for this run. Today we only
- * support JavaScript / TypeScript; Python / Ruby / Go land here as
- * sibling modules with the same exported shape.
- */
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
 
 /**
  * Walk the install dir for source files referencing `@restlessai/sdk`.
@@ -38,13 +28,16 @@ function getSdkWriter(language) {
  * so we don't treat a stray comment or stale partial reference as
  * "wired in."
  *
- * Uses the shared `findSdkReferences` helper so the grep excludes
- * `node_modules` (and other heavy dirs) at the recursion level, not
- * after. Past incident: scanning node_modules synchronously froze the
- * UI for tens of seconds between Generate API key and Configure SDK.
+ * Goes through the writer's `candidateWiringFiles`, which for JavaScript is
+ * the shared grep - excluding `node_modules` (and other heavy dirs) at the
+ * recursion level, not after. Past incident: scanning node_modules
+ * synchronously froze the UI for tens of seconds between Generate API key
+ * and Configure SDK. Other languages override the search entirely, because
+ * "the wiring is in a file that imports the package" is a JavaScript
+ * assumption (Ruby wires in `config.ru`, away from the routes).
  */
-function findSdkCandidateFiles(installDir) {
-  return findSdkReferences(installDir);
+function findSdkCandidateFiles(installDir, language) {
+  return getSdkWriter(language).candidateWiringFiles(installDir);
 }
 
 /**
@@ -59,7 +52,7 @@ function findSdkCandidateFiles(installDir) {
  */
 function findWiredSourceFile(installDir, language = 'javascript') {
   const writer = getSdkWriter(language);
-  const candidates = findSdkCandidateFiles(installDir);
+  const candidates = findSdkCandidateFiles(installDir, language);
   for (const rel of candidates) {
     const abs = path.join(installDir, rel);
     try {
@@ -106,27 +99,22 @@ function canonicalizeSdkBlock(ctx) {
   return { mode: 'canonicalized', file: path.relative(ctx.installDir, file) };
 }
 
-const languageAliases = {
-  node: 'javascript',
-  'node.js': 'javascript',
-  nodejs: 'javascript',
-  js: 'javascript',
-  'javascript (node.js)': 'javascript',
-  ts: 'typescript',
-  py: 'python',
-  python3: 'python',
-  rb: 'ruby',
-  golang: 'go',
-  csharp: 'csharp',
-  'c#': 'csharp',
-};
-
+/**
+ * The command that installs the SDK for each language.
+ *
+ * Only the JS entries are reachable today - `getSdkWriter` throws before we
+ * get here for anything else - but the package names are the real published
+ * ones, verified against each SDK's README, so the entries are correct when
+ * their writers land. They were previously wrong in all three: `restlessai`
+ * on PyPI and RubyGems (published name is `restless-sdk` on both) and
+ * `github.com/restlessai/go` (the org is `restlesshq`).
+ */
 const installCommands = {
   javascript: 'npm install @restlessai/sdk --save',
   typescript: 'npm install @restlessai/sdk --save',
-  python: 'pip install restlessai',
-  ruby: 'gem install restlessai',
-  go: 'go get github.com/restlessai/go',
+  python: 'pip install restless-sdk',
+  ruby: 'gem install restless-sdk',
+  go: 'go get github.com/restlesshq/go',
 };
 
 /**
@@ -167,7 +155,7 @@ export function nextWiringStatus(installDir, nextInfo, language = 'javascript') 
   const writer = getSdkWriter(language);
   const mwSet = new Set(nextInfo.middlewareFiles);
   const wired = [];
-  for (const rel of findSdkCandidateFiles(installDir)) {
+  for (const rel of findSdkCandidateFiles(installDir, language)) {
     try {
       if (writer.hasInit(fs.readFileSync(path.join(installDir, rel), 'utf8'))) wired.push(rel);
     } catch {
@@ -272,6 +260,11 @@ export function resolveInstallDir(packageDir, apiRootDir) {
 export function inlineKeyIntoSource(installDir, apiKey) {
   let touched = [];
   try {
+    // JAVASCRIPT-ONLY, by construction: everything below matches CJS/ESM
+    // require and import call shapes. Left on the raw grep rather than the
+    // writer's `candidateWiringFiles` because routing the search through the
+    // writer while the patching stays JS would only hide that. Porting this
+    // is part of adding a language, not part of the shared plumbing.
     const files = findSdkReferences(installDir);
     const literal = JSON.stringify(apiKey);
     const TODO = '// TODO: move this out of the codebase before committing';
@@ -381,7 +374,11 @@ export default async function installSdk({
   });
 
   if (!detectedLanguage) detectedLanguage = 'javascript';
-  const guideLanguage = languageAliases[detectedLanguage] || detectedLanguage;
+  // Also the name of the guide in `docs/sdks/` and the key into
+  // `installCommands`, so it has to go through the same normalization the
+  // writer registry uses - otherwise `node` picks the JS writer but looks
+  // for a `docs/sdks/node.md` that doesn't exist.
+  const guideLanguage = normalizeLanguage(detectedLanguage);
 
   // Next.js needs a fundamentally different wiring than the middleware /
   // plugin model the guide's Express/Fastify/Koa sections describe, and it

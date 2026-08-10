@@ -3,15 +3,9 @@ import path from 'path';
 import { runAI, loadPrompt } from '../lib/ai.js';
 import { bold, dim, green, yellow, cyan, orange } from '../lib/ui.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
 import { analyzeOwnerId } from './final-checks.js';
-
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
 
 /**
  * Find the wired source file by grepping for the SDK import. Same
@@ -28,7 +22,7 @@ function findWiredSourceFile(installDir, language) {
     return path.join(installDir, plugin.restlessConfigFile);
   }
   const writer = getSdkWriter(language);
-  const candidates = findSdkReferences(installDir);
+  const candidates = writer.candidateWiringFiles(installDir);
   for (const rel of candidates) {
     const abs = path.join(installDir, rel);
     try {

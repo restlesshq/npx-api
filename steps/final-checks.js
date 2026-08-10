@@ -5,21 +5,18 @@ import { loadSettings } from '../lib/settings.js';
 import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { runAI, loadPrompt } from '../lib/ai.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
 import { extractJson } from '../lib/extract-json.js';
 import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
-
-/**
- * Pick the writer for ctx.language. Same registry as install-sdk.js;
- * keep them in lockstep when adding new languages.
- */
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
+import {
+  isOwnerIdPlaceholder,
+  MUTABLE_TAIL_FIELDS,
+  OWNER_ID_PLACEHOLDER,
+  PLACEHOLDER_OWNER_IDS,
+  RISKY_CREDENTIAL_TOKENS,
+} from '../lib/sdk-writers/contract.js';
 
 /**
  * Find the entry source file the SDK is actually wired into. Two-layer
@@ -64,7 +61,7 @@ function findWiredSourceFile(installDir, ctx) {
     } catch {}
   }
 
-  const candidates = findSdkReferences(installDir);
+  const candidates = writer.candidateWiringFiles(installDir);
   for (const rel of candidates) {
     const abs = path.join(installDir, rel);
     try {
@@ -102,31 +99,13 @@ function findWiredSourceFile(installDir, ctx) {
  * cases that need codebase context (e.g. is `workspace.subdomain`
  * actually mutable in this project's schema).
  */
-const RISKY_TOKENS = [
-  'authorization', 'apikey', 'api_key', 'api-key', 'x-api-key',
-  'x-auth', 'secret', 'token', 'password', 'bearer',
-];
-
-// AI emits this literal when it can't find a stable internal id. Treat
-// it as "needs repair" so the interactive prompt fires.
-const SENTINEL_PLACEHOLDER = "'NEEDS_CONFIGURATION'";
-
-const MUTABLE_TAIL_FIELDS = new Set([
-  'email', 'username', 'name', 'displayname', 'display_name',
-  'handle', 'slug', 'nickname', 'alias', 'login',
-]);
-
-// Literal string values that almost certainly indicate "I didn't have a
-// real id, so I picked a placeholder." Using one of these here fake-
-// groups every unauthenticated / unknown request under a single tenant
-// on the dashboard, masking the fact that they're actually anonymous.
-// The right way to signal "no owner for this request" is `undefined`
-// (or omitting the owner block entirely); the SDK has its own anonymous
-// bucket on the wire-format side.
-const PLACEHOLDER_STRINGS = new Set([
-  'anonymous', 'none', 'unknown', 'guest', 'default', 'placeholder',
-  'nobody', 'null', 'undefined', 'test', 'todo',
-]);
+// The owner.id policy sets live in `lib/sdk-writers/contract.js`: they encode
+// what SETUP-002 means (permanent, immutable, never a credential), which is
+// identical in every language, so a Python writer inherits them rather than
+// re-listing them. Aliased to the old local names to keep the analysis below
+// reading the way it did.
+const RISKY_TOKENS = RISKY_CREDENTIAL_TOKENS;
+const PLACEHOLDER_STRINGS = PLACEHOLDER_OWNER_IDS;
 
 export function analyzeOwnerId(expr) {
   if (!expr || typeof expr !== 'string') {
@@ -134,10 +113,12 @@ export function analyzeOwnerId(expr) {
   }
   const trimmed = expr.trim();
 
-  if (trimmed === SENTINEL_PLACEHOLDER || trimmed === '"NEEDS_CONFIGURATION"') {
+  // Quote-style agnostic, so Python's `"""..."""` and Go's backticks read the
+  // same as the JS single-quoted form this used to hardcode.
+  if (isOwnerIdPlaceholder(trimmed)) {
     return {
       severity: 'critical',
-      reason: "set to the 'NEEDS_CONFIGURATION' placeholder - the installer couldn't find a stable id",
+      reason: `set to the '${OWNER_ID_PLACEHOLDER}' placeholder - the installer couldn't find a stable id`,
     };
   }
 
