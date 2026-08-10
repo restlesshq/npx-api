@@ -1,4 +1,6 @@
-Discover all APIs in this **Node.js / TypeScript** codebase. You MUST finish within 10 tool calls. Be fast.
+Discover all APIs in this codebase. You MUST finish within 10 tool calls. Be fast.
+
+The findings below were produced by a deterministic pre-scan that already knows which languages are present. Work with what it found; do not assume the project is any particular language.
 
 **NEVER read .env, .env.local, or any environment/secret files.**
 
@@ -19,7 +21,7 @@ Determine the framework **per package, from the code that handles requests - not
 - If a package builds a **Fastify** server (imports `fastify` / `@fastify/*`, calls `fastify(...)` / `fastifyModule(...)`, uses `.register(...)`, `.addHook(...)`, or `FastifyInstance`) and a separate Express layer only forwards into it (e.g. `fastify.routing(req, res)`, or an `express.Router()` that delegates), the framework is **Fastify**. The Express piece is a host shim, not the API framework.
 - The same logic applies to NestJS (`@nestjs/*`), Koa, and Hono wrapped by an outer host.
 
-If the findings show zero endpoints AND no `package.json` exists, return `{"apis": []}` immediately - we only support Node.
+The findings' **Framework signals** block is labelled per language when more than one is present. A repo can legitimately hold, say, a Django API and a Next.js frontend; emit one API per real API, not one per repo.
 
 ## Step 2 - Grep for routes when findings are empty OR a framework is under-represented (0–2 tool calls)
 
@@ -34,6 +36,8 @@ When you explore, read that package's **server entry** - the file that calls `.r
 ((app|router|fastify|api|server|instance)\.(get|post|put|delete|patch|all|route)\(|@(Get|Post|Put|Delete|Patch|Controller)\()
 ```
 Glob: `*.{js,ts,mjs,cjs}`. Use `output_mode: "content"`.
+
+For a **Python** package, read the module that builds the app instead. Routes live in decorators (`@app.get("/pets")`, `@router.post(...)`), in a Django URLconf (`urlpatterns` with `path()` / `re_path()`, often only `include()`ing others), or in a Starlette route table. A package with a framework dep and zero matched routes is the signature of a route style the regex does not cover, exactly as it is in JavaScript.
 
 ## Step 3 - Group endpoints into APIs
 
@@ -59,7 +63,7 @@ Output ONLY this JSON block - no explanation before or after:
 }
 ```
 
-Set `language` to `"javascript"` or `"typescript"` based on the file extensions in the findings.
+Set `language` to `"javascript"`, `"typescript"` or `"python"`, matching the package the endpoints actually came from. The findings label each framework signal with its language when more than one is present; otherwise use the file extensions. Getting this wrong sends the installer at the wrong SDK, so prefer the signal over a guess.
 
 For `existingOasFile`: pick the best candidate from the findings list. Prefer shallower paths and OpenAPI 3.x over Swagger 2.0. Set to `null` if none.
 
@@ -67,4 +71,4 @@ For `existingOasFile`: pick the best candidate from the findings list. Prefer sh
 Paths containing: `/internal/`, `/admin/`, `/_/`, `/debug/`, `/health`, `/metrics`, `/status`. Files named `admin` or `internal`.
 
 ## OAS generation support
-Set `frameworkCanGenerateOas: true` when the package's entry in the **Framework signals** block is marked OAS-capable (e.g. `OAS-capable via @fastify/swagger`), or if you otherwise see one of these imports in files you already read: `@fastify/swagger`, `@nestjs/swagger`, `swagger-jsdoc`, `tsoa`, `express-openapi`. Don't search separately.
+Set `frameworkCanGenerateOas: true` when the package's entry in the **Framework signals** block is marked OAS-capable (e.g. `OAS-capable via @fastify/swagger`), or if you otherwise see one of these imports in files you already read: `@fastify/swagger`, `@nestjs/swagger`, `swagger-jsdoc`, `tsoa`, `express-openapi`. In Python the equivalents are `fastapi` (which serves `/openapi.json` itself), `apiflask`, `flask-smorest`, `drf-spectacular`, `drf-yasg`, `connexion` and `django-ninja`. Don't search separately.

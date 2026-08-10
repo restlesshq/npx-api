@@ -46,23 +46,12 @@ describe('getSdkWriter', () => {
     expect(getSdkWriter(undefined)).toBe(jsWriter);
   });
 
-  it('still refuses Python while Phase 1b is incomplete', () => {
-    // lib/sdk-writers/python.js exists and passes assertWriterShape, but a
-    // writer alone does not make a language installable. This registry is the
-    // ship gate: until endpoint detection, install-dir resolution, the
-    // installed-check and the guide are all in place (and restless-sdk is on
-    // PyPI), Python must stay unreachable rather than half-work. Delete this
-    // test in the same change that registers the writer.
-    expect(() => getSdkWriter('python')).toThrow(UnsupportedLanguageError);
-    expect(SUPPORTED_LANGUAGES).not.toContain('python');
-  });
-
   it('THROWS for a language with no writer instead of silently using JS', () => {
     // The whole point of the registry. The old `writers[language] || jsWriter`
     // handed a Python repo the JavaScript writer, which then matched none of
     // its own patterns and reported "SDK not wired" - wrong, and wrong in a
     // way that looks like a user error rather than a missing feature.
-    for (const lang of ['python', 'ruby', 'go', 'php', 'csharp']) {
+    for (const lang of ['ruby', 'go', 'php', 'csharp']) {
       expect(() => getSdkWriter(lang)).toThrow(UnsupportedLanguageError);
     }
   });
@@ -70,13 +59,13 @@ describe('getSdkWriter', () => {
   it('names the language and what is supported in the error', () => {
     let err;
     try {
-      getSdkWriter('py');
+      getSdkWriter('rb');
     } catch (e) {
       err = e;
     }
     expect(err).toBeInstanceOf(UnsupportedLanguageError);
-    expect(err.language).toBe('python');
-    expect(err.message).toContain('python');
+    expect(err.language).toBe('ruby');
+    expect(err.message).toContain('ruby');
     expect(err.message).toContain('javascript');
   });
 });
@@ -86,7 +75,7 @@ describe('isSupportedLanguage', () => {
     expect(isSupportedLanguage('javascript')).toBe(true);
     expect(isSupportedLanguage('ts')).toBe(true);
     expect(isSupportedLanguage(undefined)).toBe(true);
-    expect(isSupportedLanguage('python')).toBe(false);
+    expect(isSupportedLanguage('python')).toBe(true);
     expect(isSupportedLanguage('go')).toBe(false);
   });
 
@@ -98,7 +87,7 @@ describe('isSupportedLanguage', () => {
 
 describe('SUPPORTED_LANGUAGES', () => {
   it('lists exactly the languages with a writer', () => {
-    expect(SUPPORTED_LANGUAGES).toEqual(['javascript', 'typescript']);
+    expect(SUPPORTED_LANGUAGES).toEqual(['javascript', 'typescript', 'python']);
     for (const lang of SUPPORTED_LANGUAGES) {
       expect(() => getSdkWriter(lang)).not.toThrow();
     }

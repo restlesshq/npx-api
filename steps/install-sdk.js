@@ -11,6 +11,12 @@ import * as debug from '../lib/debug.js';
 import { getSdkWriter, normalizeLanguage } from '../lib/sdk-writers/index.js';
 import { findSdkReferences } from '../lib/grep-sdk.js';
 import {
+  describeMissingSdk,
+  installCommandFor,
+  isSdkInstalled,
+  resolveOwningDir,
+} from '../lib/install-target.js';
+import {
   detectNext,
   isNextFramework,
   nextAutoWrapSupport,
@@ -99,23 +105,6 @@ function canonicalizeSdkBlock(ctx) {
   return { mode: 'canonicalized', file: path.relative(ctx.installDir, file) };
 }
 
-/**
- * The command that installs the SDK for each language.
- *
- * Only the JS entries are reachable today - `getSdkWriter` throws before we
- * get here for anything else - but the package names are the real published
- * ones, verified against each SDK's README, so the entries are correct when
- * their writers land. They were previously wrong in all three: `restlessai`
- * on PyPI and RubyGems (published name is `restless-sdk` on both) and
- * `github.com/restlessai/go` (the org is `restlesshq`).
- */
-const installCommands = {
-  javascript: 'npm install @restlessai/sdk --save',
-  typescript: 'npm install @restlessai/sdk --save',
-  python: 'pip install restless-sdk',
-  ruby: 'gem install restless-sdk',
-  go: 'go get github.com/restlesshq/go',
-};
 
 /**
  * Check whether `@restlessai/sdk` is actually wired into the user's
@@ -172,67 +161,15 @@ export function nextWiringStatus(installDir, nextInfo, language = 'javascript') 
   };
 }
 
-/**
- * Walk from `packageDir` toward the filesystem root, checking each
- * directory's `node_modules` for the hoisted SDK package. Returns the
- * absolute path of the package.json that resolves the SDK, or null.
- *
- * Workspaces matter here: in npm / pnpm / yarn workspaces, running
- * `npm install <pkg>` inside `packages/<workspace>/` typically hoists
- * the dependency up to the repo root's `node_modules/`, not into the
- * workspace's own. Checking only `packageDir/node_modules` produced
- * a false "install failed" verdict for every monorepo user, after
- * which the rest of the flow ran with bogus state.
- *
- * We also defend against broken symlinks (a leftover `npm link` that
- * points nowhere) by requiring the package.json to be readable, not
- * just present on disk.
- */
-function resolveInstalledSdk(packageDir) {
-  const names = [
-    ['@restlessai', 'sdk'],
-    ['restlessai'],
-  ];
-  let dir = path.resolve(packageDir);
-  // Cap at 8 levels up. Any monorepo deeper than that is exotic; we
-  // wouldn't be confident the result belongs to the same project anyway.
-  for (let depth = 0; depth < 8; depth++) {
-    for (const name of names) {
-      const pkgJson = path.join(dir, 'node_modules', ...name, 'package.json');
-      try {
-        fs.accessSync(pkgJson, fs.constants.R_OK);
-        return pkgJson;
-      } catch {}
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return null;
-}
 
-function isSdkInstalled(packageDir) {
-  return resolveInstalledSdk(packageDir) !== null;
-}
 
 /**
- * Find the directory whose `package.json` actually owns the detected API.
- * In a monorepo the API might live under `packages/api/` with its own
- * `package.json`; installing at the repo root would add the SDK to the
- * wrong workspace. Walk from the API's rootDir up to the repo root and
- * return the first directory that has a `package.json`.
+ * The directory that owns the detected API, so the dependency lands in the
+ * right project rather than at the repo root. Which files count as "owns a
+ * project" is per-language and lives on the writer descriptor.
  */
-export function resolveInstallDir(packageDir, apiRootDir) {
-  if (!apiRootDir || apiRootDir === '.') return packageDir;
-  let dir = path.resolve(packageDir, apiRootDir);
-  const stop = path.resolve(packageDir);
-  while (dir.startsWith(stop)) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return packageDir;
+export function resolveInstallDir(packageDir, apiRootDir, language) {
+  return resolveOwningDir(packageDir, apiRootDir, language);
 }
 
 /**
@@ -441,13 +378,13 @@ export default async function installSdk({
   }
 
   // ── Sub 0: Install package ───────────────────────────────────────────────
-  const alreadyInstalled = isSdkInstalled(installDir);
+  const alreadyInstalled = isSdkInstalled(installDir, guideLanguage);
   if (alreadyInstalled) {
     update({ sub: { 0: 'done' }, activeSub: 1, message: [
       `  ${green('✓')} ${bold('@restlessai/sdk')} is already installed in ${installLocation} - skipping install.`,
     ]});
   } else {
-    const defaultCmd = installCommands[guideLanguage] || installCommands.javascript;
+    const defaultCmd = installCommandFor(guideLanguage);
     const cdPrefix = installDirRel !== '.' ? `cd ${installDirRel} && ` : '';
     // Keep the step intro visible above the prompt - just advance the cursor.
     update({ activeSub: 0 });
@@ -463,7 +400,7 @@ export default async function installSdk({
       // Install warnings can trip non-zero exits; the verify step below catches
       // a genuine failure.
     }
-    if (!isSdkInstalled(installDir)) {
+    if (!isSdkInstalled(installDir, guideLanguage)) {
       // Halt loudly. Earlier versions returned a `{ installed: false }`
       // sentinel and trusted the caller to check it - but bin/api.js
       // didn't, so finalChecks ran with `prevSubs: { 0:'done', 1:'done',
@@ -473,7 +410,7 @@ export default async function installSdk({
       fatalError(
         `Install didn't complete - ${bold('@restlessai/sdk')} isn't reachable from ${bold(installDirRel)}.`,
         [
-          `Tried to find it walking up from ${installDir} - nothing readable in any node_modules.`,
+          ...describeMissingSdk(installDir, guideLanguage),
           `Try running the command yourself, then re-run \`npx ${CLI_NAME} init\`:`,
           `  ${cmd}`,
         ],

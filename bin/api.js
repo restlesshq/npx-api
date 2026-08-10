@@ -856,8 +856,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
     packageDir,
     rootDir,
     apiRootDir: oasResult.apiRootDir,
-    installDir: resolveInstallDir(packageDir, oasResult.apiRootDir),
-    apiDir: resolveApiDir(packageDir, oasResult.apiRootDir),
+    installDir: resolveInstallDir(packageDir, oasResult.apiRootDir, oasResult.detectedLanguage),
+    apiDir: resolveApiDir(packageDir, oasResult.apiRootDir, oasResult.detectedLanguage),
     language: oasResult.detectedLanguage,
     framework: oasResult.detectedFramework,
     aiTool: setupAiTool,
@@ -1020,7 +1020,11 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   const settingsForKey = loadSettings(keyRoot);
   const apiRootDir = dirFlag || settingsForKey.apis?.[0]?.rootDir || '.';
-  const apiDir = resolveApiDir(keyPkgDir, apiRootDir);
+  // `npx api key` runs standalone (the agent flow), so the language comes
+  // from what setup recorded rather than from a live detection pass.
+  const apiLanguage = settingsForKey.apis?.find((a) => a.rootDir === apiRootDir)?.language
+    || settingsForKey.apis?.[0]?.language;
+  const apiDir = resolveApiDir(keyPkgDir, apiRootDir, apiLanguage);
 
   // Reuse a key that's already on disk rather than minting a second one for
   // the same project - a re-run that swaps the key underneath a running

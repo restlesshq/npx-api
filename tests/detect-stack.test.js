@@ -28,15 +28,18 @@ describe('detectStack', () => {
   });
 
   describe('blocks a repo with no Node server', () => {
-    it('flags a pure Python project', () => {
+    it('routes a pure Python project to the Python scanner', () => {
+      // Was a hard block before the Python writer landed. Now it is a
+      // supported language, so the same detection routes instead of exiting.
       write(dir, 'requirements.txt', 'fastapi==0.110\nuvicorn\n');
       write(dir, 'main.py', 'app = FastAPI()\n');
       const stack = detectStack(dir);
-      expect(stack.supported).toBe(false);
+      expect(stack.supported).toBe(true);
       expect(stack.languages).toEqual(['Python']);
+      expect(stack.setupLanguages).toEqual(['python']);
     });
 
-    it('flags a Django backend with a React frontend - the case the prompt guard missed', () => {
+    it('routes a Django backend with a React frontend to Python', () => {
       // The old guard in prompts/detect-endpoints.md required "no package.json
       // exists", so this shape sailed straight past it and the LLM would label
       // the frontend as the API.
@@ -45,8 +48,10 @@ describe('detectStack', () => {
       write(dir, 'frontend/package.json', pkg({ react: '^18', 'react-dom': '^18', vite: '^5' }));
       write(dir, 'frontend/src/App.jsx', 'export default function App() { return null; }\n');
       const stack = detectStack(dir);
-      expect(stack.supported).toBe(false);
-      expect(stack.languages).toEqual(['Python']);
+      // A React+Vite frontend declares no Node SERVER dep, so there is no
+      // Node API here to compete with the Django one.
+      expect(stack.supported).toBe(true);
+      expect(stack.setupLanguages).toEqual(['python']);
       expect(stack.foreign[0].files.sort()).toEqual([
         path.join('backend', 'manage.py'),
         path.join('backend', 'requirements.txt'),
@@ -82,8 +87,10 @@ describe('detectStack', () => {
       write(dir, 'services/py/setup.py', 'setup()\n');
       write(dir, 'services/go/go.mod', 'module x\n');
       const stack = detectStack(dir);
-      expect(stack.supported).toBe(false);
+      // Python is supported and Go is not yet, so this is set up as Python.
+      expect(stack.supported).toBe(true);
       expect(stack.languages).toEqual(['Python', 'Go']);
+      expect(stack.setupLanguages).toEqual(['python']);
     });
   });
 
@@ -182,29 +189,29 @@ describe('unsupportedStackMessage', () => {
     const stack = {
       supported: false,
       nodeEvidence: [],
-      foreign: [{ language: 'Python', files: ['backend/requirements.txt', 'backend/manage.py'] }],
-      languages: ['Python'],
+      foreign: [{ language: 'Ruby', files: ['backend/Gemfile', 'backend/config.ru'] }],
+      languages: ['Ruby'],
     };
     const { headline, details } = unsupportedStackMessage(stack, { rootDir: '/repo', cliName: 'api' });
-    expect(headline).toContain('a Python project');
+    expect(headline).toContain('Ruby');
     const body = details.join('\n');
-    expect(body).toContain('backend/requirements.txt');
+    expect(body).toContain('backend/Gemfile');
     expect(body).toContain('/repo');
     expect(body).toContain('RESTLESS_SKIP_STACK_CHECK=1 npx api init');
   });
 
-  it('calls a multi-language repo mixed rather than guessing one', () => {
+  it('names every unsupported language rather than guessing one', () => {
     const stack = {
       supported: false,
       nodeEvidence: [],
       foreign: [
-        { language: 'Python', files: ['a/requirements.txt'] },
+        { language: 'Ruby', files: ['a/Gemfile'] },
         { language: 'Go', files: ['b/go.mod'] },
       ],
-      languages: ['Python', 'Go'],
+      languages: ['Ruby', 'Go'],
     };
     const { headline } = unsupportedStackMessage(stack, { rootDir: '/repo' });
-    expect(headline).toContain('a mixed project');
+    expect(headline).toContain('Ruby and Go');
   });
 
   it('truncates a long evidence list', () => {
@@ -231,5 +238,47 @@ describe('stackCheckDisabled', () => {
     expect(stackCheckDisabled()).toBe(true);
     process.env.RESTLESS_SKIP_STACK_CHECK = 'true';
     expect(stackCheckDisabled()).toBe(false);
+  });
+});
+
+describe('routing (setupLanguages)', () => {
+  let dir;
+  beforeEach(() => { dir = tmp(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('routes on source extension when a Python project has no manifest', () => {
+    // Regression: test-apis/python carries no requirements.txt because its
+    // fixtures load the SDK by relative path, so the "no foreign manifest"
+    // default sent it to the JavaScript scanner and it reported zero
+    // endpoints. Plenty of real services keep dependencies somewhere the walk
+    // cannot see, too.
+    write(dir, 'main.py', 'app = FastAPI()\n@app.get("/pets")\ndef pets(): ...\n');
+    const stack = detectStack(dir);
+    expect(stack.setupLanguages).toContain('python');
+  });
+
+  it('scans a polyglot monorepo as both, rather than picking a winner', () => {
+    // A Django API behind a Next.js frontend is two real APIs. Choosing one
+    // here would decide for the user that the other does not exist.
+    write(dir, 'web/package.json', pkg({ next: '^15' }));
+    write(dir, 'web/app/api/x/route.ts', 'export async function GET() {}\n');
+    write(dir, 'api/requirements.txt', 'django\n');
+    write(dir, 'api/urls.py', 'urlpatterns = [path("pets/", v)]\n');
+    const stack = detectStack(dir);
+    expect(stack.setupLanguages).toEqual(['javascript', 'python']);
+  });
+
+  it('does not route to a language with no writer yet', () => {
+    write(dir, 'go.mod', 'module x\n');
+    write(dir, 'main.go', 'package main\n');
+    const stack = detectStack(dir);
+    expect(stack.setupLanguages).toEqual([]);
+    expect(stack.supported).toBe(false);
+  });
+
+  it('leaves a plain Node repo on the JavaScript scanner alone', () => {
+    write(dir, 'package.json', pkg({ express: '^4' }));
+    write(dir, 'server.js', "app.get('/x', h);\n");
+    expect(detectStack(dir).setupLanguages).toEqual(['javascript']);
   });
 });

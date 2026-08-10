@@ -8,6 +8,7 @@ import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/se
 import { startStep } from '../lib/step-template.js';
 import { fatalError } from '../lib/errors.js';
 import { scanCodebase } from '../lib/find-endpoints.js';
+import { scanFor } from '../lib/scanners.js';
 import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
 import { extractJson } from '../lib/extract-json.js';
 import { findOasCandidates } from '../lib/find-oas.js';
@@ -165,8 +166,8 @@ async function ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner 
  * If the scans find nothing (unusual framework, non-Node codebase), we
  * still fall back to letting the LLM explore - see the prompt.
  */
-function buildFindingsSection(packageDir) {
-  const endpointResult = scanCodebase(packageDir);
+function buildFindingsSection(packageDir, languages = ['javascript']) {
+  const endpointResult = scanFor(packageDir, languages);
   const oasResult = findOasCandidates(packageDir);
 
   const lines = ['## Findings (from a deterministic pre-scan)'];
@@ -200,8 +201,9 @@ function buildFindingsSection(packageDir) {
   // the LLM the framework truth per package - a package with a framework dep
   // but `0 inline routes matched` is the signature of a route style our regex
   // missed, and should be explored rather than ignored.
+  const multiLanguage = new Set(endpointResult.frameworkSignals.map((s) => s.language)).size > 1;
   if (endpointResult.frameworkSignals.length > 0) {
-    lines.push('Framework signals (per package.json, from deps + source markers):');
+    lines.push('Framework signals (per package, from deps + source markers):');
     for (const s of endpointResult.frameworkSignals) {
       const parts = [];
       if (s.frameworkDeps.length) parts.push(`deps[${s.frameworkDeps.join(', ')}]`);
@@ -209,7 +211,8 @@ function buildFindingsSection(packageDir) {
       if (s.oasGenDeps.length) parts.push(`OAS-capable via ${s.oasGenDeps.join(', ')}`);
       parts.push(`${s.endpointCount} inline route${s.endpointCount === 1 ? '' : 's'} matched`);
       const label = s.name ? `${s.package} (${s.name})` : s.package;
-      lines.push(`- ${label}: ${parts.join(' · ')}`);
+      const lang = multiLanguage ? `${s.language}: ` : '';
+      lines.push(`- ${lang}${label}: ${parts.join(' · ')}`);
     }
     lines.push('');
   }
@@ -273,8 +276,8 @@ async function pickTestCurl({ oasFullPath, baseUrl, packageDir, setSpinner }) {
  * picking "Other" in the picker), inject it as a "user hint" section so the
  * AI narrows its search.
  */
-async function locateApis({ packageDir, setSpinner, hint = '' }) {
-  const findingsSection = buildFindingsSection(packageDir);
+async function locateApis({ packageDir, setSpinner, hint = '', languages = ['javascript'] }) {
+  const findingsSection = buildFindingsSection(packageDir, languages);
   const hintSection = hint
     ? [
         '## User hint',
@@ -1063,11 +1066,16 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   // Node-only scan - so a Python repo used to loop there indefinitely with no
   // way out but Ctrl-C. Scoped to `packageDir` because that's the tree
   // `locateApis` actually scans.
+  // Which languages to scan this repo as. Normally one; a Django API behind
+  // a Next.js frontend is legitimately two, and both get scanned so the
+  // picker can offer either rather than us silently choosing for the user.
+  let setupLanguages = ['javascript'];
   if (!stackCheckDisabled()) {
     const stack = detectStack(packageDir);
     debug.log('generate-oas.stack-check', {
       supported: stack.supported,
       languages: stack.languages,
+      setupLanguages: stack.setupLanguages,
       nodeEvidence: stack.nodeEvidence,
     });
     if (!stack.supported) {
@@ -1077,6 +1085,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       });
       fatalError(headline, details);
     }
+    setupLanguages = stack.setupLanguages;
   }
 
   // Find the API BEFORE asking about specs. Asking first meant answering
@@ -1102,7 +1111,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
         : [`  We're looking through your code to find every endpoint and detect the framework.`],
     });
 
-    const apis = await locateApis({ packageDir, setSpinner, hint });
+    const apis = await locateApis({ packageDir, setSpinner, hint, languages: setupLanguages });
 
     // Cross-reference each detected API with .restless/settings.json. Match by
     // rootDir first, then by name.
@@ -1131,7 +1140,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
     labels.push(`${bold('Other')}\n${dim('tell us where to look')}`);
 
     console.log('');
-    console.log(`  ${dim('We support Node and TypeScript projects (more coming soon).')}`);
+    console.log(`  ${dim('We support JavaScript, TypeScript and Python projects (more coming soon).')}`);
     console.log('');
     const chosenIdx = await singleSelect(labels, {
       message: apis.length === 0
