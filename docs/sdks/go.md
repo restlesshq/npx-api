@@ -1,6 +1,12 @@
 # Go SDK Installation
 
-Full reference: the `install.md` file at the root of the `github.com/restlesshq/go` module (`go doc github.com/restlesshq/go`, or the checkout under `$GOPATH/pkg/mod`). Consult that if anything below is ambiguous.
+Full reference: the `install.md` file at the root of the `github.com/restlesshq/go` module. Once the module is a dependency, `go list` resolves where it actually lives - the module cache normally, or the target of a `replace` directive:
+
+```bash
+cat "$(go list -m -f '{{.Dir}}' github.com/restlesshq/go)/install.md"
+```
+
+Consult that if anything below is ambiguous.
 
 ## Install
 
