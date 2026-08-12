@@ -4,75 +4,33 @@ import { bold, dim, green, yellow, red, cyan, orange, ask, askYesNo, waitForKey 
 import { loadSettings } from '../lib/settings.js';
 import { getSdkLineSpec } from '../lib/setup-context.js';
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
-import { runAI, loadPrompt } from '../lib/ai.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
+import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { extractJson } from '../lib/extract-json.js';
 import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
+import { findWiredSourceFile as findWired } from '../lib/wired-file.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
+import {
+  isOwnerIdPlaceholder,
+  MUTABLE_TAIL_FIELDS,
+  OWNER_ID_PLACEHOLDER,
+  PLACEHOLDER_OWNER_IDS,
+  RISKY_CREDENTIAL_TOKENS,
+} from '../lib/sdk-writers/contract.js';
 
 /**
- * Pick the writer for ctx.language. Same registry as install-sdk.js;
- * keep them in lockstep when adding new languages.
- */
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
-
-/**
- * Find the entry source file the SDK is actually wired into. Two-layer
- * check (matches install-sdk's `findWiredSourceFile`): grep for any
- * `@restlessai/sdk` reference, then verify each candidate with the
- * writer's `parse()` so we don't treat a stale comment or partial
- * leftover as a wired block.
+ * The wired file, with the LOOSE predicate.
  *
- * Preference order:
- *   1. `ctx.entryFile` if install-sdk already pinned one (relative path
- *      under installDir). Saves a re-grep and keeps the two steps in
- *      lockstep.
- *   2. Grep for candidates, parse each, return the first that's a real
- *      block.
+ * final-checks wants the wider net specifically so it can find old-API files:
+ * they carry the import but no factory call, so the strict `hasInit` check
+ * rejects exactly the files the old-API repair flow exists to rewrite.
  */
 function findWiredSourceFile(installDir, ctx) {
-  const writer = getSdkWriter(ctx?.language || 'javascript');
-
-  // Plugin-style Next wiring: the setup callback (credential + owner.id)
-  // lives in restless.config.*, and that's the file the owner-id repair
-  // flows must patch. Resolve it directly - the grep below would surface
-  // next.config.* too (it also references the package), and which of the
-  // two comes back first is up to grep's walk order.
-  const plugin = nextPluginWiringStatus(installDir);
-  if (plugin.hasDefineConfig) {
-    return path.join(installDir, plugin.restlessConfigFile);
-  }
-
-  // `hasSdkReference` (loose), not `hasInit` (strict). The strict check
-  // rejects OLD-API files (they have the import but no factory call),
-  // and final-checks specifically wants to FIND those so the old-api
-  // repair flow can rewrite them. install-sdk uses hasInit for its own
-  // "should we skip the AI wiring pass?" decision, which is correct
-  // there - here we want the wider net.
-  if (ctx?.entryFile) {
-    const abs = path.isAbsolute(ctx.entryFile)
-      ? ctx.entryFile
-      : path.join(installDir, ctx.entryFile);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      if (writer.hasSdkReference(content)) return abs;
-    } catch {}
-  }
-
-  const candidates = findSdkReferences(installDir);
-  for (const rel of candidates) {
-    const abs = path.join(installDir, rel);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      if (writer.hasSdkReference(content)) return abs;
-    } catch {}
-  }
-  return null;
+  return findWired(installDir, ctx?.language || 'javascript', {
+    loose: true,
+    entryFile: ctx?.entryFile || null,
+  });
 }
 
 /**
@@ -102,31 +60,11 @@ function findWiredSourceFile(installDir, ctx) {
  * cases that need codebase context (e.g. is `workspace.subdomain`
  * actually mutable in this project's schema).
  */
-const RISKY_TOKENS = [
-  'authorization', 'apikey', 'api_key', 'api-key', 'x-api-key',
-  'x-auth', 'secret', 'token', 'password', 'bearer',
-];
-
-// AI emits this literal when it can't find a stable internal id. Treat
-// it as "needs repair" so the interactive prompt fires.
-const SENTINEL_PLACEHOLDER = "'NEEDS_CONFIGURATION'";
-
-const MUTABLE_TAIL_FIELDS = new Set([
-  'email', 'username', 'name', 'displayname', 'display_name',
-  'handle', 'slug', 'nickname', 'alias', 'login',
-]);
-
-// Literal string values that almost certainly indicate "I didn't have a
-// real id, so I picked a placeholder." Using one of these here fake-
-// groups every unauthenticated / unknown request under a single tenant
-// on the dashboard, masking the fact that they're actually anonymous.
-// The right way to signal "no owner for this request" is `undefined`
-// (or omitting the owner block entirely); the SDK has its own anonymous
-// bucket on the wire-format side.
-const PLACEHOLDER_STRINGS = new Set([
-  'anonymous', 'none', 'unknown', 'guest', 'default', 'placeholder',
-  'nobody', 'null', 'undefined', 'test', 'todo',
-]);
+// The owner.id policy sets live in `lib/sdk-writers/contract.js`: they encode
+// what SETUP-002 means (permanent, immutable, never a credential), which is
+// identical in every language, so a Python writer inherits them rather than
+// re-listing them. Used under their canonical names - a local alias would mean
+// two names for one set forever.
 
 export function analyzeOwnerId(expr) {
   if (!expr || typeof expr !== 'string') {
@@ -134,10 +72,12 @@ export function analyzeOwnerId(expr) {
   }
   const trimmed = expr.trim();
 
-  if (trimmed === SENTINEL_PLACEHOLDER || trimmed === '"NEEDS_CONFIGURATION"') {
+  // Quote-style agnostic, so Python's `"""..."""` and Go's backticks read the
+  // same as the JS single-quoted form this used to hardcode.
+  if (isOwnerIdPlaceholder(trimmed)) {
     return {
       severity: 'critical',
-      reason: "set to the 'NEEDS_CONFIGURATION' placeholder - the installer couldn't find a stable id",
+      reason: `set to the '${OWNER_ID_PLACEHOLDER}' placeholder - the installer couldn't find a stable id`,
     };
   }
 
@@ -151,7 +91,7 @@ export function analyzeOwnerId(expr) {
   }
 
   // Critical: raw secrets.
-  if (RISKY_TOKENS.some((t) => e.includes(t)) || /^\s*key\s*$/.test(e)) {
+  if (RISKY_CREDENTIAL_TOKENS.some((t) => e.includes(t)) || /^\s*key\s*$/.test(e)) {
     return {
       severity: 'critical',
       reason: 'looks like a raw secret (auth header, api key, token, or password)',
@@ -164,7 +104,7 @@ export function analyzeOwnerId(expr) {
   const stringLit = trimmed.match(/^(['"])(.+)\1$/);
   if (stringLit) {
     const value = stringLit[2].toLowerCase();
-    if (PLACEHOLDER_STRINGS.has(value)) {
+    if (PLACEHOLDER_OWNER_IDS.has(value)) {
       return {
         severity: 'critical',
         reason: `the literal '${stringLit[2]}' fake-groups every request under one tenant. Return \`undefined\` (or omit \`owner\`) when there's no real owner for the request.`,
@@ -415,7 +355,10 @@ export function runChecks(ctx) {
   // see one here, every downstream check (init form, credential, owner)
   // is reading from a broken block, so surface this first and route the
   // user into a focused AI rewrite.
-  const oldApiHit = writer.findOldApiSetup(content);
+  // Optional method: only the JavaScript writer has an old API to migrate
+  // from (see OPTIONAL_WRITER_METHODS). Calling it unconditionally would
+  // throw TypeError on every Python run.
+  const oldApiHit = writer.findOldApiSetup ? writer.findOldApiSetup(content) : null;
   if (oldApiHit !== null) {
     rows.push({
       kind: 'old-api',
@@ -604,6 +547,7 @@ async function repairOwnerId({ ctx, sourceFile, writer, update, setSpinner, subI
 
   try {
     const prompt = loadPrompt('fix-owner-id', {
+      ...languagePromptVars(ctx?.language),
       language: ctx.language || 'javascript',
       framework: ctx.framework || ctx.language || 'your framework',
     });

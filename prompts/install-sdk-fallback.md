@@ -7,7 +7,7 @@ Install and set up the SDK package for this {{language}} project.
 Figure out the right location:
 - Look for a monorepo structure (workspaces, lerna, turborepo, nx). If this is a monorepo, install in the correct package - the one that contains the API routes, not the root.
 - Check for a `packages/` or `apps/` directory structure.
-- Look at where existing dependencies are installed (which `package.json`, `requirements.txt`, `Gemfile`, `go.mod`, etc. is closest to the API code).
+- Look at where existing dependencies are installed (which `{{manifest}}`, `requirements.txt`, `Gemfile`, `go.mod`, etc. is closest to the API code).
 - Run the install command from that directory, not necessarily the project root.
 
 ## Step 2: Wire up the SDK in the code

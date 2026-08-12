@@ -1,15 +1,20 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { runAI, loadPrompt, pkgRoot } from '../lib/ai.js';
+import { runAI, loadPrompt, loadPromptForLanguage, pkgRoot } from '../lib/ai.js';
 import { bold, dim, green, red, cyan, yellow, orange, ask, terminalPrompt, waitForKey } from '../lib/ui.js';
 import { startStep } from '../lib/step-template.js';
 import { CLI_NAME } from '../lib/config.js';
 import { safeWriteFileSync } from '../lib/pathGuard.js';
 import { fatalError } from '../lib/errors.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
+import { getSdkWriter, normalizeLanguage } from '../lib/sdk-writers/index.js';
+import { findWiredSourceFile as findWired } from '../lib/wired-file.js';
+import {
+  describeMissingSdk,
+  installCommandFor,
+  isSdkInstalled,
+} from '../lib/install-target.js';
 import {
   detectNext,
   isNextFramework,
@@ -18,76 +23,21 @@ import {
   findNextConfigFile,
 } from '../lib/next-detect.js';
 
-/**
- * Pick the language-specific SDK writer for this run. Today we only
- * support JavaScript / TypeScript; Python / Ruby / Go land here as
- * sibling modules with the same exported shape.
- */
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
 
 /**
- * Walk the install dir for source files referencing `@restlessai/sdk`.
- * Returns the list of relative paths inside `installDir`, in grep
- * output order. Empty array when nothing matches.
+ * The wired file, with the STRICT predicate.
  *
- * This is the raw signal - callers like `isSdkWired` and
- * `findWiredSourceFile` layer additional checks (writer.parse) on top
- * so we don't treat a stray comment or stale partial reference as
- * "wired in."
+ * `hasInit`, not `hasSdkReference`: the latter matches any mention of the
+ * package - a comment, a test fixture, a config string all qualify - while
+ * `hasInit` requires an actual constructor call, which is the only thing that
+ * plumbs the SDK into the user's code. This decides whether to skip the AI
+ * wiring pass on a re-run, so a false positive means shipping unwired.
  *
- * Uses the shared `findSdkReferences` helper so the grep excludes
- * `node_modules` (and other heavy dirs) at the recursion level, not
- * after. Past incident: scanning node_modules synchronously froze the
- * UI for tens of seconds between Generate API key and Configure SDK.
- */
-function findSdkCandidateFiles(installDir) {
-  return findSdkReferences(installDir);
-}
-
-/**
- * Find a real wired source file - not just a stray reference.
- * Returns absolute path of the first file that contains a parseable
- * SDK block, or null if none.
- *
- * Two-layer check: grep finds candidates fast, then writer.parse()
- * verifies the file actually imports/requires `@restlessai/sdk` in
- * the canonical form. A file that mentions the package only in a
- * comment or string literal is rejected.
+ * No plugin short-circuit here: this step handles the Next.js plugin case
+ * separately through `nextWiringStatus`.
  */
 function findWiredSourceFile(installDir, language = 'javascript') {
-  const writer = getSdkWriter(language);
-  const candidates = findSdkCandidateFiles(installDir);
-  for (const rel of candidates) {
-    const abs = path.join(installDir, rel);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      // Use `hasInit()`, NOT `parse()`. parse() matches any quoted
-      // mention of the package - a comment, a test fixture, a config
-      // string would all qualify. hasInit() requires an actual
-      // `require('@restlessai/sdk')` or `from '@restlessai/sdk'`
-      // statement, which is the only thing that actually plumbs the
-      // SDK into the user's code.
-      if (writer.hasInit(content)) {
-        debug.log('install-sdk.wired-file', { rel, candidates: candidates.length });
-        return abs;
-      }
-    } catch {
-      // Unreadable file - skip and continue. A common case is a
-      // grep match in a generated file that's mid-rewrite.
-    }
-  }
-  if (candidates.length > 0) {
-    // Grep matched something but none of the candidates have a real
-    // init/import. Surface this in the debug log so the disagreement
-    // between "grep finds it" and "no actual wiring" is visible -
-    // most often this is a leftover comment, JSDoc, or test fixture
-    // from a prior CLI run.
-    debug.log('install-sdk.stale-references', { candidates });
-  }
-  return null;
+  return findWired(installDir, language, { plugin: false, debugTag: 'install-sdk' });
 }
 
 /**
@@ -106,28 +56,6 @@ function canonicalizeSdkBlock(ctx) {
   return { mode: 'canonicalized', file: path.relative(ctx.installDir, file) };
 }
 
-const languageAliases = {
-  node: 'javascript',
-  'node.js': 'javascript',
-  nodejs: 'javascript',
-  js: 'javascript',
-  'javascript (node.js)': 'javascript',
-  ts: 'typescript',
-  py: 'python',
-  python3: 'python',
-  rb: 'ruby',
-  golang: 'go',
-  csharp: 'csharp',
-  'c#': 'csharp',
-};
-
-const installCommands = {
-  javascript: 'npm install @restlessai/sdk --save',
-  typescript: 'npm install @restlessai/sdk --save',
-  python: 'pip install restlessai',
-  ruby: 'gem install restlessai',
-  go: 'go get github.com/restlessai/go',
-};
 
 /**
  * Check whether `@restlessai/sdk` is actually wired into the user's
@@ -167,7 +95,7 @@ export function nextWiringStatus(installDir, nextInfo, language = 'javascript') 
   const writer = getSdkWriter(language);
   const mwSet = new Set(nextInfo.middlewareFiles);
   const wired = [];
-  for (const rel of findSdkCandidateFiles(installDir)) {
+  for (const rel of writer.candidateWiringFiles(installDir)) {
     try {
       if (writer.hasInit(fs.readFileSync(path.join(installDir, rel), 'utf8'))) wired.push(rel);
     } catch {
@@ -182,165 +110,6 @@ export function nextWiringStatus(installDir, nextInfo, language = 'javascript') 
     wiredHandlerSide,
     ok: wiredMiddleware.length === 0 && wiredHandlerSide.length > 0,
   };
-}
-
-/**
- * Walk from `packageDir` toward the filesystem root, checking each
- * directory's `node_modules` for the hoisted SDK package. Returns the
- * absolute path of the package.json that resolves the SDK, or null.
- *
- * Workspaces matter here: in npm / pnpm / yarn workspaces, running
- * `npm install <pkg>` inside `packages/<workspace>/` typically hoists
- * the dependency up to the repo root's `node_modules/`, not into the
- * workspace's own. Checking only `packageDir/node_modules` produced
- * a false "install failed" verdict for every monorepo user, after
- * which the rest of the flow ran with bogus state.
- *
- * We also defend against broken symlinks (a leftover `npm link` that
- * points nowhere) by requiring the package.json to be readable, not
- * just present on disk.
- */
-function resolveInstalledSdk(packageDir) {
-  const names = [
-    ['@restlessai', 'sdk'],
-    ['restlessai'],
-  ];
-  let dir = path.resolve(packageDir);
-  // Cap at 8 levels up. Any monorepo deeper than that is exotic; we
-  // wouldn't be confident the result belongs to the same project anyway.
-  for (let depth = 0; depth < 8; depth++) {
-    for (const name of names) {
-      const pkgJson = path.join(dir, 'node_modules', ...name, 'package.json');
-      try {
-        fs.accessSync(pkgJson, fs.constants.R_OK);
-        return pkgJson;
-      } catch {}
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return null;
-}
-
-function isSdkInstalled(packageDir) {
-  return resolveInstalledSdk(packageDir) !== null;
-}
-
-/**
- * Find the directory whose `package.json` actually owns the detected API.
- * In a monorepo the API might live under `packages/api/` with its own
- * `package.json`; installing at the repo root would add the SDK to the
- * wrong workspace. Walk from the API's rootDir up to the repo root and
- * return the first directory that has a `package.json`.
- */
-export function resolveInstallDir(packageDir, apiRootDir) {
-  if (!apiRootDir || apiRootDir === '.') return packageDir;
-  let dir = path.resolve(packageDir, apiRootDir);
-  const stop = path.resolve(packageDir);
-  while (dir.startsWith(stop)) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return packageDir;
-}
-
-/**
- * For inline-key mode: after the AI has wired up the SDK, scan files
- * importing `@restlessai/sdk` and put the literal key into the SDK init
- * call. Narrowly scoped to files that import the SDK so we don't touch
- * unrelated identifiers elsewhere.
- *
- * Three call-site patterns are recognized, in order:
- *   1. `process.env.RESTLESS_KEY` placeholder (what the AI emits when we
- *      tell it to). Swap the placeholder for the literal.
- *   2. Bare immediate factory call: `require('@restlessai/sdk')()`. Inject
- *      the literal between the parens. Covers re-runs where a previous AI
- *      pass produced a no-arg call.
- *   3. Named factory call after a non-immediate import: `import x from
- *      '@restlessai/sdk'; ... x()`. Same fix - inject literal.
- *
- * For each line we patch, prepend a `// TODO: move this out of the
- * codebase before committing` comment - the inline path is testing-only
- * and we don't want users committing the literal key by accident.
- *
- * Idempotent: if the literal key is already present in the file, do
- * nothing.
- */
-export function inlineKeyIntoSource(installDir, apiKey) {
-  let touched = [];
-  try {
-    const files = findSdkReferences(installDir);
-    const literal = JSON.stringify(apiKey);
-    const TODO = '// TODO: move this out of the codebase before committing';
-
-    // `SDK_PKG` allows subpath entrypoints (`@restlessai/sdk/next`), so the
-    // inline-key path also patches Next.js wirings, not just the bare entry.
-    const SDK_PKG = String.raw`@restlessai\/sdk(?:\/[\w.-]+)*`;
-    const bareRequireCall = new RegExp(`require\\(\\s*['"]${SDK_PKG}['"]\\s*\\)\\s*\\(\\s*\\)`);
-    const bareRequireInject = new RegExp(`(require\\(\\s*['"]${SDK_PKG}['"]\\s*\\)\\s*\\()(\\s*)(\\))`);
-
-    for (const rel of files) {
-      const full = path.join(installDir, rel);
-      const content = fs.readFileSync(full, 'utf8');
-
-      // Idempotent: if we already inlined this exact key, leave the file alone.
-      if (content.includes(apiKey)) continue;
-
-      // Detect a name bound to the factory itself (not the result of calling it).
-      // `const x = require('@restlessai/sdk')()` is the immediate-call form -
-      // `x` holds the result, not the factory, so we don't match against it.
-      let factoryName = null;
-      const esmMatch = content.match(new RegExp(`import\\s+(\\w+)\\s+from\\s+['"]${SDK_PKG}['"]`));
-      const cjsMatch = content.match(new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*require\\(\\s*['"]${SDK_PKG}['"]\\s*\\)\\s*;?\\s*$`, 'm'));
-      if (esmMatch) factoryName = esmMatch[1];
-      else if (cjsMatch) factoryName = cjsMatch[1];
-
-      const namedCall = factoryName ? new RegExp(`\\b${factoryName}\\s*\\(\\s*\\)`) : null;
-      const namedInject = factoryName ? new RegExp(`(\\b${factoryName}\\s*\\()(\\s*)(\\))`) : null;
-
-      const lines = content.split('\n');
-      const next = [];
-      let changed = false;
-
-      for (const line of lines) {
-        let newLine = line;
-        let didReplace = false;
-
-        if (line.includes('process.env.RESTLESS_KEY')) {
-          newLine = line.replaceAll('process.env.RESTLESS_KEY', literal);
-          didReplace = true;
-        } else if (bareRequireCall.test(line)) {
-          newLine = line.replace(bareRequireInject, `$1${literal}$3`);
-          didReplace = true;
-        } else if (namedCall && namedCall.test(line)) {
-          newLine = line.replace(namedInject, `$1${literal}$3`);
-          didReplace = true;
-        }
-
-        if (didReplace) {
-          // Don't double-add the TODO if a previous run already inserted one.
-          const prev = next[next.length - 1] || '';
-          if (!prev.includes('TODO: move this out of the codebase')) {
-            const indent = line.match(/^\s*/)[0];
-            next.push(`${indent}${TODO}`);
-          }
-          next.push(newLine);
-          changed = true;
-        } else {
-          next.push(line);
-        }
-      }
-
-      if (changed) {
-        safeWriteFileSync(full, next.join('\n'));
-        touched.push(rel);
-      }
-    }
-  } catch {}
-  return touched;
 }
 
 export default async function installSdk({
@@ -381,7 +150,15 @@ export default async function installSdk({
   });
 
   if (!detectedLanguage) detectedLanguage = 'javascript';
-  const guideLanguage = languageAliases[detectedLanguage] || detectedLanguage;
+  // Also the name of the guide in `docs/sdks/`, so it has to go through the
+  // same normalization the writer registry uses - otherwise `node` picks the
+  // JS writer but looks for a `docs/sdks/node.md` that doesn't exist.
+  const guideLanguage = normalizeLanguage(detectedLanguage);
+  // What this language's package is CALLED, for anything we show the user.
+  // Hardcoding `@restlessai/sdk` here told a Rails user we were installing an
+  // npm package, and in the install-failure path it contradicted the
+  // per-language reason printed directly beneath it.
+  const sdkName = getSdkWriter(guideLanguage).descriptor.packageSpecifier;
 
   // Next.js needs a fundamentally different wiring than the middleware /
   // plugin model the guide's Express/Fastify/Koa sections describe, and it
@@ -444,20 +221,20 @@ export default async function installSdk({
   }
 
   // ── Sub 0: Install package ───────────────────────────────────────────────
-  const alreadyInstalled = isSdkInstalled(installDir);
+  const alreadyInstalled = isSdkInstalled(installDir, guideLanguage);
   if (alreadyInstalled) {
     update({ sub: { 0: 'done' }, activeSub: 1, message: [
-      `  ${green('✓')} ${bold('@restlessai/sdk')} is already installed in ${installLocation} - skipping install.`,
+      `  ${green('✓')} ${bold(sdkName)} is already installed in ${installLocation} - skipping install.`,
     ]});
   } else {
-    const defaultCmd = installCommands[guideLanguage] || installCommands.javascript;
+    const defaultCmd = installCommandFor(guideLanguage);
     const cdPrefix = installDirRel !== '.' ? `cd ${installDirRel} && ` : '';
     // Keep the step intro visible above the prompt - just advance the cursor.
     update({ activeSub: 0 });
     const cmd = await terminalPrompt(cdPrefix + defaultCmd);
 
     update({ activeSub: 0, message: [
-      `  Installing ${bold('@restlessai/sdk')} in ${installLocation}…`,
+      `  Installing ${bold(sdkName)} in ${installLocation}…`,
     ]});
     try {
       // Use packageDir as cwd so the `cd ...` prefix resolves correctly.
@@ -466,7 +243,7 @@ export default async function installSdk({
       // Install warnings can trip non-zero exits; the verify step below catches
       // a genuine failure.
     }
-    if (!isSdkInstalled(installDir)) {
+    if (!isSdkInstalled(installDir, guideLanguage)) {
       // Halt loudly. Earlier versions returned a `{ installed: false }`
       // sentinel and trusted the caller to check it - but bin/api.js
       // didn't, so finalChecks ran with `prevSubs: { 0:'done', 1:'done',
@@ -474,9 +251,9 @@ export default async function installSdk({
       // that genuinely failed. Never silently push past a failed install.
       debug.log('install-sdk.install-failed', { installDir, cmd });
       fatalError(
-        `Install didn't complete - ${bold('@restlessai/sdk')} isn't reachable from ${bold(installDirRel)}.`,
+        `Install didn't complete - ${bold(sdkName)} isn't reachable from ${bold(installDirRel)}.`,
         [
-          `Tried to find it walking up from ${installDir} - nothing readable in any node_modules.`,
+          ...describeMissingSdk(installDir, guideLanguage),
           `Try running the command yourself, then re-run \`npx ${CLI_NAME} init\`:`,
           `  ${cmd}`,
         ],
@@ -536,7 +313,7 @@ export default async function installSdk({
   // and the UI sat showing the "Added RESTLESS_KEY to .env" message the
   // whole time with no spinner.
   update({ activeSub: 2, message: [
-    `  Configuring ${bold('@restlessai/sdk')} in your ${bold(detectedFramework || detectedLanguage)} code…`,
+    `  Configuring ${bold(sdkName)} in your ${bold(detectedFramework || detectedLanguage)} code…`,
   ]});
   // We deliberately do NOT short-circuit the AI even when the SDK looks
   // wired in already. Three real failure modes from the "already wired"
@@ -590,7 +367,7 @@ export default async function installSdk({
   const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
   const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
   const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
-  const basePrompt = loadPrompt('setup-sdk', {
+  const basePrompt = loadPromptForLanguage('setup-sdk', guideLanguage, {
     language: detectedLanguage,
     framework: detectedFramework || detectedLanguage,
     guide: setupSection,
@@ -775,7 +552,7 @@ export default async function installSdk({
   // whether wiring pre-existed.
   if (preExistingWiring) {
     update({ activeSub: 2, message: [
-      `  Re-checking the ${bold('@restlessai/sdk')} wiring in your ${bold(detectedFramework || detectedLanguage)} code.`,
+      `  Re-checking the ${bold(sdkName)} wiring in your ${bold(detectedFramework || detectedLanguage)} code.`,
       `  ${orange(aiTool)} ${dim("is looking at what's there and adding anything missing.")}`,
     ]});
   } else if (isNext && nextStyle === 'plugin') {
@@ -791,7 +568,7 @@ export default async function installSdk({
     ]});
   } else {
     update({ activeSub: 2, message: [
-      `  Wiring ${bold('@restlessai/sdk')} into your ${bold(detectedFramework || detectedLanguage)} code.`,
+      `  Wiring ${bold(sdkName)} into your ${bold(detectedFramework || detectedLanguage)} code.`,
       `  ${orange(aiTool)} ${dim('is reading your server file and registering the middleware before routes.')}`,
     ]});
   }

@@ -10,11 +10,11 @@ This is a runtime signal, not a guess: a real HTTP request was just sent to thei
 
 {{guidance}}
 
-Start by reading the relevant server / route / config files to understand the current wiring, then make the smallest change that fixes it. The Restless SDK package is `@restlessai/sdk`. The server was reached at {{base}}.
+Start by reading the relevant server / route / config files to understand the current wiring, then make the smallest change that fixes it. The Restless SDK package is `{{sdkPackage}}`. The server was reached at {{base}}.
 
 ## Hard rules
 
-- On **Next.js**, NEVER wire the SDK into a middleware file (`middleware.ts` / `proxy.ts`). Next passes middleware a request whose `.request` getter throws `PageSignatureError`, and middleware runs on the Edge runtime where the SDK can't do its work. If a previous attempt wired it there, REMOVE it and instead wrap the route handlers (import from `@restlessai/sdk/next`).
+- On **Next.js**, NEVER wire the SDK into a middleware file (`middleware.ts` / `proxy.ts`). Next passes middleware a request whose `.request` getter throws `PageSignatureError`, and middleware runs on the Edge runtime where the SDK can't do its work. If a previous attempt wired it there, REMOVE it and instead wrap the route handlers (import from `{{sdkPackage}}/next`).
 - Do NOT print, log, echo, or hardcode the value of `RESTLESS_KEY`. Always reference it as `process.env.RESTLESS_KEY`.
 - Make the smallest change that fixes the wiring. If the existing setup is already correct, leave it alone.
 - Do not use `python`, `ruby`, `pip`, or other interpreters the user may not have — use Node or POSIX tools.

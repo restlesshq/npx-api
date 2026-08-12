@@ -6,6 +6,34 @@ It's not just another observability platform (although you can use it to see wha
 
 Think of us more as an API success platform. We give humans, AI and you the tools to quickly make successful calls.
 
+# Supported stacks
+
+| language | frameworks |
+| --- | --- |
+| JavaScript / TypeScript | Express, Fastify, Koa, Hono, NestJS, Next.js (App or Pages Router) |
+| Python | Flask, Django, FastAPI, Starlette, and anything else speaking WSGI or ASGI |
+| Ruby | Rails, Sinatra, Hanami, Grape, Roda, and anything else speaking Rack |
+| Go | net/http, chi, gorilla/mux, Echo, Gin |
+
+A repo can hold more than one. A Django API behind a Next.js frontend is two
+real APIs, and setup scans for both and asks which you meant rather than
+picking for you.
+
+If `npx api init` finds only a language we can't wire yet (a `composer.json`,
+`Cargo.toml`, `pom.xml`, and so on) it tells you and stops
+rather than scanning a codebase it can't set up. The call it prints is the
+fastest way to get your language moved up.
+
+That check only fires when there is nothing supported to find, so a Python API
+with a `package.json` for its frontend, or a Node API with Python build
+scripts, are both unaffected. If it does misjudge your repo - an HTTP framework
+we don't know by name, or a bare `node:http` server we couldn't see - skip it
+and scan anyway:
+
+```
+RESTLESS_SKIP_STACK_CHECK=1 npx api init
+```
+
 # What lands in your project
 
  - `.restless/` - your API's OpenAPI spec plus the settings the SDK reads at

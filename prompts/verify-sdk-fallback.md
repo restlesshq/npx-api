@@ -1,8 +1,8 @@
 Verify that the Restless SDK was installed correctly in this {{language}} project.
 
-For JavaScript / TypeScript projects, the package is `@restlessai/sdk`. Check:
-- It appears in `package.json` dependencies.
-- The server entry point imports the SDK (e.g. `require('@restlessai/sdk')` or `import restless from '@restlessai/sdk'`). Framework-specific subpaths like `@restlessai/sdk/express` also work but are no longer the recommended form.
+For JavaScript / TypeScript projects, the package is `{{sdkPackage}}`. Check:
+- It appears in `{{manifest}}` dependencies.
+- The server entry point imports the SDK (e.g. `require('{{sdkPackage}}')` or `import restless from '{{sdkPackage}}'`). Framework-specific subpaths like `{{sdkPackage}}/express` also work but are no longer the recommended form.
 - The middleware/plugin is registered BEFORE any route definitions.
 - `process.env.RESTLESS_KEY` is referenced (the SDK reads this automatically).
 

@@ -1,9 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createSetupContext, getSdkLineSpec, redactSetupContext } from '../lib/setup-context.js';
 
-vi.mock('../lib/envLoader.js', () => ({
-  detectEnvLoader: () => ({ mode: 'none', evidence: 'no env loader detected' }),
-  envLoaderHasKey: (l) => !!(l && l.mode && l.mode !== 'none'),
+// Env detection is a writer method now, so the stub goes on the registry
+// rather than on a separate envLoader module. Stubbed because these cases are
+// about the context's own shape, not about reading a real project tree.
+vi.mock('../lib/sdk-writers/index.js', () => ({
+  getSdkWriter: () => ({
+    detectEnvLoader: () => ({ mode: 'none', evidence: 'no env loader detected' }),
+  }),
 }));
 
 describe('createSetupContext', () => {

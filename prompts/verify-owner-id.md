@@ -7,11 +7,11 @@ You are the **security verification pass** for a Restless SDK install in this {{
 
 So: be skeptical. Confirm rather than assume.
 
-**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read files inside node_modules/.**
+**IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read or scan {{neverRead}}.**
 
 ## What to do
 
-1. **Find the wired file.** Run `grep -rE "@restlessai/sdk" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
+1. **Find the wired file.** Run `grep -rE "{{sdkPackage}}" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
    - Classic: a file containing `sdk.setup((req) => ({ ... }))`.
    - Next.js single-config: a `restless.config.*` at the project root containing `defineConfig({ setup: async (req) => ({ ... }) })` (ignore `next.config.*` - it only wraps the build config and holds no owner).
 
@@ -89,7 +89,7 @@ So: be skeptical. Confirm rather than assume.
 
 - Edit ONLY the `owner: { id: ... }` line. Do not touch the `apiKey:` line. Do not touch the SDK init line. Do not touch anything outside the setup callback.
 - Do not install packages.
-- Do not modify package.json, .gitignore, tsconfig, Dockerfile, CI configs, or any other file.
+- Do not modify {{manifest}}, .gitignore, tsconfig, Dockerfile, CI configs, or any other file.
 - Do not read .env or any file in node_modules.
 - If the current `owner.id` is already set to `'NEEDS_CONFIGURATION'`, leave it alone. The CLI will prompt the user.
 - If you genuinely cannot make a determination at all (no auth middleware found, no evidence of what the value is or where it comes from, codebase is too unfamiliar), replace with the sentinel. **Default to suspicion in the security-relevant direction**: user-controlled input, mutable fields, and unverified auth attachments all warrant the sentinel. Lack of a formal schema does NOT. A JSON-key id, an in-memory map key, or a UUID literal are all fine; do not replace those with the sentinel just because there's no Mongoose model.

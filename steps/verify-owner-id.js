@@ -1,43 +1,11 @@
 import fs from 'fs';
-import path from 'path';
-import { runAI, loadPrompt } from '../lib/ai.js';
+import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { bold, dim, green, yellow, cyan, orange } from '../lib/ui.js';
 import * as debug from '../lib/debug.js';
-import * as jsWriter from '../lib/sdk-writers/javascript.js';
-import { findSdkReferences } from '../lib/grep-sdk.js';
-import { nextPluginWiringStatus } from '../lib/next-detect.js';
+import { getSdkWriter } from '../lib/sdk-writers/index.js';
+import { findWiredSourceFile } from '../lib/wired-file.js';
 import { analyzeOwnerId } from './final-checks.js';
 
-function getSdkWriter(language) {
-  const writers = { javascript: jsWriter, typescript: jsWriter };
-  return writers[language] || jsWriter;
-}
-
-/**
- * Find the wired source file by grepping for the SDK import. Same
- * approach as final-checks / install-sdk: writer.hasInit() confirms the
- * file actually plumbs the SDK in, not just mentions it.
- *
- * Plugin-style Next wiring has no factory call, so hasInit() never
- * matches it - the setup callback (and its owner.id) lives in
- * restless.config.*, which we resolve directly.
- */
-function findWiredSourceFile(installDir, language) {
-  const plugin = nextPluginWiringStatus(installDir);
-  if (plugin.hasDefineConfig) {
-    return path.join(installDir, plugin.restlessConfigFile);
-  }
-  const writer = getSdkWriter(language);
-  const candidates = findSdkReferences(installDir);
-  for (const rel of candidates) {
-    const abs = path.join(installDir, rel);
-    try {
-      const content = fs.readFileSync(abs, 'utf8');
-      if (writer.hasInit(content)) return abs;
-    } catch {}
-  }
-  return null;
-}
 
 /**
  * Semantic verification pass for owner.id. Runs between install-sdk and
@@ -97,6 +65,7 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
   ]});
 
   const prompt = loadPrompt('verify-owner-id', {
+    ...languagePromptVars(language),
     language,
     framework: framework || language,
   });

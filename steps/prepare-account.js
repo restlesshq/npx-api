@@ -8,24 +8,6 @@ import { generateWriteKey, ensureProject } from '../lib/project-init.js';
 import * as debug from '../lib/debug.js';
 
 /**
- * Resolve the directory that owns the detected API's `package.json`, so
- * `.env` lands next to the server that will read it. Mirrors the same
- * walk we do in install-sdk.js.
- */
-export function resolveApiDir(packageDir, apiRootDir) {
-  if (!apiRootDir || apiRootDir === '.') return packageDir;
-  let dir = path.resolve(packageDir, apiRootDir);
-  const stop = path.resolve(packageDir);
-  while (dir.startsWith(stop)) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return packageDir;
-}
-
-/**
  * Find a real `.env` (or `.env.local`) regular file, searching from
  * `apiDir` up to `rootDir` (the repo / git root) inclusive. In a monorepo
  * the API code lives in e.g. `packages/api` but the `.env` is usually at
