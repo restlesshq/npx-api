@@ -396,9 +396,9 @@ async function finalizeApi({
   // Visibility (external vs internal) is recorded, not asked. Nothing in
   // setup branches on it and the dashboard doesn't read it yet, so the
   // question was spending one of the user's few decisions on a field only
-  // `npx api update` touches. The heuristic below fills it in: it biases
+  // `npx restless update` touches. The heuristic below fills it in: it biases
   // toward "internal" when the name, framework, or routes look service-y,
-  // and is wrong cheaply - `npx api update` flips it in one keystroke.
+  // and is wrong cheaply - `npx restless update` flips it in one keystroke.
   const nameLower = (name || '').toLowerCase();
   const frameworkLower = (framework || '').toLowerCase();
   const endpointsLower = (endpoints || []).map((e) => e.toLowerCase());
@@ -950,7 +950,7 @@ export function describeCoverageGap(coverage) {
 
 /**
  * Write a spec by reading the routes: the AI pass, its parse-and-fix loop, and
- * the file-route coverage guard. Exported because `npx api update` regenerates
+ * the file-route coverage guard. Exported because `npx restless update` regenerates
  * through exactly this path - "re-scan my routes" has to mean the same thing
  * after setup as during it, including the coverage guard, or an update would
  * quietly produce a less complete spec than the original.
@@ -1221,7 +1221,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
   let finalOasFile = oasFile;
   let preferNativeGeneration = canGenerateNatively;
   // How this spec came to be, recorded on the settings entry. This is not
-  // decoration: `npx api update` reads it to decide what "refresh my spec"
+  // decoration: `npx restless update` reads it to decide what "refresh my spec"
   // means, and the right answer is completely different per kind (re-fetch a
   // URL, re-read a file the user maintains, re-run a framework generator,
   // re-scan the routes). Every branch below has to set it.

@@ -149,13 +149,13 @@ describe('an agent we cannot identify', () => {
     expect(r.mod.invocationSource()).toBe('agent');
   });
 
-  it('leaves `npx api init | tee log.txt` alone - stdin is still a terminal', async () => {
+  it('leaves `npx restless init | tee log.txt` alone - stdin is still a terminal', async () => {
     const r = await freshEnv({}, { tty: { out: false, in: true } }); restore = r.restore;
     expect(r.mod.isAgent()).toBe(false);
     expect(r.mod.invocationSource()).toBe('cli');
   });
 
-  it('leaves `npx api init < /dev/null` alone - stdout is still a terminal', async () => {
+  it('leaves `npx restless init < /dev/null` alone - stdout is still a terminal', async () => {
     const r = await freshEnv({}, { tty: { out: true, in: false } }); restore = r.restore;
     expect(r.mod.isAgent()).toBe(false);
   });

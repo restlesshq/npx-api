@@ -1,4 +1,4 @@
-# npx api init
+# npx restless init
 
 Restless makes sure every 🔴 400 Bad Request turns out 🟢 200 Okay.
 
@@ -19,7 +19,7 @@ A repo can hold more than one. A Django API behind a Next.js frontend is two
 real APIs, and setup scans for both and asks which you meant rather than
 picking for you.
 
-If `npx api init` finds only a language we can't wire yet (a `composer.json`,
+If `npx restless init` finds only a language we can't wire yet (a `composer.json`,
 `Cargo.toml`, `pom.xml`, and so on) it tells you and stops
 rather than scanning a codebase it can't set up. The call it prints is the
 fastest way to get your language moved up.
@@ -31,7 +31,7 @@ we don't know by name, or a bare `node:http` server we couldn't see - skip it
 and scan anyway:
 
 ```
-RESTLESS_SKIP_STACK_CHECK=1 npx api init
+RESTLESS_SKIP_STACK_CHECK=1 npx restless init
 ```
 
 # What lands in your project
@@ -43,7 +43,7 @@ RESTLESS_SKIP_STACK_CHECK=1 npx api init
 
 # Running inside a coding agent
 
-If you run `npx api init` inside Claude Code or Codex, it doesn't quietly drive
+If you run `npx restless init` inside Claude Code or Codex, it doesn't quietly drive
 its own AI through your codebase. It prints the setup as instructions for the
 agent you're already talking to, so the work happens in front of you: you see
 every diff and can stop or redirect it. Your agent handles reading the code,
@@ -52,14 +52,14 @@ that shouldn't be improvised:
 
 | command | what it does |
 | ------- | ------------ |
-| `npx api guide [oas\|sdk]` | Prints the spec-writing / SDK-wiring instructions |
-| `npx api key` | Registers the project and writes `RESTLESS_KEY` to `.env` |
-| `npx api register --oas <file>` | Records a spec in `.restless/settings.json` (rejects localhost servers) |
-| `npx api verify --url <url>` | Sends one request, confirms the SDK saw it, the log landed, and no owner-id placeholder remains |
-| `npx api login` | Prints the URL you open to claim the project |
+| `npx restless guide [oas\|sdk]` | Prints the spec-writing / SDK-wiring instructions |
+| `npx restless key` | Registers the project and writes `RESTLESS_KEY` to `.env` |
+| `npx restless register --oas <file>` | Records a spec in `.restless/settings.json` (rejects localhost servers) |
+| `npx restless verify --url <url>` | Sends one request, confirms the SDK saw it, the log landed, and no owner-id placeholder remains |
+| `npx restless login` | Prints the URL you open to claim the project |
 
 Re-running is safe: an unchanged key keeps its existing project rather than
-registering a new one - even when `.restless/` is gone, `npx api key` re-adopts
+registering a new one - even when `.restless/` is gone, `npx restless key` re-adopts
 the project this machine first registered the key to, and if the key on disk
 can't be matched to any known project it mints a fresh key (replacing the `.env`
 line) instead of re-registering the old one into a project its logs would never
@@ -81,15 +81,15 @@ Running in a plain terminal? Setup asks whether it can use your local agent.
 Answer "No, other options" to copy that same prompt for an agent elsewhere, set
 it up by hand with the commands above, book a call, or ask questions first.
 
-Want the guided flow instead, with the CLI doing the work? `npx api init --self-drive`.
+Want the guided flow instead, with the CLI doing the work? `npx restless init --self-drive`.
 
 # After you've claimed a project
 
-`npx api init` stays safe to re-run, and it notices what's already there: an API
+`npx restless init` stays safe to re-run, and it notices what's already there: an API
 you've mapped is offered back to you instead of being re-scanned, and a project
 you've already claimed finishes without asking you to claim it a second time.
 
-Changing things afterwards is `npx api update`, not another `init`. It edits
+Changing things afterwards is `npx restless update`, not another `init`. It edits
 settings (name, base URL, visibility, request prefix) and refreshes your spec,
 then pushes both to the dashboard.
 
@@ -108,7 +108,7 @@ Anything with a source to go back to gets checked before `update` asks you
 anything, so it opens with whether your spec actually changed:
 
 ```
-$ npx api update
+$ npx restless update
   Your spec changed (3 endpoints now)
 
     + GET /pets/{id}
@@ -127,7 +127,7 @@ agree. If it fails, or you say no, the file you already had is exactly as it was
 It checks the dashboard too, which is the other way a spec goes out of date:
 
 ```
-$ npx api update
+$ npx restless update
   ! Your dashboard is missing 2 endpoints that your spec has:
     + GET /api/v1/projects/{}/feedback
     + PATCH /api/v1/projects/{}/feedback/{}
@@ -169,11 +169,11 @@ no flags and it prints these rather than trying to drive a picker nobody can
 answer:
 
 ```
-npx api update --status --json     # did the spec change? writes nothing
-npx api update --refresh --json    # re-run its source, then push spec + settings
-npx api update --oas <file|url>    # point at a different spec and push it
-npx api update --base-url https://api.acme.com
-npx api update --sync              # push settings with no edits
+npx restless update --status --json     # did the spec change? writes nothing
+npx restless update --refresh --json    # re-run its source, then push spec + settings
+npx restless update --oas <file|url>    # point at a different spec and push it
+npx restless update --base-url https://api.acme.com
+npx restless update --sync              # push settings with no edits
 ```
 
 Also `--name`, `--internal` / `--external`, `--prefix`, and `--project <id>` to

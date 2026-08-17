@@ -118,7 +118,7 @@ export default async function prepareAccount({ ctx, update, setSpinner }) {
   let projectId, setupKey, reusedProject;
   setSpinner({ phase: 'Registering project', detail: `POST ${SITE_URL}/api/projects/init` });
   try {
-    // Shared with `npx api key`, so guided and agent-driven runs resolve the
+    // Shared with `npx restless key`, so guided and agent-driven runs resolve the
     // project identically - including reusing this repo's existing project
     // when the key hasn't changed, instead of minting a fresh one per run and
     // leaving the previous project holding all the logs.

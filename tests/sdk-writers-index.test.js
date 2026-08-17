@@ -193,7 +193,7 @@ describe('descriptor.neverRead', () => {
 describe('the registry is the only place that dispatches on language', () => {
   // The registry's docstring promises that adding a language means adding it
   // here once. That was false: envLoader.js, install-target.js, scanners.js,
-  // detect-stack.js, agent-plan.js, test-setup.js and bin/api.js each keyed off
+  // detect-stack.js, agent-plan.js, test-setup.js and bin/restless.js each keyed off
   // the language name themselves, and assertWriterShape checked none of them -
   // so a new language silently got the JavaScript answer at those sites.
   //
@@ -204,7 +204,7 @@ describe('the registry is the only place that dispatches on language', () => {
       'lib/install-target.js', 'lib/scanners.js', 'lib/detect-stack.js',
       'lib/agent-plan.js', 'lib/ai.js', 'lib/setup-context.js',
       'steps/test-setup.js', 'steps/install-sdk.js', 'steps/final-checks.js',
-      'bin/api.js',
+      'bin/restless.js',
     ];
     const offenders = [];
     for (const file of files) {

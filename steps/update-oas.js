@@ -25,7 +25,7 @@ import { loadCachedToken } from '../lib/cli-token.js';
 import * as debug from '../lib/debug.js';
 
 /**
- * `npx api update` -> refreshing the spec.
+ * `npx restless update` -> refreshing the spec.
  *
  * This used to be a stub that told you to re-run `init`, and the reason it
  * stayed a stub is that "refresh my spec" has no single meaning. A spec that

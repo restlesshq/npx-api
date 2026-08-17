@@ -291,7 +291,7 @@ async function showDebugBanner() {
 await showDebugBanner();
 
 /**
- * Default screen. Shown when the CLI is run with no command (`npx api`)
+ * Default screen. Shown when the CLI is run with no command (`npx restless`)
  * or an explicit `help` / `--help` / `-h`. Leads with the logo + the
  * one-liner pitch, then lists every command with a short hint, and ends
  * by pointing first-timers at `init`. Mirrors the welcome copy so the
@@ -954,7 +954,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   setupInProgress = false;
 
 } else if (command === 'guide') {
-  // ── npx api guide [oas|sdk|<language>] ────────────────────────────
+  // ── npx restless guide [oas|sdk|<language>] ────────────────────────────
   // Hands out the same instruction sets the CLI's own model runs on, so a
   // calling agent works from the tested wording rather than an improvised
   // summary of it. Plain markdown on stdout - meant to be read by a model.
@@ -1032,7 +1032,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   await debug.flushAndExit(0);
 
 } else if (command === 'key') {
-  // ── npx api key [--json] [--inline] [--dir <apiRootDir>] ──────────
+  // ── npx restless key [--json] [--inline] [--dir <apiRootDir>] ──────────
   // Mint + register a project and put the key where the SDK will find it.
   // Ours to own: it generates a credential and registers it server-side,
   // which is not something a calling agent should improvise.
@@ -1057,7 +1057,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
 
   const settingsForKey = loadSettings(keyRoot);
   const apiRootDir = dirFlag || settingsForKey.apis?.[0]?.rootDir || '.';
-  // `npx api key` runs standalone (the agent flow), so the language comes
+  // `npx restless key` runs standalone (the agent flow), so the language comes
   // from what setup recorded rather than from a live detection pass.
   const apiLanguage = settingsForKey.apis?.find((a) => a.rootDir === apiRootDir)?.language
     || settingsForKey.apis?.[0]?.language;
@@ -1150,7 +1150,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   await debug.flushAndExit(0);
 
 } else if (command === 'register') {
-  // ── npx api register --oas <file> [--dir <d>] [--name <n>] ────────
+  // ── npx restless register --oas <file> [--dir <d>] [--name <n>] ────────
   // Record a spec an agent just wrote into `.restless/settings.json`, which
   // is what the SDK reads at startup and what later commands look up.
   const oasFlag = flagValue(process.argv, '--oas');
@@ -1222,7 +1222,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   await debug.flushAndExit(0);
 
 } else if (command === 'verify') {
-  // ── npx api verify --url <base> [--path /x] [--json] ──────────────
+  // ── npx restless verify --url <base> [--path /x] [--json] ──────────────
   // One real request, then read the response headers. Ours to own because
   // the verdict comes from headers the SDK sets, not from the status code -
   // a captured 401 is a pass, and that trips people (and agents) up.
@@ -1317,7 +1317,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   await debug.flushAndExit(result.ok ? 0 : 1);
 
 } else if (command === 'login' || command === 'claim') {
-  // ── npx api login ─────────────────────────────────────────────────
+  // ── npx restless login ─────────────────────────────────────────────────
   // Prints the claim URL. The setup key is handed to the server up front
   // and keyed by an opaque token, so it never lands in browser history,
   // an OAuth referer, or a screen share.
@@ -1702,7 +1702,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
       console.log(`  ${p.bold("Couldn't load that request from here.")}`);
     }
     console.log('');
-    console.log(`  ${p.dim('For security, `npx api debug` only works for the first 5 minutes')}`);
+    console.log(`  ${p.dim(`For security, \`npx ${CLI_NAME} debug\` only works for the first 5 minutes`)}`);
     console.log(`  ${p.dim('after a request. After that, the log is only viewable when')}`);
     console.log(`  ${p.dim("you're signed in.")}`);
     console.log('');
@@ -1978,8 +1978,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
   }
 
 } else if (command === 'skill') {
-  // npx api skill <docs-url>            → fetch /skill.md, preview, prompt, install
-  // npx api skill <docs-url> --manual   → just print the skill + target path
+  // npx restless skill <docs-url>            → fetch /skill.md, preview, prompt, install
+  // npx restless skill <docs-url> --manual   → just print the skill + target path
 
   const rawUrl = process.argv[3];
   const manualFlag = process.argv.includes('--manual') || process.argv.includes('--print');
@@ -2094,7 +2094,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   console.log();
 
 } else if (command === 'update') {
-  // ── npx api update [projectId] ────────────────────────────────────
+  // ── npx restless update [projectId] ────────────────────────────────────
   // Post-claim editor. Refreshes the spec (from wherever it came from)
   // and edits a handful of safe fields, then pushes both to the
   // dashboard.

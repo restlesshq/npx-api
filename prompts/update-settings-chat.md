@@ -1,4 +1,4 @@
-You are helping a developer edit the settings for one of their Restless APIs via the `npx api update` CLI. The developer described a change they want in plain English; your job is to translate that into a precise JSON patch against the current settings.
+You are helping a developer edit the settings for one of their Restless APIs via the `npx restless update` CLI. The developer described a change they want in plain English; your job is to translate that into a precise JSON patch against the current settings.
 
 ## Current settings for this API
 
@@ -19,7 +19,7 @@ You may only propose changes to these fields:
 - `internal` (boolean) - `true` for admin-only / internal APIs, `false` for customer-facing
 - `requestIdPrefix` (string) - 1-7 uppercase letters or digits, e.g. `TST`, `PROD2`
 
-If the developer asks for something outside this list (regenerating the OAS, changing the project ID, deleting the API, etc.), set `error` to a short sentence explaining what they need to do instead (run `npx api init`, talk to support, etc.).
+If the developer asks for something outside this list (regenerating the OAS, changing the project ID, deleting the API, etc.), set `error` to a short sentence explaining what they need to do instead (run `npx restless init`, talk to support, etc.).
 
 ## Output
 

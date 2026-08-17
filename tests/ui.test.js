@@ -216,7 +216,7 @@ describe('startSpinner stays on one line', () => {
 });
 
 describe('logo subtitle names the running command', () => {
-  // Row 2 of the logo was hardcoded to `npx api init`, so `update` displayed
+  // Row 2 of the logo was hardcoded to `npx restless init`, so `update` displayed
   // the wrong command above every screen it drew. The default now also honours
   // CLI_NAME, which exists so output matches whatever bin name shipped - the
   // old literal ignored it.
