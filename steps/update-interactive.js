@@ -20,15 +20,15 @@ import { describeCheck, describeDashboardGap, dashboardIsBehind } from './update
 import * as debug from '../lib/debug.js';
 
 /**
- * `npx api update` with a human at the keyboard.
+ * `npx restless update` with a human at the keyboard.
  *
- * Lives here rather than inline in `bin/api.js` because it is the same size and
+ * Lives here rather than inline in `bin/restless.js` because it is the same size and
  * shape as any other step, and it needs the same things they do: the shared
  * check, the shared renderer, the shared push. Left in the entry point it grew
  * a private copy of the push sequence and a hand-inlined per-kind predicate,
  * both of which had already drifted from the headless path's versions.
  *
- * `bin/api.js` still owns choosing the project and deciding that a human is
+ * `bin/restless.js` still owns choosing the project and deciding that a human is
  * present; everything after that is here.
  */
 

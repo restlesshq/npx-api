@@ -29,7 +29,7 @@ For each file above (and anywhere else you find SDK code), remove:
    - `restless.config.*` at the project root exists solely for the SDK: strip it to a minimal valid empty module (`export {}`).
    - Per-route wrapping, if any (`export const GET = wrap(getPets)` with `wrap` from a Restless client module): unwrap back to `export const GET = getPets;` and remove the shared client module's SDK code.
 
-6. **Comments** that mention Restless, ReadMe, `{{sdkPackage}}`, `RESTLESS_KEY`, or the install steps left behind by `npx api init`.
+6. **Comments** that mention Restless, ReadMe, `{{sdkPackage}}`, `RESTLESS_KEY`, or the install steps left behind by `npx restless init`.
 
 ## Rules
 

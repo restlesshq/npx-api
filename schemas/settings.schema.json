@@ -42,11 +42,11 @@
           },
           "oasSource": {
             "type": "object",
-            "description": "How the spec got here. `npx api update` reads this to decide what refreshing means: re-fetch a URL, re-read a file you maintain, re-run a framework generator, or re-scan the routes.",
+            "description": "How the spec got here. `npx restless update` reads this to decide what refreshing means: re-fetch a URL, re-read a file you maintain, re-run a framework generator, or re-scan the routes.",
             "properties": {
               "kind": {
                 "type": "string",
-                "description": "ai: our model read the routes. native: the framework's own generator. found: already in the repo, we never write it. file: you pointed us at a path. url: fetched from a URL. describe: located from a plain-English description. agent: written by a coding agent via `npx api register`.",
+                "description": "ai: our model read the routes. native: the framework's own generator. found: already in the repo, we never write it. file: you pointed us at a path. url: fetched from a URL. describe: located from a plain-English description. agent: written by a coding agent via `npx restless register`.",
                 "enum": ["ai", "native", "found", "file", "url", "describe", "agent"]
               },
               "framework": {
@@ -87,7 +87,7 @@
           },
           "internal": {
             "type": "boolean",
-            "description": "Internal/admin API rather than customer-facing. Inferred during setup; `npx api update` flips it.",
+            "description": "Internal/admin API rather than customer-facing. Inferred during setup; `npx restless update` flips it.",
             "default": false
           },
           "requestIdPrefix": {
@@ -123,7 +123,7 @@
           },
           "oasHash": {
             "type": "string",
-            "description": "sha256 of the spec's exact bytes as last pushed to the dashboard. Lets `npx api update` tell you a spec you maintain yourself has changed since then - those are the only kinds where nothing is fetched, so there is otherwise no baseline to compare against.",
+            "description": "sha256 of the spec's exact bytes as last pushed to the dashboard. Lets `npx restless update` tell you a spec you maintain yourself has changed since then - those are the only kinds where nothing is fetched, so there is otherwise no baseline to compare against.",
             "pattern": "^[0-9a-f]{64}$"
           },
           "oasOperationCount": {

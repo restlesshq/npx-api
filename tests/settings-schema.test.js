@@ -24,21 +24,21 @@ const entrySchema = schema.properties.apis.items;
  */
 const WRITTEN_FIELDS = {
   id: 'lib/settings.js upsertApi',
-  name: 'steps/generate-oas.js finalizeApi, bin/api.js register',
-  rootDir: 'steps/generate-oas.js finalizeApi, bin/api.js register',
+  name: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
+  rootDir: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
   projectId: 'lib/project-init.js recordProjectId',
-  oasFile: 'steps/generate-oas.js finalizeApi, bin/api.js register',
-  oasSource: 'steps/generate-oas.js finalizeApi, bin/api.js register',
+  oasFile: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
+  oasSource: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
   framework: 'steps/generate-oas.js finalizeApi',
   language: 'steps/generate-oas.js finalizeApi',
-  baseUrl: 'steps/generate-oas.js finalizeApi, bin/api.js register/update',
-  internal: 'steps/generate-oas.js finalizeApi, bin/api.js update',
-  requestIdPrefix: 'steps/generate-oas.js finalizeApi, bin/api.js register/update',
+  baseUrl: 'steps/generate-oas.js finalizeApi, bin/restless.js register/update',
+  internal: 'steps/generate-oas.js finalizeApi, bin/restless.js update',
+  requestIdPrefix: 'steps/generate-oas.js finalizeApi, bin/restless.js register/update',
   testCurl: 'steps/generate-oas.js finalizeApi',
   redact: 'steps/detect-auth.js (read by @restlessai/sdk at startup)',
   oasHash: 'lib/project-sync.js syncProject',
   oasOperationCount: 'lib/project-sync.js syncProject',
-  lastSyncedAt: 'steps/generate-oas.js finalizeApi, bin/api.js register',
+  lastSyncedAt: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
 };
 
 /** A minimal structural check. Not a full JSON-Schema implementation - just

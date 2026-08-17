@@ -294,15 +294,15 @@ describe('fixContext stale-key', () => {
     expect(c.guidance).toContain("don't edit the wiring");
   });
 
-  it('defaults the CLI name to api', () => {
+  it('defaults the CLI name to restless', () => {
     const c = fixContext('stale-key', { localBase: 'http://localhost:3001' });
-    expect(c.guidance).toContain('npx api key');
+    expect(c.guidance).toContain('npx restless key');
   });
 });
 
 describe('Python port heuristics', () => {
   it('knows each framework\'s conventional default', () => {
-    // 3000 is a Node convention. Guessing it for Django sends `npx api
+    // 3000 is a Node convention. Guessing it for Django sends `npx restless
     // verify` at a closed port and reads as "the SDK isn't working".
     expect(pythonFrameworkDefaultPort(['django'])).toBe('8000');
     expect(pythonFrameworkDefaultPort(['flask'])).toBe('5000');

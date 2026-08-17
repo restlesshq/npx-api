@@ -192,6 +192,9 @@ describe('unsupportedStackMessage', () => {
       foreign: [{ language: 'Ruby', files: ['backend/Gemfile', 'backend/config.ru'] }],
       languages: ['Ruby'],
     };
+    // cliName is deliberately not the default here: the bin is `restless`, but
+    // ReadMe's api package dispatches to us as `api`, so the escape hatch has to
+    // quote back whatever name the user actually typed.
     const { headline, details } = unsupportedStackMessage(stack, { rootDir: '/repo', cliName: 'api' });
     expect(headline).toContain('Ruby');
     const body = details.join('\n');

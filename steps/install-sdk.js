@@ -245,7 +245,7 @@ export default async function installSdk({
     }
     if (!isSdkInstalled(installDir, guideLanguage)) {
       // Halt loudly. Earlier versions returned a `{ installed: false }`
-      // sentinel and trusted the caller to check it - but bin/api.js
+      // sentinel and trusted the caller to check it - but bin/restless.js
       // didn't, so finalChecks ran with `prevSubs: { 0:'done', 1:'done',
       // 2:'done' }` and painted phantom green checkmarks over a step
       // that genuinely failed. Never silently push past a failed install.

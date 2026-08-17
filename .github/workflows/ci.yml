@@ -88,15 +88,15 @@ jobs:
       - name: Run the installed CLI
         working-directory: /tmp/consumer
         run: |
-          ./node_modules/.bin/api version
-          ./node_modules/.bin/api help > /dev/null
+          ./node_modules/.bin/restless version
+          ./node_modules/.bin/restless help > /dev/null
 
       # readVersion() falls back to the string "unknown" when it cannot read the
       # package.json next to the bin, rather than crashing. That fallback would
       # otherwise be invisible, so compare against the version we declare.
       - name: Check the shipped version is the declared one
         run: |
-          shipped="$(/tmp/consumer/node_modules/.bin/api version)"
+          shipped="$(/tmp/consumer/node_modules/.bin/restless version)"
           declared="$(node -p 'require("./package.json").version')"
           if [ "$shipped" != "$declared" ]; then
             echo "Installed CLI reports '$shipped' but package.json declares '$declared'"

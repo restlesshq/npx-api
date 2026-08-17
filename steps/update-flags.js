@@ -17,7 +17,7 @@ import { describeCheck, describeDashboardGap } from './update-render.js';
 import * as debug from '../lib/debug.js';
 
 /**
- * `npx api update` driven by flags instead of pickers.
+ * `npx restless update` driven by flags instead of pickers.
  *
  * `init` grew an agent-aware path a while ago; `update` had none, so a coding
  * agent that wanted to change a base URL or re-sync a spec landed in a
@@ -39,7 +39,7 @@ import * as debug from '../lib/debug.js';
  * was given wrongly.
  *
  * That last case matters more than it looks: a value flag with nothing after it
- * used to be indistinguishable from not passing it, so `npx api update
+ * used to be indistinguishable from not passing it, so `npx restless update
  * --base-url` (a typo, or a shell that ate the argument) silently did nothing
  * and reported success. An agent has no way to notice that.
  */
