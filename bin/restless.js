@@ -349,7 +349,6 @@ function printHelp() {
     ['init', 'Set up Restless here: scan your code, install the SDK, wire it in'],
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Refresh your spec, edit settings, and sync both to the dashboard'],
-    ['skill <docs-url>', 'Install an API skill into Claude Code'],
     ['help', 'Show this help'],
     ['--version', 'Print the installed CLI version'],
   ];
@@ -1976,122 +1975,6 @@ if (command === '--version' || command === '-v' || command === 'version') {
       }
     }
   }
-
-} else if (command === 'skill') {
-  // npx restless skill <docs-url>            → fetch /skill.md, preview, prompt, install
-  // npx restless skill <docs-url> --manual   → just print the skill + target path
-
-  const rawUrl = process.argv[3];
-  const manualFlag = process.argv.includes('--manual') || process.argv.includes('--print');
-
-  if (!rawUrl) {
-    console.log(red('\n  ✗ Missing docs URL.\n'));
-    console.log(`  Usage: npx ${CLI_NAME} skill <docs-url>\n`);
-    console.log(`  Example: npx ${CLI_NAME} skill ${dim('docs.example.com/docs/my-project')}\n`);
-    await debug.flushAndExit(1);
-  }
-
-  // Accept "docs.site.com", "https://docs.site.com/docs/x", "docs.site.com/docs/x/skill.md".
-  // We always fetch <input>/skill.md unless the input already ends in skill.md.
-  function buildSkillUrl(input) {
-    let s = input.trim().replace(/^\/+/, '').replace(/\/+$/, '');
-    if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
-    if (!/\/skill\.md$/i.test(s)) s = `${s}/skill.md`;
-    return s;
-  }
-
-  const skillUrl = buildSkillUrl(rawUrl);
-  process.stdout.write(`\n  ${dim('Fetching')} ${cyan(skillUrl)}${dim('…')}\n`);
-
-  let body;
-  try {
-    const res = await fetch(skillUrl);
-    if (!res.ok) {
-      console.log(`\n  ${red('✗')} ${red(`HTTP ${res.status}`)} ${dim(`from ${skillUrl}`)}\n`);
-      console.log(dim('  Make sure the URL points at a project on a Restless docs deployment.\n'));
-      await debug.flushAndExit(1);
-    }
-    body = await res.text();
-  } catch (err) {
-    console.log(`\n  ${red('✗')} Could not reach ${cyan(skillUrl)}: ${err.message}\n`);
-    await debug.flushAndExit(1);
-  }
-
-  // Pull `name:` from the frontmatter so the install path matches whatever
-  // the server picked. Fallback to a slug derived from the URL host if the
-  // frontmatter is missing or malformed.
-  function parseSkillName(md) {
-    const m = md.match(/^---\s*\n([\s\S]*?)\n---/);
-    if (!m) return null;
-    const nameLine = m[1].split('\n').find((l) => /^name:\s*/.test(l));
-    if (!nameLine) return null;
-    return nameLine.replace(/^name:\s*/, '').trim() || null;
-  }
-
-  const skillName = parseSkillName(body)
-    || rawUrl.replace(/^https?:\/\//i, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase();
-  const targetDir = path.join(os.homedir(), '.claude', 'skills', skillName);
-  const targetPath = path.join(targetDir, 'SKILL.md');
-
-  // Preview block - same in auto and manual modes so the user always
-  // sees what's about to land on disk before any side effect.
-  console.log();
-  console.log(`  ${dim('─'.repeat(64))}`);
-  for (const line of body.split('\n')) {
-    console.log(`  ${dim('│')} ${line}`);
-  }
-  console.log(`  ${dim('─'.repeat(64))}`);
-  console.log();
-
-  const home = os.homedir();
-  const prettyTarget = targetPath.startsWith(home) ? `~${targetPath.slice(home.length)}` : targetPath;
-
-  if (manualFlag) {
-    console.log(`  ${bold('Manual install')}\n`);
-    console.log(`  Save the markdown above to:\n`);
-    console.log(`    ${cyan(prettyTarget)}\n`);
-    console.log(`  Quick way:\n`);
-    console.log(`    ${dim('mkdir -p ~/.claude/skills/' + skillName + ' && curl -sSL ' + skillUrl + ' > ' + prettyTarget)}\n`);
-    await debug.flushAndExit(0);
-  }
-
-  console.log(`  ${dim('This will install to')} ${cyan(prettyTarget)}\n`);
-  process.stdout.write(`  Install? ${dim('[Y/n] ')}`);
-  const ok = await askYesNo('', { defaultValue: true });
-  if (!ok) {
-    console.log(dim('\n  Cancelled. To grab it manually, rerun with --manual.\n'));
-    await debug.flushAndExit(0);
-  }
-
-  // Refuse to overwrite an existing skill silently - could clobber an
-  // edited copy. Confirm the overwrite explicitly.
-  if (fs.existsSync(targetPath)) {
-    console.log();
-    console.log(`  ${yellow('!')} ${prettyTarget} already exists.`);
-    process.stdout.write(`  Overwrite? ${dim('[y/N] ')}`);
-    const overwrite = await askYesNo('', { defaultValue: false });
-    if (!overwrite) {
-      console.log(dim('\n  Left existing file alone.\n'));
-      await debug.flushAndExit(0);
-    }
-  }
-
-  fs.mkdirSync(targetDir, { recursive: true });
-  fs.writeFileSync(targetPath, body, 'utf8');
-
-  console.log(`\n  ${green('✓')} Installed ${bold(skillName)} → ${cyan(prettyTarget)}\n`);
-
-  console.log(`  ${bold('How to use it')}`);
-  console.log();
-  console.log(`  Claude Code picks the skill up automatically - start a new session`);
-  console.log(`  (or reload the running one) and ask anything about this API.`);
-  console.log();
-  console.log(`  Try:`);
-  console.log(`    ${dim('"using ' + skillName + ', show me the public endpoints"')}`);
-  console.log();
-  console.log(`  The skill points at the project's MCP server, so live endpoint`);
-  console.log(`  details flow in on demand. To uninstall, just delete the file.`);
-  console.log();
 
 } else if (command === 'update') {
   // ── npx restless update [projectId] ────────────────────────────────────
