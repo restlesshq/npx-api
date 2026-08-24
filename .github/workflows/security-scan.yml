@@ -39,9 +39,21 @@ jobs:
 
       # On a PR, take the scanner from the base branch rather than the PR's
       # own tree. Otherwise a PR could neuter the check that is reviewing it.
+      # Take the scanner from the PR's BASE so a PR can't neuter the check that
+      # is reviewing it. Restore just this one file, in place: checking out the
+      # whole .github/ directory would DELETE files the PR legitimately adds,
+      # and errors outright when .github/ is new to the repo. If base has no
+      # copy yet (the PR that first lands this), fall back to the PR's own and
+      # say so - it self-heals on the next PR.
       - name: Restore scanner from base
         if: github.event_name == 'pull_request'
-        run: git checkout ${{ github.event.pull_request.base.sha }} -- .github/
+        run: |
+          if git cat-file -e "${{ github.event.pull_request.base.sha }}:.github/scripts/ci-scan.mjs" 2>/dev/null; then
+            git checkout "${{ github.event.pull_request.base.sha }}" -- .github/scripts/ci-scan.mjs
+            echo "Scanner restored from base."
+          else
+            echo "Base has no scanner yet (first landing); using this PR's copy."
+          fi
 
       - name: Deterministic scan
         env:
