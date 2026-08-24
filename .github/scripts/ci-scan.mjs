@@ -8,19 +8,18 @@
 // Env: BASE_SHA, HEAD_SHA, EVENT (push|pull_request), FORCED (true|false),
 //      REPO, GH_TOKEN.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync } from 'node:child_process';
 
 const { BASE_SHA, HEAD_SHA, EVENT, FORCED, REPO } = process.env;
-const ZERO = "0000000000000000000000000000000000000000";
+const ZERO = '0000000000000000000000000000000000000000';
 const findings = [];
 const block = (rule, detail) => findings.push({ rule, detail });
 
-const git = (args, opts = {}) =>
-  execFileSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, ...opts });
+const git = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, ...opts });
 
-const ghJSON = (path) => {
+const ghJSON = path => {
   try {
-    return JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }));
+    return JSON.parse(execFileSync('gh', ['api', path], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
   } catch {
     return null;
   }
@@ -30,15 +29,22 @@ const ghJSON = (path) => {
 // unreachable from the checkout, so fall back to the merge-base with the
 // default branch rather than silently diffing against nothing.
 let base = BASE_SHA;
-const usable = (sha) => {
+const usable = sha => {
   if (!sha || sha === ZERO) return false;
-  try { git(["cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" }); return true; } catch { return false; }
+  try {
+    git(['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
 };
 if (!usable(base)) {
   try {
-    const def = git(["symbolic-ref", "refs/remotes/origin/HEAD"]).trim().replace("refs/remotes/", "");
-    base = git(["merge-base", def, HEAD_SHA]).trim();
-  } catch { base = null; }
+    const def = git(['symbolic-ref', 'refs/remotes/origin/HEAD']).trim().replace('refs/remotes/', '');
+    base = git(['merge-base', def, HEAD_SHA]).trim();
+  } catch {
+    base = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -47,48 +53,50 @@ if (!usable(base)) {
 // dropped the signature so `git log` looked untouched. That combination is not
 // something a normal workflow produces.
 // ---------------------------------------------------------------------------
-if (EVENT === "push" && FORCED === "true" && BASE_SHA && BASE_SHA !== ZERO) {
+if (EVENT === 'push' && FORCED === 'true' && BASE_SHA && BASE_SHA !== ZERO) {
   const before = ghJSON(`/repos/${REPO}/git/commits/${BASE_SHA}`);
   const after = ghJSON(`/repos/${REPO}/git/commits/${HEAD_SHA}`);
   if (before && after) {
     const sameParents =
-      JSON.stringify(before.parents.map((p) => p.sha)) === JSON.stringify(after.parents.map((p) => p.sha));
+      JSON.stringify(before.parents.map(p => p.sha)) === JSON.stringify(after.parents.map(p => p.sha));
     const treeChanged = before.tree.sha !== after.tree.sha;
     const sigDropped = before.verification?.verified === true && after.verification?.verified !== true;
     if (sameParents && treeChanged) {
       block(
-        "amend-in-place",
-        `Force push kept the same parent (${before.parents.map((p) => p.sha.slice(0, 7)).join(",") || "root"}) ` +
+        'amend-in-place',
+        `Force push kept the same parent (${before.parents.map(p => p.sha.slice(0, 7)).join(',') || 'root'}) ` +
           `but changed the tree (${before.tree.sha.slice(0, 7)} -> ${after.tree.sha.slice(0, 7)})` +
-          (sigDropped ? ", and dropped a previously valid signature" : "") +
-          ". A rebase moves the parent; this rewrote content in place.",
+          (sigDropped ? ', and dropped a previously valid signature' : '') +
+          '. A rebase moves the parent; this rewrote content in place.',
       );
     } else if (sigDropped) {
-      block("signature-dropped", `Force push replaced a signed commit with an unsigned one.`);
+      block('signature-dropped', `Force push replaced a signed commit with an unsigned one.`);
     }
   }
 }
 
 if (!base) {
-  console.log("No usable diff base (new branch with no history?). Skipping diff checks.");
+  console.log('No usable diff base (new branch with no history?). Skipping diff checks.');
 } else {
-  const nameStatus = git(["diff", "--name-status", "-z", base, HEAD_SHA]).split("\0").filter(Boolean);
+  const nameStatus = git(['diff', '--name-status', '-z', base, HEAD_SHA]).split('\0').filter(Boolean);
   const changed = [];
   for (let i = 0; i < nameStatus.length; ) {
     const status = nameStatus[i++];
-    if (status.startsWith("R") || status.startsWith("C")) { i++; changed.push({ status, path: nameStatus[i++] }); }
-    else changed.push({ status, path: nameStatus[i++] });
+    if (status.startsWith('R') || status.startsWith('C')) {
+      i++;
+      changed.push({ status, path: nameStatus[i++] });
+    } else changed.push({ status, path: nameStatus[i++] });
   }
 
-  const allChanged = new Set(changed.map((c) => c.path));
+  const allChanged = new Set(changed.map(c => c.path));
   // NOTE: `-w --name-only` does NOT filter the file list (git lists the file
   // regardless). `--numstat` does respect -w and omits whitespace-only files
   // entirely, so that is what we key off.
   const substantive = new Set(
-    git(["diff", "-w", "--ignore-blank-lines", "--numstat", "-z", base, HEAD_SHA])
-      .split("\0")
+    git(['diff', '-w', '--ignore-blank-lines', '--numstat', '-z', base, HEAD_SHA])
+      .split('\0')
       .filter(Boolean)
-      .map((rec) => rec.split("\t").pop())
+      .map(rec => rec.split('\t').pop())
       .filter(Boolean),
   );
 
@@ -97,12 +105,12 @@ if (!base) {
   // The attack rewrote every file to CRLF. That is camouflage: it inflates the
   // diff so the one real change is buried and the reviewer's budget is spent.
   // -------------------------------------------------------------------------
-  const whitespaceOnly = [...allChanged].filter((p) => !substantive.has(p));
+  const whitespaceOnly = [...allChanged].filter(p => !substantive.has(p));
   if (whitespaceOnly.length > 5) {
     block(
-      "mass-whitespace-churn",
+      'mass-whitespace-churn',
       `${whitespaceOnly.length} files changed with no substantive content change (line endings or whitespace only). ` +
-        `This is the camouflage pattern from the 2026-08-23 incident. Examples: ${whitespaceOnly.slice(0, 5).join(", ")}`,
+        `This is the camouflage pattern from the 2026-08-23 incident. Examples: ${whitespaceOnly.slice(0, 5).join(', ')}`,
     );
   }
 
@@ -111,7 +119,8 @@ if (!base) {
   // postcss.config.mjs, next.config.js, src/app.ts and providers/claude.js each
   // took a ~30KB blob. These run on build or boot, with no import needed.
   // -------------------------------------------------------------------------
-  const AUTO_EXEC = /(^|\/)((.*\.config\.(js|mjs|cjs|ts))|(next|postcss|tailwind|vite|webpack|rollup|svelte|astro)\.config\..*|app\.(ts|js|mjs)|index\.(ts|js|mjs)|server\.(ts|js|mjs)|main\.(ts|js|mjs))$/;
+  const AUTO_EXEC =
+    /(^|\/)((.*\.config\.(js|mjs|cjs|ts))|(next|postcss|tailwind|vite|webpack|rollup|svelte|astro)\.config\..*|app\.(ts|js|mjs)|index\.(ts|js|mjs)|server\.(ts|js|mjs)|main\.(ts|js|mjs))$/;
   const BIN_OR_ENTRY = /(^|\/)(bin|providers|scripts)\//;
   const GROWTH_LIMIT = 5000;
 
@@ -120,16 +129,18 @@ if (!base) {
   const sizeOf = (rev, path) => {
     try {
       return Buffer.byteLength(
-        git(["show", `${rev}:${path}`], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] }),
+        git(['show', `${rev}:${path}`], { maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }),
       );
-    } catch { return 0; }
+    } catch {
+      return 0;
+    }
   };
 
   for (const { path } of changed) {
     if (!AUTO_EXEC.test(path) && !BIN_OR_ENTRY.test(path)) continue;
     // CI tooling legitimately lives in .github/scripts/ and is not an app
     // entrypoint. Payloads hidden there are still caught by minified-blob.
-    if (path.startsWith(".github/")) continue;
+    if (path.startsWith('.github/')) continue;
     const wasThere = sizeOf(base, path);
     // Growth, not addition. A brand-new file has no "growth" to measure, and
     // reporting its full size as a delta flags every legitimate new module.
@@ -137,7 +148,10 @@ if (!base) {
     if (wasThere === 0) continue;
     const grew = sizeOf(HEAD_SHA, path) - wasThere;
     if (grew > GROWTH_LIMIT) {
-      block("auto-exec-bloat", `${path} grew by ${grew} bytes. Files that execute on build or boot should not gain bulk code in a single change.`);
+      block(
+        'auto-exec-bloat',
+        `${path} grew by ${grew} bytes. Files that execute on build or boot should not gain bulk code in a single change.`,
+      );
     }
   }
 
@@ -150,25 +164,37 @@ if (!base) {
   // line as removed-and-readded, which would otherwise fire on every file.
   const rules = (rev, path) => {
     let raw;
-    try { raw = git(["show", `${rev}:${path}`]); } catch { return new Set(); }
-    return new Set(raw.split("\n").map((l) => l.replace(/\r$/, "").trim()).filter((l) => l && !l.startsWith("#")));
+    try {
+      raw = git(['show', `${rev}:${path}`]);
+    } catch {
+      return new Set();
+    }
+    return new Set(
+      raw
+        .split('\n')
+        .map(l => l.replace(/\r$/, '').trim())
+        .filter(l => l && !l.startsWith('#')),
+    );
   };
   for (const { path } of changed) {
     if (!/(^|\/)\.gitignore$/.test(path)) continue;
     const before = rules(base, path);
     const after = rules(HEAD_SHA, path);
-    const lost = [...before].filter((r) => !after.has(r) && /\.?env/i.test(r));
-    if (lost.length) block("gitignore-weakened", `${path} no longer ignores: ${lost.join(", ")}`);
+    const lost = [...before].filter(r => !after.has(r) && /\.?env/i.test(r));
+    if (lost.length) block('gitignore-weakened', `${path} no longer ignores: ${lost.join(', ')}`);
   }
 
   // -------------------------------------------------------------------------
   // 5. A committed .env. Templates are fine; a real one is not.
   // -------------------------------------------------------------------------
   for (const { status, path } of changed) {
-    if (!status.startsWith("A")) continue;
-    const name = path.split("/").pop();
+    if (!status.startsWith('A')) continue;
+    const name = path.split('/').pop();
     if (/^\.env($|\.)/.test(name) && !/\.(example|sample|template|dist)$/.test(name)) {
-      block("env-committed", `${path} was added. Committed env files leak secrets, and in this incident one carried the C2 address.`);
+      block(
+        'env-committed',
+        `${path} was added. Committed env files leak secrets, and in this incident one carried the C2 address.`,
+      );
     }
   }
 
@@ -177,29 +203,35 @@ if (!base) {
   // The payload was a single enormous line. Lockfiles and vendored/minified
   // assets legitimately look like this, so they're excluded.
   // -------------------------------------------------------------------------
-  const EXEMPT = /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.min\.(js|css)$|(^|\/)(dist|build|vendor|node_modules)\/|\.(map|svg|snap)$)/;
+  const EXEMPT =
+    /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.min\.(js|css)$|(^|\/)(dist|build|vendor|node_modules)\/|\.(map|svg|snap)$)/;
   const LONG_LINE = 1000;
   for (const { path } of changed) {
     if (EXEMPT.test(path)) continue;
-    const added = git(["diff", "--unified=0", base, HEAD_SHA, "--", path])
-      .split("\n")
-      .filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+    const added = git(['diff', '--unified=0', base, HEAD_SHA, '--', path])
+      .split('\n')
+      .filter(l => l.startsWith('+') && !l.startsWith('+++'));
     const longest = added.reduce((m, l) => Math.max(m, l.length - 1), 0);
     if (longest > LONG_LINE) {
-      block("minified-blob", `${path} added a single line of ${longest} characters. Obfuscated payloads look exactly like this.`);
+      block(
+        'minified-blob',
+        `${path} added a single line of ${longest} characters. Obfuscated payloads look exactly like this.`,
+      );
     }
   }
 }
 
 // ---------------------------------------------------------------------------
 if (!findings.length) {
-  console.log("Deterministic scan passed: no incident-pattern signals.");
+  console.log('Deterministic scan passed: no incident-pattern signals.');
   process.exit(0);
 }
 
-console.error(`\n${"=".repeat(72)}\nDETERMINISTIC SECURITY SCAN FAILED: ${findings.length} signal(s)\n${"=".repeat(72)}\n`);
+console.error(
+  `\n${'='.repeat(72)}\nDETERMINISTIC SECURITY SCAN FAILED: ${findings.length} signal(s)\n${'='.repeat(72)}\n`,
+);
 for (const f of findings) console.error(`  [${f.rule}]\n    ${f.detail}\n`);
-console.error("These are mechanical checks, not model judgement. If a finding is a");
-console.error("false positive, fix the rule in .github/scripts/ci-scan.mjs in its own");
-console.error("PR rather than bypassing the check.\n");
+console.error('These are mechanical checks, not model judgement. If a finding is a');
+console.error('false positive, fix the rule in .github/scripts/ci-scan.mjs in its own');
+console.error('PR rather than bypassing the check.\n');
 process.exit(1);
