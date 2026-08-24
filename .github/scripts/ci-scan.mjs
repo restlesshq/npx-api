@@ -80,7 +80,7 @@ if (!base) {
 } else {
   const nameStatus = git(['diff', '--name-status', '-z', base, HEAD_SHA]).split('\0').filter(Boolean);
   const changed = [];
-  for (let i = 0; i < nameStatus.length; ) {
+  for (let i = 0; i < nameStatus.length;) {
     const status = nameStatus[i++];
     if (status.startsWith('R') || status.startsWith('C')) {
       i++;
