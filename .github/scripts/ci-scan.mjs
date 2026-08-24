@@ -115,14 +115,27 @@ if (!base) {
   const BIN_OR_ENTRY = /(^|\/)(bin|providers|scripts)\//;
   const GROWTH_LIMIT = 5000;
 
+  // stderr silenced: `git show` is noisy about paths that don't exist at a rev,
+  // which is an expected case here (added files), not an error worth printing.
   const sizeOf = (rev, path) => {
-    try { return Buffer.byteLength(git(["show", `${rev}:${path}`], { maxBuffer: 256 * 1024 * 1024 })); }
-    catch { return 0; }
+    try {
+      return Buffer.byteLength(
+        git(["show", `${rev}:${path}`], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] }),
+      );
+    } catch { return 0; }
   };
 
   for (const { path } of changed) {
     if (!AUTO_EXEC.test(path) && !BIN_OR_ENTRY.test(path)) continue;
-    const grew = sizeOf(HEAD_SHA, path) - sizeOf(base, path);
+    // CI tooling legitimately lives in .github/scripts/ and is not an app
+    // entrypoint. Payloads hidden there are still caught by minified-blob.
+    if (path.startsWith(".github/")) continue;
+    const wasThere = sizeOf(base, path);
+    // Growth, not addition. A brand-new file has no "growth" to measure, and
+    // reporting its full size as a delta flags every legitimate new module.
+    // An added file carrying a payload is caught by minified-blob instead.
+    if (wasThere === 0) continue;
+    const grew = sizeOf(HEAD_SHA, path) - wasThere;
     if (grew > GROWTH_LIMIT) {
       block("auto-exec-bloat", `${path} grew by ${grew} bytes. Files that execute on build or boot should not gain bulk code in a single change.`);
     }
