@@ -1,0 +1,128 @@
+name: Security scan
+
+# Deterministic, model-free check for the patterns from the 2026-08-23
+# supply-chain incident. Runs alongside (not instead of) the AI reviewer:
+# this catches the mechanical fingerprints, the AI catches everything else.
+#
+# Needs no secrets to do its job, so it is safe to run on every push including
+# branches with no PR. That coverage is the point: in the incident, 30 branches
+# were poisoned and only 2 had an open PR, so only 2 were ever reviewed.
+#
+# THREAT-MODEL CAVEAT. On `pull_request`, GitHub takes this workflow file from
+# the BASE branch, so a PR cannot disable it. On `push`, GitHub takes it from
+# the PUSHED commit, so someone who can already force-push could also delete
+# this file in the same push. Push coverage is therefore detection, not
+# prevention. The control that actually stops that case is "Require signed
+# commits" in branch protection: the worm's rewrites all came back unsigned.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # On a PR, take the scanner from the base branch rather than the PR's
+      # own tree. Otherwise a PR could neuter the check that is reviewing it.
+      - name: Restore scanner from base
+        if: github.event_name == 'pull_request'
+        run: git checkout ${{ github.event.pull_request.base.sha }} -- .github/
+
+      - name: Deterministic scan
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          FORCED: ${{ github.event.forced }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          node .github/scripts/ci-scan.mjs 2>&1 | tee "$RUNNER_TEMP/scan.log"
+
+      # Fires only when something above failed.
+      #
+      # Two delivery paths, preferring the one that keeps Slack credentials OUT
+      # of CI. The repos already do this for the changelog: CI holds only a
+      # bearer token for the dashboard's ingest endpoint, and the dashboard
+      # (which has the Slack creds via Infisical) does the posting.
+      #
+      #   Preferred: set SECURITY_ALERT_URL (a dashboard endpoint, e.g.
+      #     https://app.restless.ai/api/security/alert) and reuse an org-level
+      #     bearer in SECURITY_ALERT_SECRET. Nothing Slack-shaped lives in CI.
+      #   Fallback: set SLACK_SECURITY_WEBHOOK to a plain incoming webhook.
+      #     Simpler, but it IS a credential a compromised repo could read. An
+      #     incoming webhook can only post to one channel, so the blast radius
+      #     is small, but the relay above is strictly better.
+      #
+      # If neither is configured the step no-ops rather than failing the build,
+      # so this workflow is safe to land before the secret exists.
+      - name: Alert Slack
+        if: failure()
+        env:
+          ALERT_URL: ${{ secrets.SECURITY_ALERT_URL }}
+          ALERT_SECRET: ${{ secrets.SECURITY_ALERT_SECRET }}
+          WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+        run: |
+          DETAIL="$(sed -n '1,80p' "$RUNNER_TEMP/scan.log" 2>/dev/null || echo 'scan produced no output')"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TITLE="Security scan blocked a change"
+
+          if [ -n "$ALERT_URL" ] && [ -n "$ALERT_SECRET" ]; then
+            jq -n \
+              --arg repo "${{ github.repository }}" --arg ref "${{ github.ref_name }}" \
+              --arg actor "${{ github.actor }}" --arg sha "${{ github.sha }}" \
+              --arg event "${{ github.event_name }}" --arg forced "${{ github.event.forced }}" \
+              --arg url "$RUN_URL" --arg detail "$DETAIL" --arg title "$TITLE" \
+              '{kind:"security-scan-block", title:$title, repo:$repo, ref:$ref, actor:$actor,
+                sha:$sha, event:$event, forced:($forced=="true"), runUrl:$url, detail:$detail}' \
+              > "$RUNNER_TEMP/alert.json"
+            curl -sS -X POST -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $ALERT_SECRET" \
+              --data @"$RUNNER_TEMP/alert.json" "$ALERT_URL" \
+              --retry 3 --retry-delay 2 --max-time 20
+            echo "Alert relayed via the dashboard."
+          elif [ -n "$WEBHOOK" ]; then
+            jq -n \
+              --arg repo "${{ github.repository }}" --arg ref "${{ github.ref_name }}" \
+              --arg actor "${{ github.actor }}" --arg event "${{ github.event_name }}" \
+              --arg forced "${{ github.event.forced }}" --arg url "$RUN_URL" \
+              --arg detail "$DETAIL" --arg title "$TITLE" \
+              '{
+                text: ("\ud83d\udea8 " + $title + ": " + $repo + " / " + $ref),
+                blocks: [
+                  {type:"header", text:{type:"plain_text", text:("\ud83d\udea8 " + $title)}},
+                  {type:"section", fields:[
+                    {type:"mrkdwn", text:("*Repo*\n" + $repo)},
+                    {type:"mrkdwn", text:("*Branch*\n" + $ref)},
+                    {type:"mrkdwn", text:("*Pushed by*\n" + $actor)},
+                    {type:"mrkdwn", text:("*Event*\n" + $event + (if $forced=="true" then " (FORCE PUSH)" else "" end))}
+                  ]},
+                  {type:"section", text:{type:"mrkdwn", text:("```" + $detail + "```")}},
+                  {type:"actions", elements:[
+                    {type:"button", text:{type:"plain_text", text:"Open the run"}, url:$url}
+                  ]}
+                ]
+              }' > "$RUNNER_TEMP/slack.json"
+            curl -sS -X POST -H 'Content-Type: application/json' \
+              --data @"$RUNNER_TEMP/slack.json" "$WEBHOOK" \
+              --retry 3 --retry-delay 2 --max-time 20
+            echo "Alert posted to Slack via webhook."
+          else
+            echo "No SECURITY_ALERT_URL or SLACK_SECURITY_WEBHOOK configured; skipping alert."
+          fi
