@@ -1,19 +1,20 @@
 name: Security scan
 
-# Deterministic, model-free check for the patterns from the 2026-08-23
-# supply-chain incident. Runs alongside (not instead of) the AI reviewer:
-# this catches the mechanical fingerprints, the AI catches everything else.
+# Deterministic, model-free check for the mechanical patterns a repository
+# compromise tends to leave behind. Runs alongside (not instead of) the AI
+# reviewer: this catches the fingerprints, the AI catches everything else.
 #
 # Needs no secrets to do its job, so it is safe to run on every push including
-# branches with no PR. That coverage is the point: in the incident, 30 branches
-# were poisoned and only 2 had an open PR, so only 2 were ever reviewed.
+# branches with no PR. That coverage is the point: a PR-only gate never sees a
+# branch that has no pull request open, which is most of them most of the time.
 #
 # THREAT-MODEL CAVEAT. On `pull_request`, the scanner is restored from the base
 # commit, so a PR cannot neuter the check reviewing it. On `push`, the workflow
 # and the scanner both come from the pushed commit, so someone who can already
 # force-push could delete this file in the same push. Push coverage is
 # detection, not prevention. The control that actually stops that case is
-# "Require signed commits": the worm's rewrites all came back unsigned.
+# "Require signed commits", which rejects the push itself: a rewritten commit
+# cannot carry a valid signature from the original author.
 #
 # INJECTION RULE. No `${{ }}` expression is ever interpolated into a `run:`
 # body. Branch names and actor names are attacker-controlled and may contain

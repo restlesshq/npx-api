@@ -1,9 +1,10 @@
 // Deterministic pre-check. No model, no secrets, no network beyond `gh api`.
 //
 // This runs BEFORE (and independently of) the AI reviewer. Everything here is a
-// mechanical signal from the 2026-08-23 supply-chain incident, chosen because it
-// is cheap, has no false-negative mode, and cannot be talked out of a verdict by
-// text in the diff. The AI reviewer stays in place for everything this can't see.
+// mechanical fingerprint of a repository-compromise or supply-chain style
+// change, chosen because it is cheap, has no false-negative mode, and cannot be
+// talked out of a verdict by text in the diff. The AI reviewer stays in place
+// for everything this can't see.
 //
 // Env: BASE_SHA, HEAD_SHA, EVENT (push|pull_request), FORCED (true|false),
 //      REPO, GH_TOKEN.
@@ -49,9 +50,10 @@ if (!usable(base)) {
 
 // ---------------------------------------------------------------------------
 // 1. Amend-in-place fingerprint (force pushes only).
-// A rebase moves the parent. The worm kept the parent, changed the tree, and
-// dropped the signature so `git log` looked untouched. That combination is not
-// something a normal workflow produces.
+// A rebase moves the parent. A rewrite that keeps the parent, changes the tree,
+// and drops a previously valid signature leaves `git log` looking untouched
+// while the content differs. That combination is not something a normal
+// workflow produces, and it is a known way to slip changes past review.
 // ---------------------------------------------------------------------------
 if (EVENT === 'push' && FORCED === 'true' && BASE_SHA && BASE_SHA !== ZERO) {
   const before = ghJSON(`/repos/${REPO}/git/commits/${BASE_SHA}`);
@@ -110,7 +112,8 @@ if (!base) {
     block(
       'mass-whitespace-churn',
       `${whitespaceOnly.length} files changed with no substantive content change (line endings or whitespace only). ` +
-        `This is the camouflage pattern from the 2026-08-23 incident. Examples: ${whitespaceOnly.slice(0, 5).join(', ')}`,
+        `Bulk line-ending churn is a known way to bury one real change in an ` +
+        `unreviewably large diff. Examples: ${whitespaceOnly.slice(0, 5).join(', ')}`,
     );
   }
 
@@ -157,8 +160,8 @@ if (!base) {
 
   // -------------------------------------------------------------------------
   // 4. .gitignore losing its env protection.
-  // The worm removed `.env*` so its planted .env would commit. Caught by the AI
-  // reviewer as a warning; it deserves to be blocking and deterministic.
+  // Dropping `.env*` from .gitignore is a precondition for committing a secrets
+  // file, deliberately or by accident. Deterministic and blocking, not advisory.
   // -------------------------------------------------------------------------
   // Compare normalised rule SETS, not raw diff lines. A CRLF rewrite shows every
   // line as removed-and-readded, which would otherwise fire on every file.
@@ -193,7 +196,8 @@ if (!base) {
     if (/^\.env($|\.)/.test(name) && !/\.(example|sample|template|dist)$/.test(name)) {
       block(
         'env-committed',
-        `${path} was added. Committed env files leak secrets, and in this incident one carried the C2 address.`,
+        `${path} was added. Committed env files leak secrets, and are a common way to ` +
+          `smuggle in configuration that points code at an attacker-controlled host.`,
       );
     }
   }
