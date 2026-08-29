@@ -38,6 +38,8 @@ import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-u
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences, findOwnerIdPlaceholders } from '../lib/grep-sdk.js';
+import contextStep from '../steps/context.js';
+import { signIn, pickProject, clearAccountToken, reportSignInFailure } from '../lib/context-auth.js';
 import * as debug from '../lib/debug.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
@@ -347,6 +349,7 @@ function printHelp() {
   console.log(`  ${bold('Commands')}`);
   const rows = [
     ['init', 'Set up Restless here: scan your code, install the SDK, wire it in'],
+    ['context', "Read this repo and teach the AI how your API is meant to be used"],
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Refresh your spec, edit settings, and sync both to the dashboard'],
     ['help', 'Show this help'],
@@ -2126,6 +2129,73 @@ if (command === '--version' || command === '-v' || command === 'version') {
       apiEntry: chosenApi,
     });
   await debug.flushAndExit(updateCode);
+} else if (command === 'context') {
+  // ── npx restless context ───────────────────────────────────────────────
+  // Read this repo and propose what the AI should know about the API.
+  //
+  // Unlike every other command here, this one does NOT need to be run where
+  // `init` was: the repos with the most to say about an API are often not the
+  // one that implements it. So there is no settings.json to read a projectId
+  // out of, and this block does what those blocks do with settings - work out
+  // WHO is running and WHICH project they mean - by signing in and asking.
+  const contextCwd = process.cwd();
+  setLogoSubtitle(`npx ${CLI_NAME} context`);
+
+  const session = await signIn({ interactive: isInteractive() });
+  if (!session.ok) {
+    reportSignInFailure(session);
+    await debug.flushAndExit(1);
+  }
+
+  // `--project <id>` skips the picker, which is what a CI job or a second run
+  // in a many-project account wants.
+  const requestedProject = flagValue(process.argv, '--project');
+  let picked = await pickProject({
+    token: session.token,
+    preferredId: requestedProject || '',
+    interactive: isInteractive(),
+  });
+
+  // A cached session that the server has since rejected looks exactly like a
+  // bad request from here, so spend the cache once and try again rather than
+  // telling the user to go and delete a file.
+  if (!picked.ok && picked.expired && session.cached) {
+    clearAccountToken();
+    const fresh = await signIn({ interactive: isInteractive() });
+    if (!fresh.ok) {
+      reportSignInFailure(fresh);
+      await debug.flushAndExit(1);
+    }
+    session.token = fresh.token;
+    picked = await pickProject({
+      token: session.token,
+      preferredId: requestedProject || '',
+      interactive: isInteractive(),
+    });
+  }
+
+  if (!picked.ok) {
+    console.log('');
+    console.log(red(`  ✗ ${picked.error}`));
+    if (picked.projects?.length) {
+      console.log('');
+      console.log(dim('  Projects on your account:'));
+      for (const p of picked.projects) {
+        console.log(`    ${dim('•')} ${p.projectId} ${dim(`(${p.name || p.slug})`)}`);
+      }
+    }
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  const contextCode = await contextStep({
+    project: picked.project,
+    token: session.token,
+    cwd: contextCwd,
+    cliVersion: readVersion(),
+    yes: process.argv.includes('--yes') || process.argv.includes('-y'),
+  });
+  await debug.flushAndExit(contextCode);
 } else if (command === 'submit-debug') {
   // Hidden command (intentionally absent from `printHelp`). Every run
   // writes a local debug log to ~/.restless/debug/; this uploads the
