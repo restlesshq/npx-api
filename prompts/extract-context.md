@@ -8,9 +8,15 @@ Work in: `{{cwd}}`
 
 Two kinds of thing.
 
-**Context items** are individual facts a developer needs and cannot infer from an OpenAPI spec. The spec already says a field is a string; context says what values it accepts, what the error means, why the call 400s, what the rate limit is, what order things must happen in.
+**Context items** are individual facts a developer needs and cannot get from an OpenAPI spec. Three flavours, and all three are wanted:
+
+- **What a capability IS.** What this part of the product does, what problem it solves, what the words in it mean. Someone arriving at `/logs` needs to know what a log IS here, what gets captured, how long it is kept, and why they would want one. A spec lists the fields; it never says what the feature is for. This is the flavour most often missing, so look for it deliberately.
+- **How it behaves.** What values a field accepts, what an error means, why a call 400s, what the limits are, what order things must happen in, what the defaults are.
+- **How things relate.** Which concepts belong to which, what has to exist before what, which identifier from one call goes into another.
 
 **Use cases** are short, complete workflows: a goal a developer has, and the sequence of calls that achieves it. One use case ties several endpoints into something someone actually wants to do.
+
+Write for someone who has never seen this product before and is deciding whether it does what they need. If your item only makes sense to a reader who already knows the product, you have written a footnote, not documentation.
 
 ## Scope of this run
 
@@ -43,10 +49,12 @@ Do not modify a single file: this is a read-only task.
 
 Include something only if ALL of these hold:
 
-- A developer **outside this company** could act on it.
-- It is about the API's **contract**: endpoints, parameters, accepted values, defaults, error meanings, status codes, limits, pagination, idempotency, auth mechanics, ordering requirements, gotchas.
+- A developer **outside this company** could use it: to decide whether this API does what they need, to understand a concept, or to get a call right.
+- It is about the API as its callers meet it: what a capability does and is for, its concepts and vocabulary, endpoints, parameters, accepted values, defaults, error meanings, status codes, limits, pagination, idempotency, auth mechanics, ordering requirements, gotchas.
 - It is **true of the shipped API**, not of a branch, a flag, or a plan.
 - It is not already in the "Already covered" list.
+
+**Be thorough.** A real endpoint usually has several things worth saying: what it is for, what its parameters mean, what it returns, how it fails, what it costs. One item per endpoint means you skimmed. Do not pad with restatements of the spec, but do not stop at the first thing you noticed either.
 
 ## Never include
 

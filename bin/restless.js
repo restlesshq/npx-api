@@ -349,7 +349,7 @@ function printHelp() {
   console.log(`  ${bold('Commands')}`);
   const rows = [
     ['init', 'Set up Restless here: scan your code, install the SDK, wire it in'],
-    ['context', "Read this repo and teach the AI how your API is meant to be used"],
+    ['context', 'Read this repo and teach the AI how your API is meant to be used'],
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Refresh your spec, edit settings, and sync both to the dashboard'],
     ['help', 'Show this help'],
@@ -378,6 +378,18 @@ function printHelp() {
   console.log('');
   console.log(`    ${dim(`Not Claude Code or Codex? Add ${cyan('--agent <name>')}${'\x1b[2m'} (or set`)}`);
   console.log(`    ${dim(`${cyan('RESTLESS_AGENT')}${'\x1b[2m'}) so the project records which agent set it up.`)}`);
+  console.log('');
+  console.log(`  ${bold('Flags for')} ${cyan('context')}`);
+  const contextFlags = [
+    ['--project <id>', "Which project to send to (defaults to this repo's own)"],
+    ['--full', 'Re-read everything, ignoring where the last run got to'],
+    ['--dry-run', 'Show what would be sent, and send nothing'],
+    ['--yes', 'Skip the confirmation'],
+  ];
+  const ctxWidth = Math.max(...contextFlags.map(([name]) => name.length));
+  for (const [name, hint] of contextFlags) {
+    console.log(`    ${cyan(name.padEnd(ctxWidth))}  ${dim(hint)}`);
+  }
   console.log('');
   // `update` needs no TTY when it's told exactly what to do, which is the
   // only way an agent or a CI job can drive it.
@@ -2210,6 +2222,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
     cwd: contextCwd,
     cliVersion: readVersion(),
     yes: process.argv.includes('--yes') || process.argv.includes('-y'),
+    dryRun: process.argv.includes('--dry-run'),
+    full: process.argv.includes('--full'),
   });
   await debug.flushAndExit(contextCode);
 } else if (command === 'submit-debug') {

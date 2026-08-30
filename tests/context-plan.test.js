@@ -56,6 +56,7 @@ describe('buildPlan', () => {
     write('src/app/api/v1/pets/[id]/route.ts', 'export async function GET() {}\n');
     write('src/app/api/internal/admin/route.ts', 'export async function POST() {}\n');
     write('src/lib/auth.ts', 'export function checkAuth() {}\n');
+    write('README.md', '# Petstore\n\nAn API for pets.\n');
     write('.restless/openapi.json', JSON.stringify({
       openapi: '3.0.0',
       paths: {
@@ -160,6 +161,48 @@ describe('buildPlan', () => {
       expect(plan.coverage.filesSkipped).toBe(20);
     } finally {
       fs.rmSync(big, { recursive: true, force: true });
+    }
+  });
+
+  it('adds a product pass over the repo\'s own prose', () => {
+    const plan = buildPlan({ rootDir: dir, oasFile: '.restless/openapi.json' });
+    expect(plan.product?.files).toContain('README.md');
+  });
+
+  it('keeps the team\'s own notes out of the product pass', () => {
+    // A docs folder is usually half customer documentation and half internal
+    // design notes, and the second half is the richest source of exactly what
+    // must never be published. Cheaper to never read it than to rely on the
+    // safety reviews catching what came out.
+    const notes = fs.mkdtempSync(path.join(os.tmpdir(), 'restless-plan-notes-'));
+    try {
+      const write = (rel) => {
+        fs.mkdirSync(path.join(notes, path.dirname(rel)), { recursive: true });
+        fs.writeFileSync(path.join(notes, rel), '# doc\n');
+      };
+      fs.writeFileSync(
+        path.join(notes, 'package.json'),
+        JSON.stringify({ dependencies: { next: '15.0.0' } }),
+      );
+      write('src/app/api/things/route.ts');
+      fs.writeFileSync(
+        path.join(notes, 'src/app/api/things/route.ts'),
+        'export async function GET() {}\n',
+      );
+      write('README.md');
+      write('docs/getting-started.md');
+      write('docs/plans/new-billing.md');
+      write('docs/specs/rewrite.md');
+      write('docs/rfcs/0001-auth.md');
+      write('docs/internal/oncall.md');
+      write('docs/2026-06-18-design-review.md');
+      write('CHANGELOG.md');
+      write('CONTRIBUTING.md');
+
+      const plan = buildPlan({ rootDir: notes, oasFile: '' });
+      expect(plan.product.files.sort()).toEqual(['README.md', 'docs/getting-started.md']);
+    } finally {
+      fs.rmSync(notes, { recursive: true, force: true });
     }
   });
 
