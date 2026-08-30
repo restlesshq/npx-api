@@ -2147,12 +2147,27 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
-  // `--project <id>` skips the picker, which is what a CI job or a second run
-  // in a many-project account wants.
+  // Which project, in order of how much we should trust the answer.
+  //
+  // `--project <id>` is explicit and wins. Failing that, a repo that has been
+  // through `init` already names its project in `.restless/settings.json`, and
+  // asking someone with 22 projects to pick the one their own repo already
+  // names is a question we can answer ourselves. Only a repo with neither
+  // (a docs repo, a client SDK - the ones this command exists for) gets the
+  // picker.
   const requestedProject = flagValue(process.argv, '--project');
+  const localProject = requestedProject
+    ? ''
+    : (loadSettings(resolveProjectDirs(contextCwd).rootDir).apis || [])
+      .map((a) => a.projectId)
+      .find(Boolean) || '';
+
   let picked = await pickProject({
     token: session.token,
-    preferredId: requestedProject || '',
+    preferredId: requestedProject || localProject,
+    // A stale id in a committed settings file must not fail the run; a wrong
+    // `--project` should. See `pickProject`.
+    requirePreferred: !!requestedProject,
     interactive: isInteractive(),
   });
 
@@ -2169,7 +2184,8 @@ if (command === '--version' || command === '-v' || command === 'version') {
     session.token = fresh.token;
     picked = await pickProject({
       token: session.token,
-      preferredId: requestedProject || '',
+      preferredId: requestedProject || localProject,
+      requirePreferred: !!requestedProject,
       interactive: isInteractive(),
     });
   }

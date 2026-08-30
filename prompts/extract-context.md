@@ -30,12 +30,14 @@ Use these exact strings when tying an item to one endpoint. If an item is not ab
 
 ## How to work
 
-1. Find where the API is defined: routes, handlers, controllers, serializers, validation, middleware, error definitions.
+1. **Read the files listed above.** They were located for you by a scan of the repository, so you do not need to go looking. Follow an import out of them when you genuinely need to understand something they reference, but do not wander: anything outside this list is either covered by another pass or deliberately out of scope.
 2. Read for the CALLER's benefit. The question is always "what would surprise someone calling this?", never "how is this built?".
 3. Prefer things that are true and checkable in the code over things that sound plausible.
 4. Tie each item to a product capability: what the developer is trying to DO. A fact with no purpose attached is not worth saving.
 
-Read as much as you need. Do not modify a single file: this is a read-only task.
+Do not modify a single file: this is a read-only task.
+
+**Answer even if you have not read everything.** You have a limited number of steps, and a partial answer is worth far more than an unfinished one. Read the most promising files first, and emit your JSON before you run out.
 
 ## The bar
 

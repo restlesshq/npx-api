@@ -155,7 +155,23 @@ function makeCanUseTool(gitRoot) {
 export default {
   name: 'claude',
 
-  async run(prompt, cwd, { onStatus } = {}) {
+  /**
+   * `maxTurns` defaults to the 30 that suits a focused task (write this spec,
+   * wire this SDK). A caller whose job is open-ended - reading a whole
+   * repository, say - raises it, because hitting the cap does NOT degrade
+   * gracefully the way a partial edit does: the agent never reaches the turn
+   * where it emits its answer, so the run returns nothing at all rather than
+   * returning less.
+   *
+   * `onError` exists for the same reason. The loop below deliberately swallows
+   * SDK errors and returns whatever partial text it has (see the note above
+   * it), which is right for steps that re-check their own output. But it makes
+   * "the model found nothing" and "the model never got to answer" identical
+   * from the outside, and a caller that reports the second as the first is
+   * lying to the user. Callers that cannot otherwise tell those apart pass
+   * this and check.
+   */
+  async run(prompt, cwd, { onStatus, maxTurns = 30, onError } = {}) {
     let result = '';
     // Counts so the debug log answers "did the AI actually write?" in a
     // single line. Useful post-mortem when install-sdk later finds nothing
@@ -187,7 +203,7 @@ export default {
       for await (const message of query({
         prompt,
         options: {
-          maxTurns: 30,
+          maxTurns,
           allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
           cwd,
           canUseTool: makeCanUseTool(gitRoot),
@@ -227,6 +243,7 @@ export default {
         message: runError,
         resultChars: result.length,
       });
+      onError?.(runError);
     }
     debug.log('ai.run.end', {
       provider: 'claude',

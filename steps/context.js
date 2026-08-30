@@ -8,6 +8,9 @@ import { isInteractive } from '../lib/env.js';
 import { describeRepo, changedSince, hasUncommittedChanges } from '../lib/context-repo.js';
 import { screenCandidates } from '../lib/context-guard.js';
 import { fetchScope, pushCandidates } from '../lib/context-sync.js';
+import { buildPlan } from '../lib/context-plan.js';
+import { loadSettings, findApiEntry } from '../lib/settings.js';
+import { detectStack } from '../lib/detect-stack.js';
 
 /**
  * `npx restless context` - read this repo, propose what the AI should know
@@ -36,26 +39,112 @@ const MAX_CANDIDATES = 25;
 // the repository. Past this we stop pretending it is an incremental run.
 const MAX_CHANGED_FILES = 60;
 
-/** The scope paragraph the extraction prompt is built around. */
-function describeScope({ mode, files, lastRun, label }) {
-  if (mode === 'full') {
-    return [
-      'This is a **full pass**. Read the whole repository.',
-      lastRun?.headSha
-        ? `\nThis repo was indexed before, at \`${lastRun.headSha.slice(0, 8)}\`, but that commit is not in this checkout (a rebase, a squash, or a shallow clone), so the diff cannot be trusted and everything is being re-read. The "Already covered" list below is what came out of it. Do not propose those again.`
-        : `\nNothing from ${label} has been indexed before, so everything here is new ground.`,
-    ].join('\n');
+/** Ceiling per batch. The run-wide `MAX_CANDIDATES` still applies after. */
+const MAX_CANDIDATES_PER_BATCH = 8;
+
+// Turn budget for one batch.
+//
+// The provider's default of 30 is sized for a focused task, and reading a
+// whole repository is not one: the first real run in `restlesshq/app` spent 27
+// Reads and 2 Globs orienting itself, hit the cap, and returned nothing.
+// Hitting the cap is not a degraded result, it is NO result, because the agent
+// never reaches the turn where it emits its answer.
+//
+// Batching is what makes this number small and safe again. A batch is a known
+// list of files (7 by default), so the budget is one read each plus room to
+// follow an import and answer - not an open-ended exploration whose cost
+// nobody can predict.
+const MAX_TURNS_PER_BATCH = 25;
+// The redaction pass reads no files at all - it gets the candidates inline and
+// is told not to go looking - so it needs only enough turns to think and
+// answer.
+const MAX_TURNS_REVIEW = 10;
+
+/**
+ * The scope paragraph for one batch.
+ *
+ * Every batch names its own files. Nothing here ever says "read the
+ * repository": working out which files matter is the planner's job, done
+ * deterministically before any model runs, because that is the question the
+ * first real run spent its entire turn budget failing to answer.
+ */
+function describeBatchScope({ batch, plan, mode, lastRun, label, isCrossCutting }) {
+  const lines = [];
+
+  if (isCrossCutting) {
+    lines.push(
+      'This pass is about the things that apply **across** the API rather than to one endpoint: how authentication works, how paging works, what an error body looks like, what the limits are, what has to happen in what order.',
+      '',
+      'These files were picked because their names suggest they hold that kind of rule:',
+    );
+  } else if (mode === 'incremental') {
+    lines.push(
+      `This is an **incremental pass**. ${label} was last indexed at commit \`${lastRun.headSha.slice(0, 8)}\`${lastRun.ranAt ? ` on ${new Date(lastRun.ranAt).toLocaleDateString()}` : ''}, and only these files have changed since:`,
+    );
+  } else {
+    lines.push(
+      plan.specSource === 'none'
+        ? 'These files were located by a scan of the repository as the ones that define its HTTP surface:'
+        : "These files serve part of the API's published surface, matched from its OpenAPI spec:",
+    );
   }
 
-  return [
-    `This is an **incremental pass**. ${label} was last indexed at commit \`${lastRun.headSha.slice(0, 8)}\`${lastRun.ranAt ? ` on ${new Date(lastRun.ranAt).toLocaleDateString()}` : ''}.`,
-    '',
-    'Only these files have changed since. Read them, and whatever you need around them to understand them, but do not go trawling the rest of the repository: everything else was covered by an earlier run.',
-    '',
-    files.map((f) => `- ${f}`).join('\n'),
-    '',
-    'Propose something only if these changes actually created or corrected a fact a developer needs. A refactor that moved code without changing the API is a legitimate empty result. Return `[]` and say nothing rather than padding.',
-  ].join('\n');
+  lines.push('', batch.files.map((f) => `- ${f}`).join('\n'));
+
+  if (batch.operations.length) {
+    lines.push(
+      '',
+      'The operations these files serve, which is what a reader of the docs will actually be calling:',
+      '',
+      batch.operations.map((o) => `- ${o}`).join('\n'),
+    );
+  }
+
+  if (mode === 'incremental') {
+    lines.push(
+      '',
+      'Propose something only if these changes actually created or corrected a fact a developer needs. A refactor that moved code without changing the API is a legitimate empty result. Return `[]` rather than padding.',
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Which endpoint scanners to run here.
+ *
+ * `setupLanguages` is what `detectStack` believes this repo is written in.
+ * JavaScript is always included: `detectStack` reports it via `nodeEvidence`
+ * rather than in the language list, and a repo that turns out to be Python
+ * with a Node frontend still has routes worth finding on both sides. Scanning
+ * for a language that isn't there costs a directory walk that finds nothing.
+ */
+function detectLanguages(cwd) {
+  try {
+    const stack = detectStack(cwd);
+    return [...new Set(['javascript', ...(stack.setupLanguages || [])])];
+  } catch {
+    return ['javascript'];
+  }
+}
+
+/**
+ * The spec `init` wrote in this repo, if there is one.
+ *
+ * Preferred over the project's server-side copy: it is the spec as it exists
+ * at the commit being read, so a run right after an API change plans against
+ * the new shape rather than whatever was last uploaded.
+ */
+function localOasFileFor(cwd, projectId) {
+  try {
+    const settings = loadSettings(cwd);
+    // Match the project being uploaded to first: a workspace with two APIs in
+    // it has two specs, and the wrong one would plan against the wrong API.
+    const entry = findApiEntry(settings, { projectId }) || settings.apis?.[0];
+    return entry?.oasFile || '';
+  } catch {
+    return '';
+  }
 }
 
 /** Compact list of what the project already has, for the "don't repeat" list. */
@@ -132,16 +221,21 @@ async function reviewForLeaks(candidates, cwd, { setSpinner } = {}) {
   });
 
   let verdicts;
+  let reviewError = null;
   try {
-    const raw = await runAI(prompt, cwd, { setSpinner });
+    const raw = await runAI(prompt, cwd, {
+      setSpinner,
+      maxTurns: MAX_TURNS_REVIEW,
+      onError: (err) => { reviewError = err; },
+    });
     verdicts = extractJson(raw);
   } catch (err) {
-    return {
-      ok: false,
-      error: `The redaction pass couldn't run (${err.message}).`,
-    };
+    reviewError = err.message;
   }
 
+  if (reviewError) {
+    return { ok: false, error: `The redaction pass couldn't run (${reviewError}).` };
+  }
   if (!Array.isArray(verdicts)) {
     return { ok: false, error: "The redaction pass didn't return a verdict we could read." };
   }
@@ -252,41 +346,169 @@ export default async function contextStep({ project, token, cwd, cliVersion, yes
     }
   }
 
-  console.log('');
-  console.log(
-    mode === 'incremental'
-      ? `  ${dim(`Reading ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} since ${lastRun.headSha.slice(0, 8)}.`)}`
-      : `  ${dim('Reading the whole repository.')}`,
-  );
-
-  // ── Pass 1: extract, on this machine ─────────────────────────────────
-  const extractPrompt = loadPrompt('extract-context', {
-    cwd,
-    scope: describeScope({ mode, files: changedFiles, lastRun, label: repo.label }),
-    existing: describeExisting(scope.existing),
-    endpoints: (scope.endpoints || []).length
-      ? scope.endpoints.join('\n')
-      : '(This project has no OpenAPI spec yet, so leave `endpoint` out of every item.)',
-    max: String(MAX_CANDIDATES),
+  // ── Plan the reading, before any model runs ──────────────────────────
+  //
+  // Deterministic and fast (well under a second on a 794-file repo). The
+  // spec says which operations are worth documenting, the endpoint scanners
+  // say which file serves each one, and what comes out is a short list of
+  // files instead of an instruction to go and find the API.
+  const planSpinner = startSpinner('Working out what to read');
+  const plan = buildPlan({
+    rootDir: cwd,
+    oasFile: localOasFileFor(cwd, project.projectId),
+    serverOperations: scope.endpoints || [],
+    languages: detectLanguages(cwd),
+    changedFiles: mode === 'incremental' ? changedFiles : null,
   });
+  planSpinner.stop();
 
-  let extracted;
-  try {
-    const raw = await runAI(extractPrompt, cwd);
-    extracted = extractJson(raw);
-  } catch (err) {
+  const cov = plan.coverage;
+  console.log('');
+  if (plan.strategy === 'inventory') {
+    console.log(`  ${dim(`No HTTP routes found here, so this reads the repo's own files (${cov.filesPlanned}).`)}`);
+  } else if (plan.specSource === 'none') {
+    console.log(`  ${dim(`No spec to work from, so this reads the ${cov.filesPlanned} files that define routes.`)}`);
+  } else {
+    console.log(
+      `  ${dim(`${cov.mappedOperations} of ${cov.operations} published operations, served by ${cov.filesPlanned} file${cov.filesPlanned === 1 ? '' : 's'}.`)}`,
+    );
+    if (cov.endpointsFound > cov.mappedOperations) {
+      // The number that explains why this is fast, and why the output is
+      // about the public API rather than every route in the repo.
+      console.log(
+        `  ${dim(`(${cov.endpointsFound} routes exist here; the spec says which ones are public.)`)}`,
+      );
+    }
+  }
+  if (cov.filesSkipped > 0) {
+    console.log(`  ${yellow(`! ${cov.filesSkipped} more files matched but exceed one run. Re-run to continue, or narrow with a subdirectory.`)}`);
+  }
+  if (plan.unmappedOperations.length) {
+    console.log(
+      `  ${dim(`${plan.unmappedOperations.length} operation${plan.unmappedOperations.length === 1 ? '' : 's'} in the spec had no file we could find; skipped.`)}`,
+    );
+  }
+
+  if (!plan.batches.length && !plan.crossCutting) {
     console.log('');
-    console.log(red(`  ✗ Couldn't read the repository: ${err.message}`));
+    console.log(green('  ✓ Nothing here to read.'));
+    console.log(
+      dim(
+        mode === 'incremental'
+          ? '  None of the changed files serve the API.'
+          : '  No routes, no spec, and no source files this could learn from.',
+      ),
+    );
+    console.log('');
+    return 0;
+  }
+
+  // ── Pass 1: extract, on this machine, one batch at a time ────────────
+  //
+  // Batched rather than one sweep, because one sweep is all-or-nothing: the
+  // first real run spent its whole budget orienting itself and returned
+  // nothing at all. Each batch names its own files, so a batch that fails
+  // costs a batch.
+  const passes = [
+    ...plan.batches.map((b) => ({ batch: b, isCrossCutting: false })),
+    ...(plan.crossCutting ? [{ batch: plan.crossCutting, isCrossCutting: true }] : []),
+  ];
+
+  const endpointMenu = (scope.endpoints || []).length
+    ? scope.endpoints.join('\n')
+    : '(This project has no OpenAPI spec yet, so leave `endpoint` out of every item.)';
+
+  const collected = [];
+  const failedPasses = [];
+
+  for (const [i, pass] of passes.entries()) {
+    const name = pass.isCrossCutting ? 'shared rules' : `batch ${pass.batch.label}`;
+    const spinner = startSpinner(
+      `Reading ${name} (${i + 1}/${passes.length}, ${pass.batch.files.length} files)`,
+    );
+
+    const prompt = loadPrompt('extract-context', {
+      cwd,
+      scope: describeBatchScope({
+        batch: pass.batch,
+        plan,
+        mode,
+        lastRun,
+        label: repo.label,
+        isCrossCutting: pass.isCrossCutting,
+      }),
+      existing: describeExisting(scope.existing),
+      endpoints: endpointMenu,
+      max: String(MAX_CANDIDATES_PER_BATCH),
+    });
+
+    // "The model found nothing" and "the model never got to answer" look
+    // identical from here unless we check: the provider swallows SDK errors
+    // and returns whatever partial text it had, which for a run that hit the
+    // turn cap is nothing at all. A pass that failed is recorded as failed,
+    // never folded into the total as an empty result.
+    let raw = '';
+    let runError = null;
+    try {
+      raw = await runAI(prompt, cwd, {
+        maxTurns: MAX_TURNS_PER_BATCH,
+        onError: (err) => { runError = err; },
+        setSpinner: (s) => spinner.update(
+          `${name} (${i + 1}/${passes.length}) ${typeof s === 'string' ? s : s?.detail || ''}`,
+        ),
+      });
+    } catch (err) {
+      runError = err.message;
+    }
+    spinner.stop();
+
+    if (runError || !raw.trim()) {
+      failedPasses.push({ name, reason: runError || 'returned nothing' });
+      continue;
+    }
+    const parsed = extractJson(raw);
+    if (!Array.isArray(parsed)) {
+      failedPasses.push({ name, reason: "didn't return a readable list" });
+      continue;
+    }
+    for (const item of parsed) {
+      const normalized = normalizeCandidate(item);
+      if (normalized) collected.push(normalized);
+    }
+  }
+
+  if (failedPasses.length) {
+    console.log('');
+    console.log(yellow(`  ! ${failedPasses.length} of ${passes.length} passes didn't finish:`));
+    for (const f of failedPasses) console.log(dim(`    ${f.name}: ${f.reason}`));
+  }
+
+  // Every pass failing is a failed run, not an empty one. Saying "nothing
+  // worth saving" here would tell the user their repo had been read when none
+  // of it was.
+  if (failedPasses.length === passes.length) {
+    console.log('');
+    console.log(red('  ✗ Nothing was read, so there is nothing to report.'));
+    console.log(dim('    The debug log holds what each pass did before it stopped.'));
     console.log('');
     return 1;
   }
 
-  const candidates = (Array.isArray(extracted) ? extracted : [])
-    .map(normalizeCandidate)
-    .filter(Boolean)
+  // Two batches can land on the same fact from different files (a shared
+  // helper explains paging, and so does the route that uses it). Collapse by
+  // title before anything else looks at them.
+  const seenTitles = new Set();
+  const candidates = collected
+    .filter((c) => {
+      const key = c.title.trim().toLowerCase();
+      if (seenTitles.has(key)) return false;
+      seenTitles.add(key);
+      return true;
+    })
     .slice(0, MAX_CANDIDATES);
 
   if (!candidates.length) {
+    // A genuine empty result: the model ran to completion and returned [].
     console.log('');
     console.log(green('  ✓ Nothing new worth saving.'));
     console.log(
