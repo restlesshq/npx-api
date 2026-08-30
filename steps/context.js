@@ -719,10 +719,20 @@ export default async function contextStep({ project, token, cwd, cliVersion, yes
     // Its reasons are printed rather than just counted: a run where the two
     // sides disagree is either a prompt that needs tuning or a leak the local
     // pass missed, and a bare number tells you neither.
-    console.log(dim(`    ${pushed.skippedUnsafe} dropped by the safety review on upload:`));
-    for (const d of pushed.dropped || []) {
-      console.log(`      ${dim('•')} ${white(d.title)}`);
-      console.log(`        ${dim(d.reason)}`);
+    //
+    // An older dashboard sends the count without the reasons. Say so, rather
+    // than printing a heading with nothing under it and leaving the developer
+    // to wonder whether the reasons were empty or missing.
+    const reasons = pushed.dropped || [];
+    if (reasons.length) {
+      console.log(dim(`    ${pushed.skippedUnsafe} dropped by the safety review on upload:`));
+      for (const d of reasons) {
+        console.log(`      ${dim('•')} ${white(d.title)}`);
+        console.log(`        ${dim(d.reason)}`);
+      }
+    } else {
+      console.log(dim(`    ${pushed.skippedUnsafe} dropped by the safety review on upload.`));
+      console.log(dim("    This dashboard doesn't report why yet, so there is nothing more to show."));
     }
   }
   console.log('');
