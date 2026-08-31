@@ -157,11 +157,15 @@ describe('startSpinner stays on one line', () => {
    * It is fed URLs, file paths and model-written summaries, so none of its
    * messages have a bounded length.
    */
-  function capture(msg, columns) {
+  function capture(msg, columns, { isTTY = true } = {}) {
     const chunks = [];
     const origWrite = process.stdout.write;
     const origCols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    const origTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
     Object.defineProperty(process.stdout, 'columns', { value: columns, configurable: true });
+    // The redraw behaviour these tests are about only exists for a TTY. Under
+    // vitest stdout is a pipe, so it has to be stated rather than inherited.
+    Object.defineProperty(process.stdout, 'isTTY', { value: isTTY, configurable: true });
     process.stdout.write = (c) => { chunks.push(String(c)); return true; };
     try {
       const spinner = startSpinner(msg);
@@ -172,6 +176,8 @@ describe('startSpinner stays on one line', () => {
           process.stdout.write = origWrite;
           if (origCols) Object.defineProperty(process.stdout, 'columns', origCols);
           else delete process.stdout.columns;
+          if (origTty) Object.defineProperty(process.stdout, 'isTTY', origTty);
+          else delete process.stdout.isTTY;
           resolve(chunks);
         }, 120);
       });
@@ -197,6 +203,20 @@ describe('startSpinner stays on one line', () => {
   it('marks the truncation so it does not read as the whole message', async () => {
     const chunks = await capture('y'.repeat(400), 80);
     expect(chunks.some((c) => c.includes('\u2026'))).toBe(true);
+  });
+
+  it('does not animate when stdout is not a TTY', async () => {
+    // A pipe or a CI log cannot process the clear-line escape, so every tick
+    // would APPEND a frame rather than replace one. A `context` run spins for
+    // minutes and would bury its own output under thousands of them.
+    const chunks = await capture('Reading batch 1/3', 80, { isTTY: false });
+    expect(chunks.join('')).not.toContain('\x1b[2K');
+    expect(chunks.filter((c) => c.includes('Reading batch 1/3'))).toHaveLength(1);
+  });
+
+  it('still truncates the one line it prints when not a TTY', async () => {
+    const chunks = await capture('z'.repeat(400), 80, { isTTY: false });
+    expect(widest(chunks)).toBeLessThanOrEqual(80);
   });
 
   it('leaves a short message intact', async () => {

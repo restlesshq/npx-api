@@ -38,6 +38,8 @@ import { checkOasServers, guessBaseUrl, isPlausibleBaseUrl } from '../lib/base-u
 import { safeWriteFileSync, safeAppendFileSync } from '../lib/pathGuard.js';
 import { fatalError, isFatalExit } from '../lib/errors.js';
 import { findSdkReferences, findOwnerIdPlaceholders } from '../lib/grep-sdk.js';
+import contextStep from '../steps/context.js';
+import { signIn, pickProject, clearAccountToken, reportSignInFailure } from '../lib/context-auth.js';
 import * as debug from '../lib/debug.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
@@ -347,6 +349,7 @@ function printHelp() {
   console.log(`  ${bold('Commands')}`);
   const rows = [
     ['init', 'Set up Restless here: scan your code, install the SDK, wire it in'],
+    ['context', 'Read this repo and teach the AI how your API is meant to be used'],
     ['debug <request-id>', 'Inspect a request, ask AI about it, or have it fixed for you'],
     ['update [projectId]', 'Refresh your spec, edit settings, and sync both to the dashboard'],
     ['help', 'Show this help'],
@@ -375,6 +378,18 @@ function printHelp() {
   console.log('');
   console.log(`    ${dim(`Not Claude Code or Codex? Add ${cyan('--agent <name>')}${'\x1b[2m'} (or set`)}`);
   console.log(`    ${dim(`${cyan('RESTLESS_AGENT')}${'\x1b[2m'}) so the project records which agent set it up.`)}`);
+  console.log('');
+  console.log(`  ${bold('Flags for')} ${cyan('context')}`);
+  const contextFlags = [
+    ['--project <id>', "Which project to send to (defaults to this repo's own)"],
+    ['--full', 'Re-read everything, ignoring where the last run got to'],
+    ['--dry-run', 'Show what would be sent, and send nothing'],
+    ['--yes', 'Skip the confirmation'],
+  ];
+  const ctxWidth = Math.max(...contextFlags.map(([name]) => name.length));
+  for (const [name, hint] of contextFlags) {
+    console.log(`    ${cyan(name.padEnd(ctxWidth))}  ${dim(hint)}`);
+  }
   console.log('');
   // `update` needs no TTY when it's told exactly what to do, which is the
   // only way an agent or a CI job can drive it.
@@ -2126,6 +2141,91 @@ if (command === '--version' || command === '-v' || command === 'version') {
       apiEntry: chosenApi,
     });
   await debug.flushAndExit(updateCode);
+} else if (command === 'context') {
+  // ── npx restless context ───────────────────────────────────────────────
+  // Read this repo and propose what the AI should know about the API.
+  //
+  // Unlike every other command here, this one does NOT need to be run where
+  // `init` was: the repos with the most to say about an API are often not the
+  // one that implements it. So there is no settings.json to read a projectId
+  // out of, and this block does what those blocks do with settings - work out
+  // WHO is running and WHICH project they mean - by signing in and asking.
+  const contextCwd = process.cwd();
+  setLogoSubtitle(`npx ${CLI_NAME} context`);
+
+  const session = await signIn({ interactive: isInteractive() });
+  if (!session.ok) {
+    reportSignInFailure(session);
+    await debug.flushAndExit(1);
+  }
+
+  // Which project, in order of how much we should trust the answer.
+  //
+  // `--project <id>` is explicit and wins. Failing that, a repo that has been
+  // through `init` already names its project in `.restless/settings.json`, and
+  // asking someone with 22 projects to pick the one their own repo already
+  // names is a question we can answer ourselves. Only a repo with neither
+  // (a docs repo, a client SDK - the ones this command exists for) gets the
+  // picker.
+  const requestedProject = flagValue(process.argv, '--project');
+  const localProject = requestedProject
+    ? ''
+    : (loadSettings(resolveProjectDirs(contextCwd).rootDir).apis || [])
+      .map((a) => a.projectId)
+      .find(Boolean) || '';
+
+  let picked = await pickProject({
+    token: session.token,
+    preferredId: requestedProject || localProject,
+    // A stale id in a committed settings file must not fail the run; a wrong
+    // `--project` should. See `pickProject`.
+    requirePreferred: !!requestedProject,
+    interactive: isInteractive(),
+  });
+
+  // A cached session that the server has since rejected looks exactly like a
+  // bad request from here, so spend the cache once and try again rather than
+  // telling the user to go and delete a file.
+  if (!picked.ok && picked.expired && session.cached) {
+    clearAccountToken();
+    const fresh = await signIn({ interactive: isInteractive() });
+    if (!fresh.ok) {
+      reportSignInFailure(fresh);
+      await debug.flushAndExit(1);
+    }
+    session.token = fresh.token;
+    picked = await pickProject({
+      token: session.token,
+      preferredId: requestedProject || localProject,
+      requirePreferred: !!requestedProject,
+      interactive: isInteractive(),
+    });
+  }
+
+  if (!picked.ok) {
+    console.log('');
+    console.log(red(`  ✗ ${picked.error}`));
+    if (picked.projects?.length) {
+      console.log('');
+      console.log(dim('  Projects on your account:'));
+      for (const p of picked.projects) {
+        console.log(`    ${dim('•')} ${p.projectId} ${dim(`(${p.name || p.slug})`)}`);
+      }
+    }
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  const contextCode = await contextStep({
+    project: picked.project,
+    token: session.token,
+    cwd: contextCwd,
+    cliVersion: readVersion(),
+    yes: process.argv.includes('--yes') || process.argv.includes('-y'),
+    dryRun: process.argv.includes('--dry-run'),
+    full: process.argv.includes('--full'),
+  });
+  await debug.flushAndExit(contextCode);
 } else if (command === 'submit-debug') {
   // Hidden command (intentionally absent from `printHelp`). Every run
   // writes a local debug log to ~/.restless/debug/; this uploads the

@@ -71,3 +71,33 @@ describe('runAI tool-constraints preamble', () => {
     expect(out).toBe('stub-result');
   });
 });
+
+describe('runAI passthrough of maxTurns and onError', () => {
+  let stub;
+  beforeEach(() => {
+    stub = makeStubProvider();
+    setProvider(stub);
+  });
+  afterEach(() => setProvider('claude'));
+
+  it('leaves both undefined when the caller does not ask', () => {
+    // Every existing call site omits them, and must keep the provider's own
+    // defaults: a 30-turn budget and errors swallowed into a partial result.
+    return runAI('p', '/tmp').then(() => {
+      expect(stub.calls[0].opts.maxTurns).toBeUndefined();
+      expect(stub.calls[0].opts.onError).toBeUndefined();
+    });
+  });
+
+  it('hands the provider a caller-supplied turn budget', async () => {
+    await runAI('p', '/tmp', { maxTurns: 150 });
+    expect(stub.calls[0].opts.maxTurns).toBe(150);
+  });
+
+  it('hands the provider an onError the provider can invoke', async () => {
+    const seen = [];
+    await runAI('p', '/tmp', { onError: (e) => seen.push(e) });
+    stub.calls[0].opts.onError('Reached maximum number of turns (30)');
+    expect(seen).toEqual(['Reached maximum number of turns (30)']);
+  });
+});
