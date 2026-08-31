@@ -205,12 +205,104 @@ never discards them: `--json` reports `synced` separately from `ok` and says why
 Authorizing a machine needs a browser once; after that the session is reused for
 24 hours.
 
+# Teaching the AI about your API
+
+A spec says a call exists. It never says what the thing it returns *is*, why a
+field 400s, or which three calls in a row get someone what they came for. That
+part lives in your code, your tests, and your docs, and it's the part your
+users (and the AI answering their questions) actually need.
+
+`npx restless context` reads a repo and proposes it for you:
+
+```
+$ npx restless context
+
+  Repository  restlesshq/logs
+  Project     Restless
+
+  34 endpoints in your spec, 21 files to read.
+
+  Ready to upload (6)
+
+    context   What a log is, and how long we keep it
+              GET /v1/logs
+    context   Why an ingest call 401s when the key is valid
+              POST /v1/request
+    use case  Capture a request and find it in the dashboard
+
+  These go to your dashboard as pending suggestions. Nothing is
+  published until you approve it there.
+
+  Upload these for review? [Y/n]
+```
+
+Two kinds of thing come out of it. **Context items** are single facts a
+developer can't get from a spec: what a capability is for, what a value means,
+what has to happen before what. **Use cases** are short end-to-end workflows,
+one goal tied to the sequence of calls that reaches it.
+
+**Run it wherever the knowledge is, not where `init` ran.** The repo with the
+most to say about an API is often not the one that implements it, so a docs
+repo or a client SDK is a first-class place to run this. A repo that's been
+through `init` already names its project and doesn't ask; anywhere else you
+pick one, or name it with `--project <id>`.
+
+**Re-running is the point.** Each run records the commit it read, and the next
+one diffs against it and only reads what moved, which is cheap enough to make a
+habit or a CI step. `--full` ignores the mark and re-reads everything. In a
+directory that isn't a git repo it always reads everything, and says so.
+
+## What leaves your machine
+
+The reading happens here, in your own agent. **The repository never leaves the
+machine** - what uploads is the finished text, and only after three separate
+checks:
+
+ 1. The extraction is told it's writing public documentation, not describing an
+    implementation.
+ 2. A second pass that sees *only* the extracted text: an independent model
+    call plus a set of fixed rules matching the things you can't be wrong about
+    once (live keys, internal hostnames, customer data).
+ 3. An adversarial review on our side before anything is stored.
+
+Anything any of them flags is **dropped, not starred out** - a redacted secret
+still tells the reader there's a secret and what it's called. The local pass
+names what it withheld on your terminal, so you can see it work without the
+text going anywhere:
+
+```
+  Withheld (2) - checked here, never uploaded:
+    • Rotating the ingest signing key
+      contains what looks like an AWS access key
+```
+
+If the leak check can't complete, the run uploads nothing at all.
+
+Everything that does land arrives as a pending suggestion. You approve it in
+the dashboard; nothing is published because a model proposed it.
+
+| flag | what it does |
+| ---- | ------------ |
+| `--project <id>` | Which project to send to (defaults to this repo's own) |
+| `--full` | Re-read everything, ignoring where the last run got to |
+| `--dry-run` | Show exactly what would be sent, and send nothing |
+| `--yes` | Skip the confirmation |
+
+`--dry-run` is a real preview rather than a simulation of one: every step above
+the upload happens on your machine regardless, so what it prints is what would
+have gone. A non-interactive run (a coding agent's shell, or CI) has no
+confirmation to skip and uploads once the checks pass, so reach for `--dry-run`
+first when you're wiring it into one.
+
 # Privacy
 
  - The setup will use AI, but won't use it without asking first.
  - It uses your local AI, so no code will be sent to our servers.
  - Inside a coding agent, the AI doing the work is the one you're already
    using, and nothing extra is spawned behind your back.
+ - `npx restless context` reads your repo locally too. The code stays here;
+   only the documentation it writes is uploaded, after the checks above, and
+   only as suggestions you approve yourself.
  - Registering a project records two things about how setup ran: whether you
    started it yourself or your coding agent did, and which agent did the work
    (`--agent` / `RESTLESS_AGENT` if you set one, otherwise blank unless it's
