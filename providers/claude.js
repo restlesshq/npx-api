@@ -1,3 +1,4 @@
+import path from 'path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import * as debug from '../lib/debug.js';
 import { isInsideRoot, getGitRoot } from '../lib/pathGuard.js';
@@ -36,6 +37,69 @@ function truncatedToolInput(input) {
  * Phase is stable across many calls of the same category; detail changes
  * with every call.
  */
+/**
+ * The phase for a tool we know the name of but not yet the arguments of.
+ *
+ * Streaming tells us a tool_use block has STARTED before the model has
+ * finished generating its input, and that gap is where the CLI used to go
+ * quiet. `describeToolUse` needs the input to build its detail line, so the
+ * phase is split out here to be usable a few hundred milliseconds earlier.
+ *
+ * Bash is the one that can't be answered from the name (the phase depends on
+ * the command), so it gets the generic label until the input lands.
+ */
+function phaseForToolName(toolName) {
+  switch (toolName) {
+    case 'Read': return 'Reading files';
+    case 'Glob': return 'Looking for files';
+    case 'Grep': return 'Searching the code';
+    case 'Write': return 'Writing files';
+    case 'Edit': return 'Editing files';
+    case 'Bash': return 'Running commands';
+    default: return 'Working';
+  }
+}
+
+/**
+ * Shorten an absolute path for the spinner's one-line detail. Relative to the
+ * run's cwd when it sits underneath it, basename otherwise - an absolute
+ * `/private/tmp/...` path is mostly prefix nobody is reading.
+ */
+function relativeToCwd(filePath, cwd) {
+  try {
+    const rel = path.relative(cwd, filePath);
+    if (rel && !rel.startsWith('..')) return rel;
+    return path.basename(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+/** Human byte size for a spinner detail: "34 KB", "1.2 MB". */
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Pull `file_path` out of a partially-streamed tool input.
+ *
+ * Tool input arrives as a stream of JSON fragments, and for Write/Edit the
+ * `file_path` key comes before the bulk `content`. So a few hundred bytes in
+ * we can already name the file, which is the difference between "Writing
+ * files" and "Write .restless/openapi.json".
+ */
+function sniffFilePath(partial) {
+  const m = /"file_path"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(partial);
+  if (!m) return null;
+  try {
+    return JSON.parse(`"${m[1]}"`);
+  } catch {
+    return m[1];
+  }
+}
+
 function describeToolUse(toolName, input) {
   switch (toolName) {
     case 'Read':
@@ -199,6 +263,8 @@ export default {
     // is built to handle an empty or partial AI result, so degrading is
     // always better than crashing.
     let runError = null;
+    // The tool call currently being generated, or null between calls.
+    let streaming = null;
     try {
       for await (const message of query({
         prompt,
@@ -207,8 +273,81 @@ export default {
           allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
           cwd,
           canUseTool: makeCanUseTool(gitRoot),
+          // Streaming events are what let the spinner track the model while
+          // it is generating a tool call. A tool_use block only reaches the
+          // `assistant` branch below once its ENTIRE input has been
+          // generated, and for the OpenAPI spec that is a ~40KB argument
+          // taking a minute or more. Without these events the CLI showed the
+          // PREVIOUS tool's label for that whole minute - a profiled run sat
+          // on "Creating directories" for 118 seconds while it was actually
+          // writing the spec, which reads as a hang.
+          includePartialMessages: true,
         }
       })) {
+        // ── Streaming: track the tool call being generated right now ──────
+        if (message.type === 'stream_event') {
+          const ev = message.event;
+          if (ev?.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+            streaming = {
+              name: ev.content_block.name,
+              json: '',
+              bytes: 0,
+              filePath: null,
+              paintedAt: 0,
+              paintedBytes: 0,
+            };
+            onStatus?.({
+              phase: phaseForToolName(streaming.name),
+              detail: `${streaming.name}…`,
+            });
+          } else if (ev?.type === 'content_block_delta' && ev.delta?.type === 'input_json_delta' && streaming) {
+            const chunk = ev.delta.partial_json || '';
+            streaming.bytes += chunk.length;
+            // Only the head is kept: it is enough to sniff `file_path` out of,
+            // and holding a 40KB argument twice for a spinner label would be
+            // the kind of accidental memory cost this whole change exists to
+            // avoid paying elsewhere.
+            if (streaming.json.length < 4096) streaming.json += chunk;
+            if (!streaming.filePath) streaming.filePath = sniffFilePath(streaming.json);
+
+            // Throttled on BOTH time and size. Time alone (~4 paints a
+            // second) keeps the plan view from redrawing per delta - they
+            // arrive in their thousands. But a single large delta landing
+            // inside the window would otherwise never be shown, leaving the
+            // size stuck at whatever the last paint said, so a big jump
+            // forces a paint of its own.
+            const now = Date.now();
+            const grew = streaming.bytes - streaming.paintedBytes >= 8192;
+            if (grew || now - streaming.paintedAt > 250) {
+              streaming.paintedAt = now;
+              streaming.paintedBytes = streaming.bytes;
+              const target = streaming.filePath ? ` ${relativeToCwd(streaming.filePath, cwd)}` : '';
+              onStatus?.({
+                phase: phaseForToolName(streaming.name),
+                detail: `${streaming.name}${target} (${formatBytes(streaming.bytes)} so far)`,
+              });
+            }
+          } else if (ev?.type === 'content_block_stop') {
+            streaming = null;
+          }
+          continue;
+        }
+
+        // An API-level retry, which is invisible from the outside and looks
+        // exactly like a slow model. A profiled run had one unexplained 49.5s
+        // gap; this is the event that would have named it.
+        if (message.type === 'system' && message.subtype === 'api_retry') {
+          debug.log('ai.api-retry', {
+            attempt: message.attempt,
+            maxRetries: message.max_retries,
+            retryDelayMs: message.retry_delay_ms,
+            errorStatus: message.error_status,
+            error: message.error,
+          });
+          onStatus?.({ phase: 'Retrying', detail: `API retry ${message.attempt}/${message.max_retries}` });
+          continue;
+        }
+
         if (message.type === 'assistant') {
           for (const block of message.message.content) {
             if (block.type === 'text') {
