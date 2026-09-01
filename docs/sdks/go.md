@@ -130,4 +130,4 @@ APIKey: restless.Mask(orDefault(r.Header("Authorization"), "anonymous"))
 2. `client.Middleware()` wraps the handler passed to `ListenAndServe`, outermost.
 3. A `client.Setup(...)` callback exists and reads its header via `r.Header(...)`.
 4. **`go build ./...` succeeds** - Go is the one language where the wiring either compiles or does not.
-5. Starting the server and hitting any endpoint returns an `x-restless-id` response header.
+5. Starting the server and hitting any endpoint returns an `x-request-id` response header carrying a fresh id - `<prefix>-<uuid>` when the API has a `requestIdPrefix` in `.restless/settings.json` (the CLI writes one when it registers your spec), otherwise a bare UUID. If your request already sent an `x-request-id`, the SDK leaves that chain alone and answers on `x-restless-id` instead - the SDK sets exactly one of the two. Other stacks set `x-request-id` too, so for proof it was ours, check for the `x-debug` header, which rides every captured response.

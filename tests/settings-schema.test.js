@@ -23,9 +23,9 @@ const entrySchema = schema.properties.apis.items;
  * If you add a field, add it here and to the schema in the same change.
  */
 const WRITTEN_FIELDS = {
-  id: 'lib/settings.js upsertApi',
-  name: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
-  rootDir: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
+  id: 'lib/settings.js upsertApi, lib/project-init.js recordProjectId',
+  name: 'steps/generate-oas.js finalizeApi, bin/restless.js register, lib/project-init.js recordProjectId',
+  rootDir: 'steps/generate-oas.js finalizeApi, bin/restless.js register, lib/project-init.js recordProjectId',
   projectId: 'lib/project-init.js recordProjectId',
   oasFile: 'steps/generate-oas.js finalizeApi, bin/restless.js register',
   oasSource: 'steps/generate-oas.js finalizeApi, bin/restless.js register',

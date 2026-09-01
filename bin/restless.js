@@ -30,7 +30,7 @@ import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import { normalizeLanguage } from '../lib/sdk-writers/languages.js';
 import { detectStack, stackCheckDisabled, unsupportedStackMessage } from '../lib/detect-stack.js';
 import { resolveOwningDir } from '../lib/install-target.js';
-import { loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
+import { apiDirKey, loadSettings, saveSettings, upsertApi, generatePrefix, formatRequestId, stripRequestIdPrefix } from '../lib/settings.js';
 import { findExistingEnvFile, existingRestlessKey, replaceRestlessKey } from '../steps/prepare-account.js';
 import { generateWriteKey, ensureProject, loadProjectCreds, pollForLandedLog, uploadPendingArtifacts } from '../lib/project-init.js';
 import { normalizeBaseUrl, parseStatus, describeDiagnosis, diagnoseFromHeaders, splitCurlIncludeOutput, fixContext } from '../lib/test-diagnosis.js';
@@ -1070,7 +1070,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
   setGitRoot(findGitRoot(keyRoot) || keyRoot);
 
   const settingsForKey = loadSettings(keyRoot);
-  const apiRootDir = dirFlag || settingsForKey.apis?.[0]?.rootDir || '.';
+  const apiRootDir = apiDirKey(dirFlag || settingsForKey.apis?.[0]?.rootDir);
   // `npx restless key` runs standalone (the agent flow), so the language comes
   // from what setup recorded rather than from a live detection pass.
   const apiLanguage = settingsForKey.apis?.find((a) => a.rootDir === apiRootDir)?.language
@@ -1204,11 +1204,21 @@ if (command === '--version' || command === '-v' || command === 'version') {
     await debug.flushAndExit(1);
   }
 
-  const apiRootDir = flagValue(process.argv, '--dir') || '.';
+  const apiRootDir = apiDirKey(flagValue(process.argv, '--dir'));
   const name = flagValue(process.argv, '--name') || oasDoc?.info?.title || path.basename(regRoot);
   const oasRel = path.relative(regRoot, oasAbs);
   const settings = loadSettings(regRoot);
-  const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
+  // A stub from `key` running first carries the projectId under a guessed
+  // rootDir of '.'. Adopt it rather than adding a second entry: that would
+  // split projectId and spec, and `login` would claim a spec-less project.
+  const stub = settings.apis?.length === 1 && settings.apis[0].projectId && !settings.apis[0].oasFile
+    ? settings.apis[0]
+    : null;
+  // upsertApi matches on id first; without one it would push a duplicate and
+  // the "Moved" line below would describe a move that did not happen.
+  if (stub && !stub.id) stub.id = crypto.randomUUID();
+  const existing = settings.apis?.find((a) => apiDirKey(a.rootDir) === apiRootDir) || stub;
+  const movedFrom = stub && existing === stub && apiDirKey(stub.rootDir) !== apiRootDir ? apiDirKey(stub.rootDir) : null;
   // Only a plausible public URL is worth recording as baseUrl. Relative
   // servers and --allow-local-servers overrides keep whatever was there -
   // and a local address recorded by an older CLI gets scrubbed rather than
@@ -1231,6 +1241,9 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const ops = countOperations(oasDoc);
   console.log('');
   console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${ops} endpoint${ops === 1 ? '' : 's'})`)}.`);
+  if (movedFrom) {
+    console.log(`  ${yellow('!')} Moved the API ${bold(`npx ${CLI_NAME} key`)} registered at ${bold(movedFrom)} to ${bold(apiRootDir)}, keeping its project.`);
+  }
   console.log(`  ${dim(`.restless/settings.json now points at ${oasRel}. Commit .restless/ with your code.`)}`);
   console.log('');
   await debug.flushAndExit(0);

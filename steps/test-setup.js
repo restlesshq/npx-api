@@ -287,7 +287,7 @@ export default async function testSetup({
 
   // Fire one request at the local server and classify from the response
   // headers. A connection error → 'unreachable' (server down / wrong port);
-  // otherwise the SDK's `x-restless-id` header tells us the rest. We pipe
+  // otherwise the SDK's request-id header tells us the rest. We pipe
   // curl's stderr (stdio slot 2) instead of letting it inherit the terminal -
   // otherwise a failed connection prints a raw `curl: (7) Failed to connect…`
   // line that corrupts the rendered plan UI.
