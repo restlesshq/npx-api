@@ -97,6 +97,19 @@ describe('npx restless register', () => {
     expect(out).not.toMatch(/Moved the API/);
   });
 
+  // `api` and `api/` are one directory. Treating them as two put a second
+  // entry in settings, and two entries make the SDK throw at server boot.
+  it('treats a --dir with a trailing slash as the directory it already knows', () => {
+    seedApis([{
+      id: 'first', name: 'First', rootDir: 'api', projectId: 'proj-1',
+      oasFile: '.restless/first.json',
+    }]);
+    run(['register', '--oas', '.restless/openapi.json', '--dir', 'api/']);
+    const s = settings();
+    expect(s.apis).toHaveLength(1);
+    expect(s.apis[0]).toMatchObject({ id: 'first', rootDir: 'api', projectId: 'proj-1' });
+  });
+
   // Only a spec-less stub is adoptable, or `--dir` could never add a real
   // second API to a repo that already has one.
   it('still adds a second API rather than hijacking one that already has a spec', () => {

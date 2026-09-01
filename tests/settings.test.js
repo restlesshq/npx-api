@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { loadSettings, saveSettings, upsertApi, findApiEntry } from '../lib/settings.js';
+import { apiDirKey, loadSettings, saveSettings, upsertApi, findApiEntry } from '../lib/settings.js';
 
 describe('upsertApi', () => {
   it('generates a UUID when id is not provided', () => {
@@ -68,5 +68,20 @@ describe('findApiEntry', () => {
     expect(findApiEntry(settings, {})).toBeNull();
     expect(findApiEntry({}, { id: 'a1' })).toBeNull();
     expect(findApiEntry({ apis: [] }, { id: 'a1' })).toBeNull();
+  });
+});
+
+describe('apiDirKey', () => {
+  it('collapses the spellings of one directory', () => {
+    for (const d of ['.', './', '', undefined, null]) expect(apiDirKey(d)).toBe('.');
+    for (const d of ['api', 'api/', './api', 'api//']) expect(apiDirKey(d)).toBe('api');
+    for (const d of ['services/api', 'services/api/', './services/api']) {
+      expect(apiDirKey(d)).toBe('services/api');
+    }
+  });
+
+  it('leaves a distinct directory distinct', () => {
+    expect(apiDirKey('svc-a')).not.toBe(apiDirKey('svc-b'));
+    expect(apiDirKey('api')).not.toBe(apiDirKey('api/v2'));
   });
 });

@@ -293,6 +293,16 @@ describe('ensureProject', () => {
     expect(saved.apis.find((a) => a.rootDir === 'svc-b').projectId).toBe('project-1');
   });
 
+  it('writes to the existing entry when --dir spells its directory differently', async () => {
+    const fetchImpl = mintingFetch();
+    saveSettings(tmp, { version: 1, apis: [{ id: 'a', name: 'One', rootDir: 'api' }] });
+    await mod.ensureProject({ rootDir: tmp, apiRootDir: 'api/', apiKey: 'rstlss_k', fetchImpl });
+
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis).toHaveLength(1);
+    expect(saved.apis[0]).toMatchObject({ id: 'a', rootDir: 'api', projectId: 'project-1' });
+  });
+
   it('records the project id on the API entry that owns it', async () => {
     const fetchImpl = mintingFetch();
     saveSettings(tmp, { version: 1, apis: [
