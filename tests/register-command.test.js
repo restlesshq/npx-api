@@ -77,7 +77,7 @@ describe('npx restless register', () => {
   // `login` - which picks by projectId - would claim a project with no spec.
   it('adopts the key stub instead of adding a second entry when --dir differs', () => {
     seedApis([{ id: 'stub-id', name: 'tmp', rootDir: '.', projectId: 'proj-1' }]);
-    run(['register', '--oas', '.restless/openapi.json', '--dir', 'services/api']);
+    const out = run(['register', '--oas', '.restless/openapi.json', '--dir', 'services/api']);
     const s = settings();
     expect(s.apis).toHaveLength(1);
     expect(s.apis[0]).toMatchObject({
@@ -86,6 +86,15 @@ describe('npx restless register', () => {
       rootDir: 'services/api',
       oasFile: '.restless/openapi.json',
     });
+    // Adoption relocates the entry, so it has to be visible in the output.
+    expect(out).toContain('services/api');
+    expect(out).toMatch(/Moved the API/);
+  });
+
+  it('says nothing about moving when the stub was already at the right dir', () => {
+    seedApis([{ id: 'stub-id', name: 'tmp', rootDir: '.', projectId: 'proj-1' }]);
+    const out = run(['register', '--oas', '.restless/openapi.json']);
+    expect(out).not.toMatch(/Moved the API/);
   });
 
   // Only a spec-less stub is adoptable, or `--dir` could never add a real

@@ -10,7 +10,7 @@ npm install @restlessai/sdk --save
 
 ## Setup
 
-The single entry point `@restlessai/sdk` auto-detects the framework at runtime (Express, Fastify, Koa, Hono, bare http) from the call signature. Import the bare specifier for all of them - the same factory call works everywhere, and only the registration pattern differs. The per-framework subpaths (`@restlessai/sdk/express`, `@restlessai/sdk/fastify`, and so on) still resolve, but they are not the form to write on a new install.
+The single entry point `@restlessai/sdk` auto-detects the framework at runtime (Express, Fastify, Koa, Hono, bare http, and Next route handlers) from the call signature. Import the bare specifier for all of them - the same factory call works everywhere, and only the registration pattern differs. The per-framework subpaths (`@restlessai/sdk/express`, `@restlessai/sdk/fastify`, and so on) still resolve, but they are not the form to write on a new install.
 
 Next.js is the exception: its integration is the `@restlessai/sdk/next` subpath (`withRestless` and `defineConfig`), covered in its own section below.
 

@@ -279,6 +279,20 @@ describe('ensureProject', () => {
     expect(saved.apis[0]).toMatchObject({ rootDir: 'services/api', projectId: 'project-1' });
   });
 
+  // Falling back to apis[0] here would stamp the new project over svc-a's,
+  // orphaning it - the same silent loss the stub creation above exists to stop.
+  it('never stamps the project onto an API the requested dir does not name', async () => {
+    const fetchImpl = mintingFetch();
+    saveSettings(tmp, { version: 1, apis: [
+      { id: 'a', name: 'One', rootDir: 'svc-a', projectId: 'proj-A' },
+    ]});
+    await mod.ensureProject({ rootDir: tmp, apiRootDir: 'svc-b', apiKey: 'rstlss_k', fetchImpl });
+
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis.find((a) => a.rootDir === 'svc-a').projectId).toBe('proj-A');
+    expect(saved.apis.find((a) => a.rootDir === 'svc-b').projectId).toBe('project-1');
+  });
+
   it('records the project id on the API entry that owns it', async () => {
     const fetchImpl = mintingFetch();
     saveSettings(tmp, { version: 1, apis: [

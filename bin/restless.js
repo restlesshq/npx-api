@@ -1215,6 +1215,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     ? settings.apis[0]
     : null;
   const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir) || stub;
+  const movedFrom = stub && existing === stub && (stub.rootDir || '.') !== apiRootDir ? (stub.rootDir || '.') : null;
   // Only a plausible public URL is worth recording as baseUrl. Relative
   // servers and --allow-local-servers overrides keep whatever was there -
   // and a local address recorded by an older CLI gets scrubbed rather than
@@ -1237,6 +1238,9 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const ops = countOperations(oasDoc);
   console.log('');
   console.log(`  ${green('✓')} Registered ${bold(name)} ${dim(`(${ops} endpoint${ops === 1 ? '' : 's'})`)}.`);
+  if (movedFrom) {
+    console.log(`  ${yellow('!')} Moved the API ${bold(`npx ${CLI_NAME} key`)} registered at ${bold(movedFrom)} to ${bold(apiRootDir)}, keeping its project.`);
+  }
   console.log(`  ${dim(`.restless/settings.json now points at ${oasRel}. Commit .restless/ with your code.`)}`);
   console.log('');
   await debug.flushAndExit(0);
