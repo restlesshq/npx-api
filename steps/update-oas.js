@@ -195,6 +195,7 @@ async function generateInto({ apiEntry, rootDir, packageDir, destDir, setSpinner
     apiRootDir: apiEntry.rootDir || '.',
     name: apiEntry.name,
     framework,
+    language: apiEntry.language || 'javascript',
     existingOasFile: apiEntry.oasFile || null,
     preferNative,
     oasFile: path.join(path.relative(rootDir, destDir), 'openapi.json'),

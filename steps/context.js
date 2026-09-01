@@ -302,6 +302,7 @@ async function reviewForLeaks(candidates, cwd, { setSpinner } = {}) {
   try {
     const raw = await runAI(prompt, cwd, {
       setSpinner,
+      label: 'review-context',
       maxTurns: MAX_TURNS_REVIEW,
       onError: (err) => { reviewError = err; },
     });
@@ -544,6 +545,7 @@ export default async function contextStep({ project, token, cwd, cliVersion, yes
     let runError = null;
     try {
       raw = await runAI(prompt, cwd, {
+        label: `extract-context:${name}`,
         maxTurns: MAX_TURNS_PER_BATCH,
         onError: (err) => { runError = err; },
         setSpinner: (s) => spinner.update(

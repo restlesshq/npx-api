@@ -105,6 +105,88 @@ describe('findLatestLocalLog', () => {
     const latest = debug.findLatestLocalLog();
     expect(path.basename(latest)).toBe('2026-01-02T00-00-00-000Z-update.json');
   });
+
+  it('skips the timings command\'s own logs', async () => {
+    // `restless timings` writes a log of itself, which would always be the
+    // newest on disk - so a bare `restless timings` would profile the
+    // reader instead of the run being asked about.
+    const debug = await freshDebug();
+    const stub = '{"meta":{},"entries":[]}';
+    fs.writeFileSync(path.join(tmpDir, '2026-01-01T00-00-00-000Z-init.json'), stub);
+    fs.writeFileSync(path.join(tmpDir, '2026-01-04T00-00-00-000Z-timings.json'), stub);
+
+    expect(path.basename(debug.findLatestLocalLog())).toBe('2026-01-01T00-00-00-000Z-init.json');
+  });
+});
+
+describe('listLocalLogs', () => {
+  it('lists newest first with the command parsed out of the filename', async () => {
+    const debug = await freshDebug();
+    const stub = '{"meta":{},"entries":[]}';
+    fs.writeFileSync(path.join(tmpDir, '2026-01-01T00-00-00-000Z-init.json'), stub);
+    fs.writeFileSync(path.join(tmpDir, '2026-01-02T00-00-00-000Z-update.json'), stub);
+
+    expect(debug.listLocalLogs().map((l) => l.command)).toEqual(['update', 'init']);
+  });
+
+  it('honors the limit', async () => {
+    const debug = await freshDebug();
+    for (let i = 1; i <= 5; i++) {
+      fs.writeFileSync(path.join(tmpDir, `2026-01-0${i}T00-00-00-000Z-init.json`), '{}');
+    }
+    expect(debug.listLocalLogs({ limit: 2 })).toHaveLength(2);
+  });
+
+  it('returns an empty list rather than throwing when the dir is missing', async () => {
+    const debug = await freshDebug();
+    process.env.RESTLESS_DEBUG_DIR = path.join(tmpDir, 'does-not-exist');
+    expect(debug.listLocalLogs()).toEqual([]);
+  });
+});
+
+describe('snapshot', () => {
+  it('returns the log as it stands, in the on-disk shape', async () => {
+    const debug = await freshDebug();
+    debug.init({ argv: ['node', 'api', 'init'] });
+    debug.log('mid-run', { n: 1 });
+
+    const snap = debug.snapshot();
+    expect(snap.meta.command).toBe('init');
+    expect(snap.entries.map((e) => e.type)).toContain('mid-run');
+  });
+
+  it('hands back a copy, so a caller sorting it cannot reorder the log', async () => {
+    const debug = await freshDebug();
+    debug.init({ argv: ['node', 'api', 'init'] });
+    debug.log('first');
+    debug.log('second');
+
+    debug.snapshot().entries.reverse();
+    expect(debug.snapshot().entries.map((e) => e.type)).toEqual(['init', 'first', 'second']);
+  });
+});
+
+describe('addFinalizeHook', () => {
+  it('runs hooks before the body is written, so their entries land in it', async () => {
+    const debug = await freshDebug();
+    debug.init({ argv: ['node', 'api', 'init'] });
+    debug.addFinalizeHook(() => debug.log('from-hook', { late: true }));
+    await debug.finalize({ exitCode: 0 });
+
+    const written = JSON.parse(fs.readFileSync(path.join(tmpDir, jsonFiles()[0]), 'utf8'));
+    expect(written.entries.map((e) => e.type)).toContain('from-hook');
+  });
+
+  it('swallows a throwing hook rather than failing the exit', async () => {
+    const debug = await freshDebug();
+    debug.init({ argv: ['node', 'api', 'init'] });
+    debug.addFinalizeHook(() => { throw new Error('hook exploded'); });
+    debug.addFinalizeHook(() => debug.log('still-ran'));
+
+    await expect(debug.finalize({ exitCode: 0 })).resolves.toBeUndefined();
+    const written = JSON.parse(fs.readFileSync(path.join(tmpDir, jsonFiles()[0]), 'utf8'));
+    expect(written.entries.map((e) => e.type)).toContain('still-ran');
+  });
 });
 
 describe('submitLocalLog', () => {

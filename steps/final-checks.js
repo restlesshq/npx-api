@@ -10,6 +10,7 @@ import { brand } from '../lib/ui.js';
 import { nextPluginWiringStatus } from '../lib/next-detect.js';
 import { findWiredSourceFile as findWired } from '../lib/wired-file.js';
 import * as debug from '../lib/debug.js';
+import { buildSourceBlock } from '../lib/inline-source.js';
 import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import {
   isOwnerIdPlaceholder,
@@ -430,14 +431,102 @@ const AI_CHECK_LABELS = {
  * render in the same table. Any failure to run or parse degrades to a single
  * informational row - a review pass must never block the install.
  */
-export async function runAiChecks({ ctx, sourceFile, setSpinner, runner = runAI }) {
+/**
+ * Start the AI wiring review early, so it runs alongside `verifyOwnerId`
+ * instead of after it.
+ *
+ * These two passes were the last two AI calls of the install, ~27s and ~22s,
+ * and both only need the wired file. But `verifyOwnerId` can EDIT that file
+ * (it rewrites `owner.id` to the sentinel), so they are not simply
+ * independent - a review started early could describe a file that no longer
+ * exists by the time it is reported.
+ *
+ * Rather than reason about which of the five checks that edit could affect,
+ * the snapshot settles it: we keep the exact bytes the review read, and
+ * `finalChecks` uses the result only if the file still matches. When it
+ * doesn't, the review is thrown away and re-run against the real file - the
+ * same cost as today, in the rarer case. The common case, where `owner.id`
+ * was already fine, gets both passes for the price of the slower one.
+ *
+ * Returns null when there is nothing safe to review yet, and never rejects:
+ * a background pass that throws must not take the install down.
+ */
+export function startWiringReview({ ctx, runner = runAI }) {
+  const sourceFile = findWiredSourceFile(ctx.installDir, ctx);
+  if (!sourceFile) return null;
+
+  // Same guard `finalChecks` applies before reviewing: a structurally broken
+  // block is about to be rewritten by a repair flow, so reviewing its
+  // current text is wasted work.
+  let rows;
+  try {
+    rows = runChecks(ctx);
+  } catch {
+    return null;
+  }
+  if (rows.some((r) => r.kind === 'no-source' || r.kind === 'old-api')) return null;
+
+  let snapshot;
+  try {
+    snapshot = fs.readFileSync(sourceFile, 'utf8');
+  } catch {
+    return null;
+  }
+
+  // A no-op `setSpinner`: passing nothing would make `runAI` open its own
+  // standalone spinner, which writes straight to stdout and would tear up
+  // the pinned plan frame the foreground pass is drawing into.
+  const promise = runAiChecks({ ctx, sourceFile, setSpinner: () => {}, runner, background: true })
+    .then((aiRows) => ({ sourceFile, snapshot, rows: aiRows }))
+    .catch(() => null);
+
+  return { sourceFile, snapshot, promise };
+}
+
+/**
+ * Resolve a review started by `startWiringReview`, or report why it can't be
+ * used. Returns `{ rows }` when the reviewed bytes are still on disk, and
+ * `null` when the caller should run the review itself.
+ */
+async function settleWiringReview(pending, sourceFile) {
+  if (!pending || pending.sourceFile !== sourceFile) return null;
+  let settled;
+  try {
+    settled = await pending.promise;
+  } catch {
+    return null;
+  }
+  if (!settled?.rows) return null;
+  let current;
+  try {
+    current = fs.readFileSync(sourceFile, 'utf8');
+  } catch {
+    return null;
+  }
+  if (current !== settled.snapshot) {
+    debug.log('final-checks.review-stale', { sourceFile });
+    return null;
+  }
+  return { rows: settled.rows };
+}
+
+export async function runAiChecks({ ctx, sourceFile, setSpinner, runner = runAI, background = false }) {
   const rel = path.relative(ctx.installDir, sourceFile) || sourceFile;
+  // The caller already knows which file to review, so send it along rather
+  // than spending a round trip on a Read the CLI could do in microseconds.
+  // One hop of imports: this pass reviews the wiring in this file, and does
+  // not trace values back through the app the way verify-owner-id does.
+  const source = buildSourceBlock(ctx.installDir, { seedFiles: [rel], hops: 1 });
   let raw;
   try {
     raw = await runner(
-      loadPrompt('verify-wiring', { sourceFile: rel, framework: ctx.framework || ctx.language || 'unknown' }),
+      loadPrompt('verify-wiring', {
+        sourceFile: rel,
+        framework: ctx.framework || ctx.language || 'unknown',
+        sourceFiles: source.block,
+      }),
       ctx.installDir,
-      { setSpinner },
+      { setSpinner, label: 'verify-wiring', background },
     );
   } catch (err) {
     debug.log('final-checks.ai-error', { message: String(err?.message || err).slice(0, 200) });
@@ -517,7 +606,7 @@ async function repairOldApi({ ctx, sourceFile, update, setSpinner, subIndex, pre
       language: ctx.language || 'javascript',
       framework: ctx.framework || ctx.language || 'your framework',
     });
-    await runAI(prompt, ctx.installDir, { setSpinner });
+    await runAI(prompt, ctx.installDir, { setSpinner, label: 'fix-old-api' });
   } catch (err) {
     update({ activeSub: subIndex, sub: prevSubs, message: [
       ...baseMessage,
@@ -551,7 +640,7 @@ async function repairOwnerId({ ctx, sourceFile, writer, update, setSpinner, subI
       language: ctx.language || 'javascript',
       framework: ctx.framework || ctx.language || 'your framework',
     });
-    await runAI(prompt, ctx.installDir, { setSpinner });
+    await runAI(prompt, ctx.installDir, { setSpinner, label: 'fix-owner-id' });
   } catch (err) {
     update({ activeSub: subIndex, sub: prevSubs, message: [
       ...baseMessage,
@@ -609,6 +698,10 @@ export default async function finalChecks({
   setSpinner,
   subIndex = 3,
   prevSubs = {},
+  pendingReview = null,
+  // Same seam `runAiChecks` exposes, forwarded so a test can exercise the
+  // path where an early review turned out to be stale and has to be redone.
+  aiRunner = runAI,
 }) {
   update({ status: 'active', activeSub: subIndex, sub: prevSubs, message: [
     `  Running final checks - confirming the SDK is wired correctly and won't go silent.`,
@@ -639,7 +732,13 @@ export default async function finalChecks({
       ...renderReview(rows),
       `  ${orange(ctx.aiTool || 'the AI')} ${dim('is reading the wiring for anything the checks above can’t see…')}`,
     ]});
-    const aiRows = await runAiChecks({ ctx, sourceFile: aiSourceFile, setSpinner });
+    // A review started back when `verifyOwnerId` began is usually already
+    // done by now, and usable as long as the file it read is still the file
+    // on disk. `settleWiringReview` enforces that; a null means run it here.
+    const early = await settleWiringReview(pendingReview, aiSourceFile);
+    const aiRows = early?.rows
+      || await runAiChecks({ ctx, sourceFile: aiSourceFile, setSpinner, runner: aiRunner });
+    debug.log('final-checks.review-source', { early: !!early });
     setSpinner?.('');
     rows = [...rows, ...aiRows];
     update({ activeSub: subIndex, sub: prevSubs, message: renderReview(rows) });

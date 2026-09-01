@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import * as debug from '../lib/debug.js';
 import { isInsideRoot, getGitRoot } from '../lib/pathGuard.js';
+import { createToolProgressTracker } from '../lib/stream-progress.js';
 
 // AI tool inputs (especially Write/Edit) carry full file contents that
 // blow up the debug log size. Truncate every string field at the source
@@ -199,6 +200,11 @@ export default {
     // is built to handle an empty or partial AI result, so degrading is
     // always better than crashing.
     let runError = null;
+    // Reports the tool call currently being generated. Without it the UI
+    // shows the PREVIOUS tool for as long as the model spends composing the
+    // next one, which for a large `Write` is a minute or more of apparent
+    // hang. See `lib/stream-progress.js`.
+    const progress = createToolProgressTracker({ cwd, onStatus });
     try {
       for await (const message of query({
         prompt,
@@ -207,8 +213,38 @@ export default {
           allowedTools: ['Read', 'Edit', 'Glob', 'Grep', 'Bash', 'Write'],
           cwd,
           canUseTool: makeCanUseTool(gitRoot),
+          // Streaming events are what let the spinner track the model while
+          // it is generating a tool call. A tool_use block only reaches the
+          // `assistant` branch below once its ENTIRE input has been
+          // generated, and for the OpenAPI spec that is a ~40KB argument
+          // taking a minute or more. Without these events the CLI showed the
+          // PREVIOUS tool's label for that whole minute - a profiled run sat
+          // on "Creating directories" for 118 seconds while it was actually
+          // writing the spec, which reads as a hang.
+          includePartialMessages: true,
         }
       })) {
+        // ── Streaming: track the tool call being generated right now ──────
+        if (message.type === 'stream_event') {
+          progress.handle(message.event);
+          continue;
+        }
+
+        // An API-level retry, which is invisible from the outside and looks
+        // exactly like a slow model. A profiled run had one unexplained 49.5s
+        // gap; this is the event that would have named it.
+        if (message.type === 'system' && message.subtype === 'api_retry') {
+          debug.log('ai.api-retry', {
+            attempt: message.attempt,
+            maxRetries: message.max_retries,
+            retryDelayMs: message.retry_delay_ms,
+            errorStatus: message.error_status,
+            error: message.error,
+          });
+          onStatus?.({ phase: 'Retrying', detail: `API retry ${message.attempt}/${message.max_retries}` });
+          continue;
+        }
+
         if (message.type === 'assistant') {
           for (const block of message.message.content) {
             if (block.type === 'text') {

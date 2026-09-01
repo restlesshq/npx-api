@@ -461,7 +461,7 @@ export default async function testSetup({
     ]});
     debug.log('test-setup.fix-start', { state });
     try {
-      await runAI(loadPrompt('fix-sdk', { ...languagePromptVars(ctx?.language), evidence, guidance, base: localBase() }), installDir, { setSpinner });
+      await runAI(loadPrompt('fix-sdk', { ...languagePromptVars(ctx?.language), evidence, guidance, base: localBase() }), installDir, { setSpinner, label: 'fix-sdk' });
       update({ message: [
         `  ${green('✓')} ${orange(aiTool)} applied a fix. ${bold('Restart your server')} and we'll re-check automatically.`,
       ]});

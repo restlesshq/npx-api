@@ -18,7 +18,7 @@ import prepareAccount from '../steps/prepare-account.js';
 import installSdk from '../steps/install-sdk.js';
 import { createSetupContext, redactSetupContext, getSdkLineSpec } from '../lib/setup-context.js';
 import verifyOwnerId from '../steps/verify-owner-id.js';
-import finalChecks from '../steps/final-checks.js';
+import finalChecks, { startWiringReview } from '../steps/final-checks.js';
 import setupAccount from '../steps/setup-account.js';
 import testSetup from '../steps/test-setup.js';
 import runInteractiveUpdate from '../steps/update-interactive.js';
@@ -41,11 +41,45 @@ import { findSdkReferences, findOwnerIdPlaceholders } from '../lib/grep-sdk.js';
 import contextStep from '../steps/context.js';
 import { signIn, pickProject, clearAccountToken, reportSignInFailure } from '../lib/context-auth.js';
 import * as debug from '../lib/debug.js';
+import * as timings from '../lib/timings.js';
+import { renderReport, renderJson } from '../lib/timings-report.js';
 
 // Initialize debug capture FIRST, before anything else writes to stdout -
 // the stream wrappers need to be in place to record the welcome screen.
 const debugEnabled = debug.init({ argv: process.argv });
 debug.attachExitHandlers();
+
+// ── `--timings`: profile this run ─────────────────────────────────────────
+// A development flag. Spans are recorded on every run regardless (they ride
+// along in the debug log, same as every other event), so this only controls
+// whether the report is printed when the process exits - `npx restless
+// timings` renders the same thing from a log written earlier.
+//
+// Registered as a finalize hook so it fires on every exit path, including
+// the ones that don't reach the bottom of a command: a fatal error, a
+// ctrl-c, an uncaught throw. A run that died halfway is often the run you
+// most want the timings for.
+const timingsMode = process.argv.includes('--timings=json')
+  ? 'json'
+  : process.argv.includes('--timings')
+    ? 'text'
+    : null;
+if (timingsMode) {
+  debug.addFinalizeHook(() => {
+    // Close anything still running so an interrupted step reports the
+    // duration it actually reached instead of vanishing. Idempotent, and
+    // already done by timings.js's own hook on the normal path.
+    timings.closeOpenSpans('run-ended');
+    const log = debug.snapshot();
+    // stderr, not stdout: a run may be mid-pipe, and the report is
+    // diagnostics rather than output.
+    process.stderr.write(
+      timingsMode === 'json'
+        ? `${renderJson(log)}\n`
+        : `${renderReport(log).join('\n')}\n`,
+    );
+  });
+}
 
 // Hard ceiling: no fs write, AI tool, or helper anywhere in this process
 // is allowed to touch a path outside the git root the user invoked us
@@ -926,6 +960,15 @@ if (command === '--version' || command === '-v' || command === 'version') {
   // upstream.
   const verifyUpdate = plan.makeUpdater(1);
   verifyUpdate({ activeSub: 2, sub: { 0: 'done', 1: 'done' } });
+
+  // These were the install's last two AI calls, run back to back, and both
+  // only need the wired file - so the read-only one starts here and runs
+  // under the owner.id pass instead of after it. `finalChecks` uses its
+  // result only if the file is still byte-identical to what it reviewed,
+  // since `verifyOwnerId` may rewrite the `owner.id` line; otherwise it
+  // re-runs the review itself. See `startWiringReview`.
+  const pendingReview = startWiringReview({ ctx });
+
   await verifyOwnerId({ ctx, update: (msg) => verifyUpdate({ ...msg, activeSub: 2 }), setSpinner });
 
   // Step 2 sub 3: Run final checks. Verifies the install is correct and
@@ -937,6 +980,7 @@ if (command === '--version' || command === '-v' || command === 'version') {
     setSpinner,
     subIndex: 3,
     prevSubs: { 0: 'done', 1: 'done', 2: 'done' },
+    pendingReview,
   });
   plan.makeUpdater(1)({ status: 'done', sub: { 0: 'done', 1: 'done', 2: 'done', 3: 'done' } });
 
@@ -2239,6 +2283,59 @@ if (command === '--version' || command === '-v' || command === 'version') {
     full: process.argv.includes('--full'),
   });
   await debug.flushAndExit(contextCode);
+} else if (command === 'timings') {
+  // ── npx restless timings [file] [--json] [--list] ─────────────────────
+  // Hidden, development-only (intentionally absent from `printHelp`).
+  //
+  // Timing spans ride along in the debug log every run writes to
+  // ~/.restless/debug/, so this renders a profile of a run that has already
+  // happened - no need to reproduce a slow `init` under a flag. `--timings`
+  // on a live run prints the identical report through the same renderer.
+  const explicitPath = positionalArg(process.argv, 3);
+
+  if (process.argv.includes('--list')) {
+    const logs = debug.listLocalLogs({ limit: 15 });
+    console.log('');
+    if (!logs.length) {
+      console.log(`  ${dim('No local debug logs found.')}`);
+    } else {
+      console.log(`  ${bold('Recent runs')} ${dim('(newest first)')}`);
+      for (const l of logs) console.log(`    ${cyan((l.command || '?').padEnd(14))} ${dim(l.file)}`);
+      console.log('');
+      console.log(`  ${dim(`npx ${CLI_NAME} timings <file>`)}`);
+    }
+    console.log('');
+    await debug.flushAndExit(0);
+  }
+
+  const file = explicitPath || debug.findLatestLocalLog();
+  if (!file) {
+    console.log('');
+    console.log(`  ${dim('No local debug logs found.')}`);
+    console.log(`  ${dim(`Run \`npx ${CLI_NAME} init\` first, then re-run this to profile it.`)}`);
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    console.log('');
+    console.log(`  ${red('✗')} Couldn't read ${file}: ${err.message}`);
+    console.log('');
+    await debug.flushAndExit(1);
+  }
+
+  if (process.argv.includes('--json')) {
+    console.log(renderJson(parsed));
+    await debug.flushAndExit(0);
+  }
+
+  console.log(renderReport(parsed).join('\n'));
+  console.log(`  ${dim(file)}`);
+  console.log('');
+  await debug.flushAndExit(0);
 } else if (command === 'submit-debug') {
   // Hidden command (intentionally absent from `printHelp`). Every run
   // writes a local debug log to ~/.restless/debug/; this uploads the

@@ -1,9 +1,11 @@
 import fs from 'fs';
+import path from 'path';
 import { runAI, loadPrompt, languagePromptVars } from '../lib/ai.js';
 import { bold, dim, green, yellow, cyan, orange } from '../lib/ui.js';
 import * as debug from '../lib/debug.js';
 import { getSdkWriter } from '../lib/sdk-writers/index.js';
 import { findWiredSourceFile } from '../lib/wired-file.js';
+import { buildSourceBlock } from '../lib/inline-source.js';
 import { analyzeOwnerId } from './final-checks.js';
 
 
@@ -64,14 +66,28 @@ export default async function verifyOwnerId({ ctx, update, setSpinner }) {
     `  ${orange(aiTool)} ${dim('is tracing the data flow and checking your schema. This is a security check.')}`,
   ]});
 
+  // We already know the wired file - `findWiredSourceFile` found it and we
+  // read it above - so the prompt's old "grep for it, then open it" opening
+  // was two round trips spent rediscovering what the caller had in hand.
+  // Two hops of imports come along because step 3 of the prompt has to
+  // trace `req.user` back to the auth middleware that attaches it.
+  const relSource = path.relative(installDir, sourceFile) || sourceFile;
+  const source = buildSourceBlock(installDir, { seedFiles: [relSource], hops: 2 });
+  debug.log('verify-owner-id.inlined-source', {
+    files: source.included.length,
+    bytes: source.bytes,
+  });
+
   const prompt = loadPrompt('verify-owner-id', {
     ...languagePromptVars(language),
     language,
     framework: framework || language,
+    sourceFile: relSource,
+    sourceFiles: source.block,
   });
 
   try {
-    await runAI(prompt, installDir, { setSpinner });
+    await runAI(prompt, installDir, { setSpinner, label: 'verify-owner-id' });
   } catch (err) {
     debug.log('verify-owner-id.ai-error', { message: err.message });
     update({ message: [

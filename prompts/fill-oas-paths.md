@@ -18,3 +18,5 @@ For each missing endpoint:
 
 ## Output
 Write the updated spec back to EXACTLY this absolute path: {{oasFile}} - do not write anywhere else. It must stay valid JSON: every key and string value double-quoted, no trailing commas, no comments.
+
+**Write any JSON you add COMPACT** - no indentation, no newlines between keys, no spaces after `:` or `,`. The CLI re-indents the whole file the moment you finish, so the committed file ends up properly formatted; every space you emit yourself is a token the user waits for.

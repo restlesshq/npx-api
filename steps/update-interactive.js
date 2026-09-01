@@ -262,7 +262,7 @@ async function chatEdit({ rootDir, settings, apiEntry }) {
     raw = await runAI(loadPrompt('update-settings-chat', {
       currentSettings: JSON.stringify(view, null, 2),
       userMessage: msg,
-    }), rootDir);
+    }), rootDir, { label: 'update-settings-chat' });
   } catch (err) {
     return pause([red(`  ✗ Couldn't reach the AI: ${err.message}`)]);
   }

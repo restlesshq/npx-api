@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { runAI, loadPrompt } from '../lib/ai.js';
+import { buildApiSourceBlock, buildSourceBlock } from '../lib/inline-source.js';
+import { mergeSpecs, planSpecGroups, countOperations as countMergedOperations } from '../lib/oas-merge.js';
 import { bold, dim, green, red, yellow, cyan, ask, askWithPreview, singleSelect } from '../lib/ui.js';
 import { guessBaseUrl } from '../lib/base-url.js';
 import { loadSettings, saveSettings, upsertApi, generatePrefix } from '../lib/settings.js';
@@ -86,21 +88,179 @@ function missingFileRoutes(apiDir, oasFullPath) {
 }
 
 /**
- * Build a checklist of the file-based routes on disk to hand the generator up
- * front, so the first pass aims for full path coverage instead of discovering
- * endpoints as it goes (which is where it runs out of room and drops trees).
- * Empty string when there are no file routes - nothing authoritative to list,
- * and the generator's own exploration is fine for call-expression frameworks.
+ * Directory the concurrent workers write their fragments into.
+ *
+ * Inside `.restless/` because the AI's tool calls are fenced to the git root
+ * (see `makeCanUseTool`), so a system temp dir is not reachable. `.restless/`
+ * is committed with the user's code, so this is removed in a `finally` -
+ * leaving four `group-N.json` files in someone's repo would be worse than
+ * the time it saves.
  */
-function buildEndpointChecklist(apiDir) {
-  let scan;
-  try {
-    scan = scanCodebase(apiDir);
-  } catch {
-    return '';
+const PARTS_DIRNAME = '.tmp-oas-parts';
+
+/** Document-level fields Node knows without spending a turn asking. */
+function buildSpecShell({ name, domain }) {
+  return {
+    openapi: '3.0.3',
+    info: { title: name || 'API', version: '1.0.0' },
+    servers: [{ url: domain }],
+  };
+}
+
+/** One route list, formatted the way the part prompt expects. */
+function formatGroupRoutes(endpoints) {
+  const byPath = new Map();
+  for (const e of endpoints) {
+    if (!byPath.has(e.path)) byPath.set(e.path, new Set());
+    byPath.get(e.path).add(e.method);
   }
-  const fileRoutes = scan.endpoints.filter((e) => e.style === 'file');
-  if (fileRoutes.length === 0) return '';
+  return [...byPath.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([p, methods]) => `- ${[...methods].sort().join(', ')} ${p}`)
+    .join('\n');
+}
+
+/**
+ * Generate the spec as several fragments, concurrently, and merge them.
+ *
+ * This is the only remaining lever on the biggest single cost in `init`.
+ * Once the exploration turns were inlined away, `generate-oas` was 124s of
+ * which 104s was one `Write` emitting the whole document serially at ~93
+ * tokens/sec. Fewer tokens only goes so far (compacting the JSON bought
+ * 12%); generating a quarter of the document in each of four concurrent
+ * requests is what actually divides the wall clock.
+ *
+ * Returns `{ ok: false }` on ANY group failing, and the caller falls back to
+ * the single-pass generator. Merging whatever arrived would mean shipping a
+ * spec silently missing a fifth of the API - and for call-expression routes
+ * the coverage guard cannot see that, so nothing downstream would catch it.
+ * Paying for a full regeneration in the rare case is the right trade against
+ * quietly under-describing someone's API.
+ */
+async function generateOasInParts({
+  groups,
+  apiDir,
+  language,
+  name,
+  oasFullPath,
+  packageDir,
+  internalNote,
+  setSpinner,
+}) {
+  const partsDir = path.join(path.dirname(oasFullPath), PARTS_DIRNAME);
+  const totalEndpoints = groups.reduce((n, g) => n + g.endpoints.length, 0);
+  let writtenEndpoints = 0;
+
+  try {
+    safeMkdirSync(partsDir, { recursive: true });
+
+    // Progress in endpoints, not in groups. How many requests the CLI split
+    // the work across is an implementation detail; what the user is waiting
+    // for is their API being described, and the step's own intro already
+    // frames it that way ("Turning your 22 endpoints into an OpenAPI spec").
+    const paint = () => setSpinner?.({
+      phase: 'Writing your spec',
+      detail: `${writtenEndpoints} of ${totalEndpoints} endpoints`,
+    });
+    paint();
+
+    const results = await Promise.all(groups.map(async (group) => {
+      const partFile = path.join(partsDir, `${group.key}.json`);
+      // Source scoped to this group's own files, so each worker gets a
+      // smaller prompt than the whole-API one and reads only what it owns.
+      const source = buildSourceBlock(apiDir, { seedFiles: group.files, hops: 2 });
+
+      let runError = null;
+      try {
+        await runAI(
+          loadPrompt('generate-oas-part', {
+            name,
+            groupFiles: group.files.map((f) => `- \`${f}\``).join('\n'),
+            groupRoutes: formatGroupRoutes(group.endpoints),
+            partFile,
+            oasFile: oasFullPath,
+            internalNote,
+            sourceFiles: source.block,
+          }),
+          packageDir,
+          {
+            label: `generate-oas-part:${group.key}`,
+            // No shared spinner: K workers writing to one status line would
+            // just fight over it, so the orchestrator paints progress and
+            // each worker stays quiet.
+            setSpinner: () => {},
+            // Siblings running concurrently. Without this the first to open
+            // its span would adopt the others as children - see
+            // `timings.start`.
+            background: true,
+            onError: (err) => { runError = err; },
+          },
+        );
+      } catch (err) {
+        runError = err?.message || String(err);
+      }
+
+      writtenEndpoints += group.endpoints.length;
+      paint();
+
+      if (!fs.existsSync(partFile)) {
+        return { key: group.key, ok: false, reason: runError || 'wrote no file' };
+      }
+      try {
+        const parsed = JSON.parse(fs.readFileSync(partFile, 'utf8'));
+        return { key: group.key, ok: true, spec: parsed };
+      } catch (err) {
+        return { key: group.key, ok: false, reason: `unparseable part: ${err.message}` };
+      }
+    }));
+
+    const failed = results.filter((r) => !r.ok);
+    debug.log('generate-oas.parts', {
+      groups: groups.length,
+      failed: failed.map((f) => ({ key: f.key, reason: String(f.reason).slice(0, 160) })),
+    });
+    if (failed.length) return { ok: false, failed };
+
+    const shell = buildSpecShell({ name, domain: PLACEHOLDER_DOMAIN });
+    const { spec, conflicts, stats } = mergeSpecs(shell, results.map((r) => ({ key: r.key, spec: r.spec })));
+
+    if (countMergedOperations(spec) === 0) {
+      return { ok: false, failed: [{ key: 'merge', reason: 'merged spec has no operations' }] };
+    }
+
+    debug.log('generate-oas.merged', {
+      paths: stats.paths,
+      operations: stats.operations,
+      conflicts: conflicts.slice(0, 20),
+      conflictCount: conflicts.length,
+    });
+
+    safeMkdirSync(path.dirname(oasFullPath), { recursive: true });
+    safeWriteFileSync(oasFullPath, `${JSON.stringify(spec, null, 2)}\n`);
+    return { ok: true, conflicts, stats };
+  } catch (err) {
+    debug.log('generate-oas.parts-error', { message: String(err?.message || err).slice(0, 200) });
+    return { ok: false, failed: [{ key: 'orchestration', reason: err?.message || String(err) }] };
+  } finally {
+    // Clear the spinner we painted ourselves. The single-pass path gets this
+    // for free because `runAI` clears the spinner it was handed - but each
+    // worker here is deliberately given a no-op one so they cannot fight
+    // over the line, which left nothing to turn the real one off. The stale
+    // line then sat under the next screen with its clock still running, so
+    // the base-URL question appeared to be part of "Writing your spec".
+    setSpinner?.('');
+    // Never leave fragments behind in a directory that gets committed.
+    try { fs.rmSync(partsDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/**
+ * The authoritative section: file-based routes, whose enumerated path IS the
+ * full URL, so the generator can be told outright that each one must appear.
+ */
+function fileRouteChecklist(endpoints) {
+  const fileRoutes = endpoints.filter((e) => e.style === 'file');
+  if (fileRoutes.length === 0) return null;
 
   const byPath = new Map();
   for (const e of fileRoutes) {
@@ -118,6 +278,77 @@ function buildEndpointChecklist(apiDir) {
     '',
     ...lines,
   ].join('\n');
+}
+
+/**
+ * The advisory section: call-expression and decorator routes
+ * (Express/Fastify/Koa/Nest), grouped by the file that declares them.
+ *
+ * These paths are written relative to wherever the router is mounted, and the
+ * mount prefix genuinely is not resolvable in general - the fixture this was
+ * profiled against mounts with `app.use(config.apiPrefix, routes())` and then
+ * sub-mounts in a loop over an array, so there is no literal to read. That is
+ * why the coverage GUARD still only enforces file routes: a diff against
+ * router-relative paths would invent missing entries.
+ *
+ * But it is why the generator was previously told nothing at all for the
+ * frameworks most customers use, and the "do not drop any of these" rule had
+ * no list to point at. A count and a grouped inventory are both things we know
+ * for certain, and both are useful, so they go in the prompt - clearly marked
+ * as relative, with an explicit instruction not to copy them verbatim.
+ */
+function callRouteInventory(endpoints) {
+  const callRoutes = endpoints.filter((e) => e.style === 'function' || e.style === 'decorator');
+  if (callRoutes.length === 0) return null;
+
+  const byFile = new Map();
+  for (const e of callRoutes) {
+    const file = e.file || '(unknown file)';
+    if (!byFile.has(file)) byFile.set(file, new Map());
+    const paths = byFile.get(file);
+    if (!paths.has(e.path)) paths.set(e.path, new Set());
+    paths.get(e.path).add(e.method);
+  }
+
+  const sections = [...byFile.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([file, paths]) => {
+      const lines = [...paths.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([p, methods]) => `- ${[...methods].sort().join(', ')} ${p}`);
+      return [`### ${file}`, ...lines].join('\n');
+    });
+
+  return [
+    `## Route inventory (${callRoutes.length} route definitions across ${byFile.size} file${byFile.size === 1 ? '' : 's'})`,
+    '',
+    'Every route this codebase registers, read straight from the source.',
+    '',
+    '**These paths are written as they appear in each file, so they are RELATIVE to wherever that router gets mounted.** A `GET /:id` in a router mounted at `/api/v1/projects` is `/api/v1/projects/{id}` in the spec. **Do not copy these strings into `paths` as-is** - find each router\'s mount (the `app.use(...)` / `router.use(...)` / equivalent, in the source above) and prepend the prefix. If a prefix comes from a variable or config value, resolve it from the source.',
+    '',
+    `Use this as a completeness FLOOR, not a target: a regex found these ${callRoutes.length}, so the real API has at least that many operations and may well have more. If your spec ends up with fewer than ${callRoutes.length}, you have dropped something - go back and add it. Never delete an operation you found in the code just to match this number.`,
+    '',
+    ...sections,
+  ].join('\n');
+}
+
+/**
+ * Build the route sections handed to the generator up front, so the first pass
+ * aims for full coverage instead of discovering endpoints as it goes (which is
+ * where it runs out of room and drops trees).
+ *
+ * Empty string only when the scan found no routes at all.
+ */
+export function buildEndpointChecklist(apiDir) {
+  let scan;
+  try {
+    scan = scanCodebase(apiDir);
+  } catch {
+    return '';
+  }
+  return [fileRouteChecklist(scan.endpoints), callRouteInventory(scan.endpoints)]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 /**
@@ -146,11 +377,14 @@ async function ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner 
       .join('\n');
     await runAI(loadPrompt('fill-oas-paths', { oasFile: oasFullPath, missingList }), packageDir, {
       setSpinner,
+      label: 'fill-oas-paths',
     });
 
     // Re-validate after the edit - a broken write would wedge the next diff
     // (loadOas returns null -> every route reads as "missing" forever).
-    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+    // `reindent` again: this pass edits the same generated file, and the
+    // fill prompt is told to keep its additions compact.
+    const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner, reindent: true });
     if (!validation.ok) return { ok: false, missing };
   }
   return { ok: false, missing: [] };
@@ -261,7 +495,7 @@ async function pickTestCurl({ oasFullPath, baseUrl, packageDir, setSpinner }) {
     const result = await runAI(
       loadPrompt('find-test-endpoint', { candidates: formatted }),
       packageDir,
-      { setSpinner },
+      { setSpinner, label: 'find-test-endpoint' },
     );
     const parsed = extractJson(result, { requireKey: 'index' });
     if (parsed && Number.isInteger(parsed.index) && parsed.index >= 0 && parsed.index < candidates.length) {
@@ -292,7 +526,7 @@ async function locateApis({ packageDir, setSpinner, hint = '', languages = ['jav
       ].join('\n')
     : '';
   const prompt = loadPrompt('detect-endpoints', { findingsSection, hintSection });
-  const result = await runAI(prompt, packageDir, { setSpinner });
+  const result = await runAI(prompt, packageDir, { setSpinner, label: 'detect-endpoints' });
   const parsed = extractJson(result, { requireKey: 'apis' });
   return parsed?.apis || [];
 }
@@ -393,6 +627,14 @@ async function finalizeApi({
   replacePlaceholderDomain = false,
   oasSource = null,
 }) {
+  // Everything from here on is a question for the user, and a spinner must
+  // never be up while we wait on one - it reads as "still working" next to a
+  // prompt that is actually blocked on them, and its elapsed clock keeps
+  // counting their reading time as ours. Cleared here rather than at each
+  // `ask` because this whole function is prompts, on both the generate and
+  // the adopt path.
+  setSpinner?.('');
+
   // Visibility (external vs internal) is recorded, not asked. Nothing in
   // setup branches on it and the dashboard doesn't read it yet, so the
   // question was spending one of the user's few decisions on a field only
@@ -583,7 +825,7 @@ export async function locateOasWithAi({
       userInstruction: input,
       oasFile: oasFileAbsolute,
       candidatesFile: candidatesAbsolute,
-    }), packageDir, { setSpinner });
+    }), packageDir, { setSpinner, label: 'locate-oas' });
   } catch {}
   setSpinner('');
 
@@ -966,6 +1208,7 @@ export async function generateOasWithAi({
   apiRootDir = '.',
   name,
   framework = null,
+  language = 'javascript',
   internalEndpoints = [],
   existingOasFile = null,
   preferNative = false,
@@ -995,6 +1238,69 @@ export async function generateOasWithAi({
   const apiDir = path.resolve(packageDir, apiRootDir || '.');
   const endpointChecklist = buildEndpointChecklist(apiDir);
 
+  // Hand the route files (and what they import) over in the prompt rather
+  // than making the model fetch them one at a time. On the Express fixture
+  // this replaced 25 `Read` turns and 3 `Bash ls` turns - 78 seconds - with
+  // ~46KB of prefill, which the timing data puts at well under a second.
+  // See `lib/inline-source.js` for the measurements.
+  const source = buildApiSourceBlock(apiDir, { languages: [language] });
+  debug.log('generate-oas.inlined-source', {
+    files: source.included.length,
+    bytes: source.bytes,
+    omitted: source.omitted.length,
+  });
+
+  // ── Parallel path ──────────────────────────────────────────────────────
+  // Emitting the whole document is serial output-token work and the single
+  // largest cost left in `init`. When the API is big enough to split along
+  // route-file lines, generate the sections concurrently instead. Any group
+  // failing falls through to the single pass below, so this can only be
+  // faster or the same, never a worse spec.
+  let scanForGroups = { endpoints: [] };
+  try {
+    scanForGroups = scanFor(apiDir, [language]);
+  } catch {}
+  const groups = preferNative ? [] : planSpecGroups(scanForGroups.endpoints);
+  debug.log('generate-oas.grouping', {
+    endpoints: scanForGroups.endpoints.length,
+    groups: groups.length,
+    sizes: groups.map((g) => g.endpoints.length),
+  });
+
+  if (groups.length >= 2) {
+    const parallel = await generateOasInParts({
+      groups,
+      apiDir,
+      language,
+      name,
+      oasFullPath,
+      packageDir,
+      internalNote,
+      setSpinner,
+    });
+    if (parallel.ok) {
+      const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner, reindent: true });
+      if (validation.ok) {
+        const coverage = await ensurePathCoverage({ apiDir, oasFullPath, packageDir, setSpinner });
+        return { ok: true, oasFile, oasFullPath, coverage, parallel: true };
+      }
+      // A merged spec that won't parse is a bug in the merge, not in the
+      // model. Fall through and regenerate rather than hand back a broken
+      // file - and say so in the log so it can be found.
+      debug.log('generate-oas.parallel-invalid', { error: String(validation.error).slice(0, 200) });
+    }
+    setSpinner?.({ phase: 'Writing your spec', detail: 'finishing in a single pass' });
+  }
+
+  // The profiled run used all 30 turns, ended on "Reached maximum number of
+  // turns", returned zero characters, and happened to land its Write on the
+  // very last turn - so it "succeeded" by luck. One more file to read and the
+  // spec would never have been written, and nothing here would have said so.
+  //
+  // `runAI` swallows SDK errors by design (a partial result is usually better
+  // than a crash), which makes "the model found nothing" and "the model never
+  // got to answer" identical from the outside unless the caller asks. So ask.
+  let runError = null;
   await runAI(
     loadPrompt('generate-oas', {
       name,
@@ -1004,15 +1310,40 @@ export async function generateOasWithAi({
       frameworkNote,
       internalNote,
       endpointChecklist,
+      sourceFiles: source.block,
     }),
     packageDir,
-    { setSpinner },
+    {
+      setSpinner,
+      label: 'generate-oas',
+      onError: (err) => { runError = err; },
+    },
   );
+
+  if (runError) {
+    debug.log('generate-oas.run-error', { message: String(runError).slice(0, 200) });
+    // A cap hit that still produced a parseable spec is reported, not fatal:
+    // the file on disk is what matters, and the validation below is the real
+    // gate. But it stops being silent, and a run that wrote nothing now says
+    // why instead of failing later as an unexplained parse error.
+    if (!fs.existsSync(oasFullPath)) {
+      return {
+        ok: false,
+        error: `The spec generator stopped before writing a file: ${runError}`,
+        oasFile,
+        oasFullPath,
+      };
+    }
+  }
 
   // Validate before we go any further - server uses the same parse logic,
   // so if it fails here it'll fail there too. Hand errors back to the LLM
   // and let it iterate.
-  const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner });
+  // `reindent`: the prompt asks for compact JSON to save output tokens, so
+  // the file gets its indentation back here. Only this path passes it - the
+  // other callers are validating a spec the user brought, and reformatting
+  // one of those would drop a whole-file diff in their working tree.
+  const validation = await validateAndFixOas({ oasFullPath, packageDir, setSpinner, reindent: true });
   if (!validation.ok) {
     return { ok: false, error: validation.error, oasFile, oasFullPath };
   }
@@ -1314,6 +1645,7 @@ export default async function generateOas({ packageDir, rootDir, update, setSpin
       apiRootDir: selectedApi.rootDir || '.',
       name: selectedApi.name,
       framework: selectedApi.framework,
+      language: selectedApi.language || 'javascript',
       internalEndpoints: selectedApi.internalEndpoints,
       existingOasFile: selectedApi.existingOasFile,
       preferNative: preferNativeGeneration,

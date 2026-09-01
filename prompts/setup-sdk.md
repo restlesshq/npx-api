@@ -2,6 +2,8 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 **IMPORTANT: NEVER read .env, .env.local, or any environment/secret files.**
 
+**The project's own source files are reproduced in this prompt (see below). Do not re-read them with the Read tool, and do not `ls` or `grep` to find them - you already have them. Reach for a tool only for a file that genuinely is not in this prompt. Every tool call costs the user several seconds of waiting.**
+
 ## What to do
 
 0. **First, check if the SDK is already wired in WITH THE CURRENT API.** Grep for `require('@restlessai/sdk')` or `from '@restlessai/sdk'` in the user's source files (NOT in `node_modules/`). A file counts as correctly wired only if it has:
@@ -34,6 +36,8 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
    **Everything else (Express, Fastify, Koa, Hono, bare http):** open the file where the framework is initialized (`express()`, `fastify()`, `new Hono()`, `createServer()`, etc.) and where routes are registered. That's where the SDK middleware goes.
 
 2. **Follow the installation pattern in the guide exactly.** Here's the pattern:
+
+{{sourceFiles}}
 
 {{guide}}
 
@@ -157,3 +161,4 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 - **`.restless/` is source and belongs in the repo.** It holds the API spec and the settings the SDK reads at startup, so a teammate or CI without it gets a differently-configured SDK. Never add it to `.gitignore` or otherwise exclude it, and if you commit work for the user, include `.restless/` in that commit. It contains no secrets - the key lives in `.env`, which stays out of git.
 - **Do NOT substitute `|| 'anonymous'` inside `sdk.mask()`.** If the value is missing, `mask()` returns `undefined` and the SDK handles it gracefully. Writing `sdk.mask(key || 'anonymous')` would leak the fallback string's last 4 characters as the mask's tail.
 - Keep changes minimal - just add the SDK setup, don't refactor anything else.
+- **Apply the wiring in ONE Edit call per file, and write no prose.** Nobody reads your explanation: the CLI verifies the result by re-reading the file itself, and then runs its own review pass. Every sentence you write and every extra Edit round trip is time the user spends watching a spinner. When you're done, stop - no summary, no recap of what you changed, no bullet list. (The one exception is step 0's "already wired" case, which wants a single short sentence and no edits.)

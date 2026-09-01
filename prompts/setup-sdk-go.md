@@ -2,6 +2,8 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 
 **IMPORTANT: NEVER read .env, .env.local, or any environment/secret files. NEVER read anything under `vendor/`.**
 
+**The project's own source files are reproduced in this prompt (see below). Do not re-read them with the Read tool, and do not `ls` or `grep` to find them - you already have them. Reach for a tool only for a file that genuinely is not in this prompt. Every tool call costs the user several seconds of waiting.**
+
 ## What to do
 
 0. **First, check if the SDK is already wired in.** A project counts as wired only if all three are present:
@@ -42,6 +44,8 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
    Without one, every `/pets/1` and `/pets/2` becomes its own group on the dashboard, and a 404 on a missing record cannot be told apart from a 404 on an endpoint that does not exist. Determine the router from the imports in the file you are editing and pass the matching resolver.
 
 3. **Follow the installation pattern in the guide exactly.** Here's the pattern:
+
+{{sourceFiles}}
 
 {{guide}}
 
@@ -128,3 +132,4 @@ You need to wire up the Restless SDK in this {{language}} project that uses {{fr
 - **Do NOT substitute a fallback string inside `restless.Mask()`.** It returns "" on empty input; a fallback's last 4 characters would become the mask tail.
 - **`go build ./...` must succeed when you are done.** Go is the one language where the wiring either compiles or does not - check it rather than assuming.
 - Keep changes minimal and gofmt-clean.
+- **Apply the wiring in ONE Edit call per file, and write no prose.** Nobody reads your explanation: the CLI verifies the result by re-reading the file itself, and then runs its own review pass. Every sentence you write and every extra Edit round trip is time the user spends watching a spinner. When you're done, stop - no summary, no recap of what you changed, no bullet list.

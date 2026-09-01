@@ -8,6 +8,8 @@ import { CLI_NAME } from '../lib/config.js';
 import { safeWriteFileSync } from '../lib/pathGuard.js';
 import { fatalError } from '../lib/errors.js';
 import * as debug from '../lib/debug.js';
+import * as timings from '../lib/timings.js';
+import { buildWiringSourceBlock } from '../lib/inline-source.js';
 import { getSdkWriter, normalizeLanguage } from '../lib/sdk-writers/index.js';
 import { findWiredSourceFile as findWired } from '../lib/wired-file.js';
 import {
@@ -236,12 +238,21 @@ export default async function installSdk({
     update({ activeSub: 0, message: [
       `  Installing ${bold(sdkName)} in ${installLocation}…`,
     ]});
+    // Labelled with the DEFAULT command, not the one the user may have
+    // edited at the prompt: the label is a key the report groups on across
+    // runs, so it has to be stable.
+    const endInstallSpan = timings.start(`install: ${defaultCmd}`, {
+      kind: timings.KINDS.EXEC,
+      language: guideLanguage,
+    });
     try {
       // Use packageDir as cwd so the `cd ...` prefix resolves correctly.
       execSync(cmd, { cwd: packageDir, stdio: 'pipe', shell: true });
     } catch {
       // Install warnings can trip non-zero exits; the verify step below catches
       // a genuine failure.
+    } finally {
+      endInstallSpan();
     }
     if (!isSdkInstalled(installDir, guideLanguage)) {
       // Halt loudly. Earlier versions returned a `{ installed: false }`
@@ -367,10 +378,21 @@ export default async function installSdk({
   const guidePath = path.join(pkgRoot, 'docs', 'sdks', `${guideLanguage}.md`);
   const guide = fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : '';
   const setupSection = guide.split(/^## Setup\n/m)[1]?.split(/^## Verify\n/m)[0] || guide;
+  // Hand over the entry-file candidates and the route files instead of
+  // making the model hunt for them. In the profiled run this step spent
+  // ~33s on 10 `Read` turns and 3 `Bash ls` turns; prefilling the same text
+  // is free (see `lib/inline-source.js`).
+  const wiringSource = buildWiringSourceBlock(installDir, { languages: [guideLanguage] });
+  debug.log('install-sdk.inlined-source', {
+    files: wiringSource.included.length,
+    bytes: wiringSource.bytes,
+    omitted: wiringSource.omitted.length,
+  });
   const basePrompt = loadPromptForLanguage('setup-sdk', guideLanguage, {
     language: detectedLanguage,
     framework: detectedFramework || detectedLanguage,
     guide: setupSection,
+    sourceFiles: wiringSource.block,
   });
 
   // For Next.js, append the concrete files and the hard "never touch
@@ -537,7 +559,7 @@ export default async function installSdk({
     }
     debug.log('install-sdk.ai-attempt', { attempt: attemptNum, hint: userHint || null });
     try {
-      await runAI(prompt, installDir, { setSpinner });
+      await runAI(prompt, installDir, { setSpinner, label: `setup-sdk:attempt-${attemptNum}` });
     } catch (err) {
       // Don't bail on a per-attempt error — the retry loop is the recovery
       // path. The final `fatalError` below covers the case where every
