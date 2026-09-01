@@ -10,7 +10,9 @@ npm install @restlessai/sdk --save
 
 ## Setup
 
-The single entry point `@restlessai/sdk` auto-detects the framework at runtime (Express, Fastify, Koa, Hono, Next, bare http) from the call signature. Use it for every framework. Do NOT import a framework-specific subpath like `@restlessai/sdk/fastify`. The same factory call works everywhere; only the registration pattern differs per framework.
+The single entry point `@restlessai/sdk` auto-detects the framework at runtime (Express, Fastify, Koa, Hono, bare http) from the call signature. Import the bare specifier for all of them - the same factory call works everywhere, and only the registration pattern differs. The per-framework subpaths (`@restlessai/sdk/express`, `@restlessai/sdk/fastify`, and so on) still resolve, but they are not the form to write on a new install.
+
+Next.js is the exception: its integration is the `@restlessai/sdk/next` subpath (`withRestless` and `defineConfig`), covered in its own section below.
 
 Name the client `sdk`. The factory is what you import; calling it returns the client, and `.setup` / `.mask` live on that client. Use this exact form so the binding is predictable:
 
@@ -354,4 +356,4 @@ Read the credential off `req.headers.authorization` (Pages Router hands you Node
 
 1. `@restlessai/sdk` appears in `package.json` dependencies.
 2. The middleware/plugin is registered in the server code with a `setup(cb)` callback. On the Next.js App Router single-config integration this means: `withRestless` wraps the export in `next.config.*` AND `restless.config.*` exists with a `defineConfig({ setup })` call.
-3. Starting the server and hitting any endpoint returns an `x-restless-id` response header.
+3. Starting the server and hitting any endpoint returns an `x-request-id` response header carrying a fresh UUID. If your request already sent an `x-request-id`, the SDK leaves that chain alone and answers on `x-restless-id` instead - exactly one of the two comes back, and either one proves the SDK saw the request.

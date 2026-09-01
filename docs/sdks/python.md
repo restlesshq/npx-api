@@ -103,4 +103,4 @@ Inline `label` / `email` keys on `owner` are dropped. Everything except `id` com
 1. `restless-sdk` appears in `requirements.txt` / `pyproject.toml` / `Pipfile`.
 2. The app object is wrapped with `client.wsgi(...)` or `client.asgi(...)`, outermost.
 3. A `@client.setup` callback exists and reads its header through `request.header(...)`.
-4. Starting the server and hitting any endpoint returns an `x-restless-id` response header.
+4. Starting the server and hitting any endpoint returns an `x-request-id` response header carrying a fresh UUID. If your request already sent an `x-request-id`, the SDK leaves that chain alone and answers on `x-restless-id` instead - exactly one of the two comes back, and either one proves the SDK saw the request.

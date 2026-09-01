@@ -251,6 +251,34 @@ describe('ensureProject', () => {
     expect(res).toMatchObject({ projectId: 'project-1', reused: false });
   });
 
+  // Jesse's report: `key` before `register` on a fresh repo registered a
+  // project server-side and then wrote nothing, so `register` created the
+  // entry without a projectId and `login` said "This project has no Restless
+  // project yet - run npx restless key first" about the command that had
+  // just run. Both orders have to work: the agent playbook registers first,
+  // the README's command table lists `key` first.
+  it('creates the API entry when key runs before anything described the API', async () => {
+    const fetchImpl = mintingFetch();
+    const res = await mod.ensureProject({ rootDir: tmp, apiRootDir: '.', apiKey: 'rstlss_k', fetchImpl });
+    expect(res).toMatchObject({ projectId: 'project-1' });
+
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis).toHaveLength(1);
+    expect(saved.apis[0].projectId).toBe('project-1');
+    // Every field the schema requires, so `register` merges onto a valid entry.
+    expect(saved.apis[0].id).toEqual(expect.any(String));
+    expect(saved.apis[0].name).toEqual(expect.any(String));
+    expect(saved.apis[0].rootDir).toBe('.');
+  });
+
+  it('honours --dir when key runs first in a repo with no entries', async () => {
+    const fetchImpl = mintingFetch();
+    await mod.ensureProject({ rootDir: tmp, apiRootDir: 'services/api', apiKey: 'rstlss_k', fetchImpl });
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.restless', 'settings.json'), 'utf8'));
+    expect(saved.apis).toHaveLength(1);
+    expect(saved.apis[0]).toMatchObject({ rootDir: 'services/api', projectId: 'project-1' });
+  });
+
   it('records the project id on the API entry that owns it', async () => {
     const fetchImpl = mintingFetch();
     saveSettings(tmp, { version: 1, apis: [

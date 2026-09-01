@@ -6,6 +6,6 @@ For JavaScript / TypeScript projects, the package is `{{sdkPackage}}`. Check:
 - The middleware/plugin is registered BEFORE any route definitions.
 - `process.env.RESTLESS_KEY` is referenced (the SDK reads this automatically).
 
-For other languages, check for the language-appropriate Restless package (`restlessai` on PyPI / RubyGems, `github.com/restlessai/go` in Go).
+For other languages, check for the language-appropriate Restless package: `restless-sdk` on PyPI (imported as `restless`), `restless-sdk` on RubyGems (required as `restless`), or `github.com/restlesshq/go` in `go.mod`.
 
 Just verify - don't fix anything. Report whether it's working.

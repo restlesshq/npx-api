@@ -281,6 +281,9 @@ describe('fixContext', () => {
   });
   it('no-sdk evidence is about the missing SDK header', () => {
     const c = fixContext('no-sdk', { localBase: 'http://localhost:3000' });
+    // Both names, in the order they actually happen: a bare probe gets
+    // x-request-id back, so naming only x-restless-id misdirects the fixer.
+    expect(c.evidence).toContain('x-request-id');
     expect(c.evidence).toContain('x-restless-id');
     expect(c.evidence).toContain('not actually intercepting');
   });

@@ -1208,7 +1208,13 @@ if (command === '--version' || command === '-v' || command === 'version') {
   const name = flagValue(process.argv, '--name') || oasDoc?.info?.title || path.basename(regRoot);
   const oasRel = path.relative(regRoot, oasAbs);
   const settings = loadSettings(regRoot);
-  const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir);
+  // A stub from `key` running first carries the projectId under a guessed
+  // rootDir of '.'. Adopt it rather than adding a second entry: that would
+  // split projectId and spec, and `login` would claim a spec-less project.
+  const stub = settings.apis?.length === 1 && settings.apis[0].projectId && !settings.apis[0].oasFile
+    ? settings.apis[0]
+    : null;
+  const existing = settings.apis?.find((a) => (a.rootDir || '.') === apiRootDir) || stub;
   // Only a plausible public URL is worth recording as baseUrl. Relative
   // servers and --allow-local-servers overrides keep whatever was there -
   // and a local address recorded by an older CLI gets scrubbed rather than

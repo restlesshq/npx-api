@@ -117,4 +117,4 @@ The middleware reads the matched route from the framework, so handlers do not re
 1. `restless-sdk` appears in the `Gemfile` (or `bundle list` finds it).
 2. `CLIENT.rack` is mounted in `config.ru` or `config/application.rb`, as far out as possible.
 3. A `CLIENT.setup do |request|` block exists and reads its header through `request.header(...)`.
-4. Starting the server and hitting any endpoint returns an `x-restless-id` response header.
+4. Starting the server and hitting any endpoint returns an `x-request-id` response header carrying a fresh UUID. If your request already sent an `x-request-id`, the SDK leaves that chain alone and answers on `x-restless-id` instead - exactly one of the two comes back, and either one proves the SDK saw the request.
