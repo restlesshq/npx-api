@@ -434,3 +434,130 @@ export default defineConfig({
     expect(typeof gi.fix).toBe('function');
   });
 });
+
+// ── Concurrent wiring review ─────────────────────────────────────────────
+// `startWiringReview` overlaps the read-only AI review with `verifyOwnerId`,
+// which can rewrite the `owner.id` line - so the result is only usable while
+// the reviewed bytes are still the bytes on disk.
+describe('startWiringReview', () => {
+  let dir;
+  const WIRED = [
+    "import restless from '@restlessai/sdk';",
+    "const sdk = restless(process.env.RESTLESS_KEY);",
+    "app.use(sdk.setup((req) => ({",
+    "  apiKey: sdk.mask(req.headers.authorization),",
+    "  owner: { id: req.user.id },",
+    "})));",
+  ].join('\n');
+
+  function ctxFor() {
+    return {
+      packageDir: dir, rootDir: dir, apiRootDir: '.', installDir: dir, apiDir: dir,
+      language: 'javascript', framework: 'express', aiTool: 'Claude Code',
+      envLoader: { mode: 'none', evidence: 'none' },
+      apiKey: null, projectId: null, setupKey: null,
+      keyDelivery: 'manual', envFile: null, envRelative: null,
+    };
+  }
+
+  beforeEach(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'restless-review-'));
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ dependencies: { express: '^4' } }));
+    fs.writeFileSync(path.join(dir, 'app.js'), WIRED);
+    const { setGitRoot } = await import('../lib/pathGuard.js');
+    setGitRoot(dir);
+  });
+  afterEach(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  });
+
+  const okReview = async () => JSON.stringify({
+    checks: [{ id: 'order', ok: true, note: '' }, { id: 'mounted', ok: true, note: '' }],
+  });
+
+  it('starts the review and snapshots the file it read', async () => {
+    const { startWiringReview } = await import('../steps/final-checks.js');
+    const pending = startWiringReview({ ctx: ctxFor(), runner: okReview });
+    expect(pending).not.toBeNull();
+    expect(pending.snapshot).toBe(WIRED);
+    expect(path.basename(pending.sourceFile)).toBe('app.js');
+    await expect(pending.promise).resolves.toMatchObject({ snapshot: WIRED });
+  });
+
+  it('never opens a standalone spinner that would tear up the plan frame', async () => {
+    // Passing no setSpinner makes runAI start its own stdout spinner.
+    const { startWiringReview } = await import('../steps/final-checks.js');
+    let sawSetSpinner = false;
+    const runner = async (_p, _cwd, opts) => {
+      sawSetSpinner = typeof opts.setSpinner === 'function';
+      return okReview();
+    };
+    await startWiringReview({ ctx: ctxFor(), runner }).promise;
+    expect(sawSetSpinner).toBe(true);
+  });
+
+  it('returns null when nothing is wired yet', async () => {
+    fs.writeFileSync(path.join(dir, 'app.js'), 'const app = 1;');
+    const { startWiringReview } = await import('../steps/final-checks.js');
+    expect(startWiringReview({ ctx: ctxFor(), runner: okReview })).toBeNull();
+  });
+
+  it('resolves rather than rejecting when the review throws', async () => {
+    // A background pass must never be able to take the install down.
+    // `runAiChecks` already degrades a failure to one informational row, so
+    // that is what comes back - the install carries on either way.
+    const { startWiringReview } = await import('../steps/final-checks.js');
+    const boom = async () => { throw new Error('nope'); };
+    const settled = await startWiringReview({ ctx: ctxFor(), runner: boom }).promise;
+    expect(settled.rows).toEqual([
+      expect.objectContaining({ kind: 'ai-review', informational: true, ok: true }),
+    ]);
+  });
+
+  it('feeds its rows into finalChecks without a second AI call', async () => {
+    const { startWiringReview, default: finalChecks } = await import('../steps/final-checks.js');
+    let calls = 0;
+    const counting = async () => { calls++; return okReview(); };
+    const pending = startWiringReview({ ctx: ctxFor(), runner: counting });
+    await pending.promise;
+
+    const messages = [];
+    await finalChecks({
+      ctx: ctxFor(),
+      update: ({ message }) => { if (message) messages.push(message.join('\n')); },
+      setSpinner() {},
+      pendingReview: pending,
+    });
+    expect(calls).toBe(1);
+  });
+
+  it('discards the early review when the file changed underneath it', async () => {
+    // The real case: `verifyOwnerId` writes a RESTLESS_OWNER_ID_CONFIRM
+    // comment into the block while the review is in flight. Every check
+    // still passes, but the reviewed bytes are no longer the bytes on disk,
+    // so the early result is thrown away and the review runs again.
+    const { startWiringReview, default: finalChecks } = await import('../steps/final-checks.js');
+    let calls = 0;
+    const counting = async () => { calls++; return okReview(); };
+    const pending = startWiringReview({ ctx: ctxFor(), runner: counting });
+    await pending.promise;
+    expect(calls).toBe(1);
+
+    fs.writeFileSync(
+      path.join(dir, 'app.js'),
+      WIRED.replace(
+        '  owner: { id: req.user.id },',
+        '  // RESTLESS_OWNER_ID_CONFIRM: could not confirm req.user.id is immutable\n  owner: { id: req.user.id },',
+      ),
+    );
+
+    await finalChecks({
+      ctx: ctxFor(),
+      update() {},
+      setSpinner() {},
+      pendingReview: pending,
+      aiRunner: counting,
+    });
+    expect(calls).toBe(2);
+  });
+});

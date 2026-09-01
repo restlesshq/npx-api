@@ -425,3 +425,72 @@ describe('OAS_SOURCES is complete for every kind', () => {
     expect(OAS_SOURCES.describe.action({}, { summary: 's' }).key).toBe('replay');
   });
 });
+
+// ── Compact-in, pretty-out ───────────────────────────────────────────────
+// Spec generation is output-token-bound (a profiled run spent 118.6s in one
+// `Write`), so the prompt asks for compact JSON and the indentation is put
+// back here, where it costs nothing.
+describe('validateAndFixOas reindent', () => {
+  let dir;
+  const SPEC = {
+    openapi: '3.0.0',
+    info: { title: 'T', version: '1.0.0' },
+    paths: { '/things': { get: { responses: { 200: { description: 'ok' } } } } },
+  };
+
+  beforeEach(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'restless-reindent-'));
+    const { setGitRoot } = await import('../lib/pathGuard.js');
+    setGitRoot(dir);
+  });
+  afterEach(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  });
+
+  async function run(file, opts) {
+    const { validateAndFixOas } = await import('../lib/oas-source.js');
+    return validateAndFixOas({ oasFullPath: file, packageDir: dir, setSpinner() {}, ...opts });
+  }
+
+  it('pretty-prints a compact JSON spec without changing its meaning', async () => {
+    const file = path.join(dir, 'openapi.json');
+    const compact = JSON.stringify(SPEC);
+    fs.writeFileSync(file, compact);
+
+    expect(await run(file, { reindent: true })).toEqual({ ok: true });
+    const after = fs.readFileSync(file, 'utf8');
+    expect(after).toContain('\n  "openapi"');
+    expect(after.endsWith('\n')).toBe(true);
+    expect(JSON.parse(after)).toEqual(SPEC);
+  });
+
+  it('leaves the file alone when reindent is not asked for', async () => {
+    // Every caller but the generator is validating a spec the USER brought.
+    // Reformatting one would drop a spurious whole-file diff on them.
+    const file = path.join(dir, 'openapi.json');
+    const compact = JSON.stringify(SPEC);
+    fs.writeFileSync(file, compact);
+
+    expect(await run(file)).toEqual({ ok: true });
+    expect(fs.readFileSync(file, 'utf8')).toBe(compact);
+  });
+
+  it('does not rewrite a spec that is already formatted', async () => {
+    const file = path.join(dir, 'openapi.json');
+    fs.writeFileSync(file, `${JSON.stringify(SPEC, null, 2)}\n`);
+    const before = fs.statSync(file).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(await run(file, { reindent: true })).toEqual({ ok: true });
+    expect(fs.statSync(file).mtimeMs).toBe(before);
+  });
+
+  it('never reformats YAML', async () => {
+    const file = path.join(dir, 'openapi.yaml');
+    const raw = 'openapi: 3.0.0\ninfo:\n  title: T\n  version: "1"\npaths: {}\n';
+    fs.writeFileSync(file, raw);
+
+    expect(await run(file, { reindent: true })).toEqual({ ok: true });
+    expect(fs.readFileSync(file, 'utf8')).toBe(raw);
+  });
+});

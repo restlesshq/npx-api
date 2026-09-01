@@ -25,7 +25,7 @@ export default async function detectAuth({ packageDir, rootDir, apiId, apiName, 
 
   let detected = { headers: [], queryParams: [], bodyKeys: [] };
   try {
-    const result = await runAI(prompt, packageDir, { setSpinner });
+    const result = await runAI(prompt, packageDir, { setSpinner, label: 'detect-auth' });
     const parsed = extractJson(result, { requireKey: 'headers' });
     if (parsed) {
       detected = {

@@ -1,9 +1,11 @@
-Read the file where the Restless SDK is wired in and answer a short checklist about it. This is a review pass: **do not edit anything.** Report only.
+Answer a short checklist about the file where the Restless SDK is wired in. This is a review pass: **do not edit anything.** Report only.
 
 File: {{sourceFile}}
 Framework: {{framework}}
 
-Read that file (and any file it registers middleware from, if the answer isn't clear from the entry file alone). Do NOT read `.env` files or anything in `node_modules/`.
+**That file and the files it imports are reproduced below. Do not re-read them with the Read tool - you already have them.** Reach for a tool only if an answer genuinely depends on a file that is not in this prompt. Every tool call costs the user several seconds of waiting. Do NOT read `.env` files or anything in `node_modules/`.
+
+{{sourceFiles}}
 
 Answer each check:
 
@@ -30,5 +32,7 @@ Reply with ONLY a JSON object, no prose around it:
   ]
 }
 ```
+
+**Output the JSON object and nothing else** - no preamble, no reasoning, no closing summary. The CLI parses this with `extractJson` and throws the rest away, so prose is time the user spends watching a spinner for output nobody sees. Do the reasoning silently and emit only the object.
 
 Rules for `note`: one short phrase, lowercase, no trailing period. Required when `ok` is false - say what's wrong and where (e.g. "sits below requireApiKey on line 42"). Leave it empty when `ok` is true unless there's something genuinely worth surfacing. Never invent a failure to seem thorough: if a check passes, say it passes.

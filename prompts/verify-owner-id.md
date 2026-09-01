@@ -9,13 +9,15 @@ So: be skeptical. Confirm rather than assume.
 
 **IMPORTANT: NEVER read .env, .env.local, .env.*, or any environment/secret files. NEVER read or scan {{neverRead}}.**
 
+**The wired file and the files it imports are reproduced in this prompt (see below). Do not grep for them and do not re-read them - you already have them. Reach for a tool only for a file that genuinely is not in this prompt. Every tool call costs the user several seconds of waiting.**
+
+{{sourceFiles}}
+
 ## What to do
 
-1. **Find the wired file.** Run `grep -rE "{{sdkPackage}}" --include="*.js" --include="*.ts" --include="*.mjs" --include="*.cjs" -l` from the project root. The setup callback lives in one of two shapes:
-   - Classic: a file containing `sdk.setup((req) => ({ ... }))`.
-   - Next.js single-config: a `restless.config.*` at the project root containing `defineConfig({ setup: async (req) => ({ ... }) })` (ignore `next.config.*` - it only wraps the build config and holds no owner).
-
-   Open the file and locate the `owner: { id: <expr> }` line inside the setup callback.
+1. **The wired file is `{{sourceFile}}`**, and its full contents are in this prompt above. Locate the `owner: { id: <expr> }` line inside the setup callback. It has one of two shapes:
+   - Classic: `sdk.setup((req) => ({ ... }))`.
+   - Next.js single-config: a `restless.config.*` containing `defineConfig({ setup: async (req) => ({ ... }) })` (`next.config.*` only wraps the build config and holds no owner).
 
 2. **Extract the expression.** Note the exact code currently inside `owner: { id: <expr> }`. This is what you're verifying.
 
@@ -92,4 +94,5 @@ So: be skeptical. Confirm rather than assume.
 - Do not modify {{manifest}}, .gitignore, tsconfig, Dockerfile, CI configs, or any other file.
 - Do not read .env or any file in node_modules.
 - If the current `owner.id` is already set to `'NEEDS_CONFIGURATION'`, leave it alone. The CLI will prompt the user.
+- **Write no prose.** Your text output is discarded - the CLI re-reads the file and re-runs its own static check to see what you decided, so an explanation reaches nobody. Make the edit (or leave the line alone) and stop: no summary, no recap, no bullet list. Anything you have to say to the user goes in the `RESTLESS_OWNER_ID_CONFIRM` comment, which the CLI does read.
 - If you genuinely cannot make a determination at all (no auth middleware found, no evidence of what the value is or where it comes from, codebase is too unfamiliar), replace with the sentinel. **Default to suspicion in the security-relevant direction**: user-controlled input, mutable fields, and unverified auth attachments all warrant the sentinel. Lack of a formal schema does NOT. A JSON-key id, an in-memory map key, or a UUID literal are all fine; do not replace those with the sentinel just because there's no Mongoose model.
